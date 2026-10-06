@@ -335,6 +335,30 @@ def redact_url(url: str) -> str:
     return urlunsplit((parts.scheme, netloc, path, query, ""))
 
 
+_CHALLENGE_MARKERS = re.compile(
+    r"just a moment|cf-chl|challenge-platform|attention required|h?captcha|px-captcha|perimeterx"
+    r"|access denied|request blocked|you(?:'|&#39;)?ve been blocked|blocked by network security",
+    re.IGNORECASE,
+)
+
+
+def is_challenge_page(status: int, headers: Mapping[str, str], body: str) -> bool:
+    """True for bot-management walls (Cloudflare, Akamai, HUMAN/PerimeterX, DataDome...).
+
+    A challenge is not transient: retrying it immediately only deepens the block, so the
+    client raises :class:`HttpStatusError` at once and the source backs off instead.
+    """
+    if not (status in (403, 429, 503) or 430 <= status < 500):  # 435 = HUMAN/PerimeterX
+        return False
+    lowered = {k.lower(): v for k, v in headers.items()}
+    if lowered.get("cf-mitigated", "").lower() == "challenge":
+        return True
+    content_type = lowered.get("content-type", "").lower()
+    if "html" not in content_type and "json" not in content_type and content_type:
+        return False
+    return bool(_CHALLENGE_MARKERS.search(body[:20_000]))
+
+
 class HttpStatusError(Exception):
     """Unexpected HTTP status (non-retryable, or retries exhausted on a retryable one).
 
@@ -527,7 +551,15 @@ class HttpClient:
             if headers:
                 req_headers.update(headers)
             target = cache_bust(url, bust_cache) if bust_cache else url
-            client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else None
+            extra_kwargs: dict[str, Any] = {}
+            if timeout:
+                # Only override when asked: passing timeout=None to aiohttp would *disable*
+                # the session's default timeout instead of inheriting it.
+                extra_kwargs["timeout"] = aiohttp.ClientTimeout(
+                    total=timeout,
+                    connect=min(timeout, self.settings.connect_timeout_seconds),
+                    sock_read=timeout,
+                )
             started = time.perf_counter()
             status = 0
             try:
@@ -538,8 +570,8 @@ class HttpClient:
                     headers=req_headers,
                     json=json,
                     data=data,
-                    timeout=client_timeout,
                     proxy=proxy or self.settings.proxy,
+                    **extra_kwargs,
                 ) as resp:
                     status = resp.status
                     # Case-insensitive copy: servers send "Etag", "etag", "x-ratelimit-remaining"...
@@ -557,7 +589,7 @@ class HttpClient:
                     retry_after = parse_retry_after(resp_headers.get("Retry-After"))
                     if status in (403, 429):
                         self.identities.burn(host)
-                    if status in RETRYABLE_STATUSES:
+                    if status in RETRYABLE_STATUSES and not is_challenge_page(status, resp_headers, text):
                         if retry_after is not None and bucket is not None:
                             bucket.penalize(retry_after)
                         raise RetryableHttpError(status, str(resp.url), text, resp_headers, retry_after)
@@ -661,6 +693,7 @@ __all__ = [
     "chromium_sec_ch_ua",
     "create_session",
     "estimate_chrome_major",
+    "is_challenge_page",
     "json_dumps",
     "json_loads",
     "redact_url",

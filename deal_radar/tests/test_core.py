@@ -310,6 +310,15 @@ async def server():
     async def forbidden(request: web.Request) -> web.Response:
         return web.Response(status=403, text="blocked")
 
+    async def challenge(request: web.Request) -> web.Response:
+        state["challenge"] = state.get("challenge", 0) + 1
+        return web.Response(status=503, text="<html><title>Just a moment...</title></html>", content_type="text/html",
+                            headers={"cf-mitigated": "challenge"})
+
+    async def slow(request: web.Request) -> web.Response:
+        await asyncio.sleep(5)
+        return web.json_response({})
+
     async def big(request: web.Request) -> web.Response:
         return web.Response(body=b"x" * 50_000)
 
@@ -322,6 +331,8 @@ async def server():
     app.router.add_get("/flaky", flaky)
     app.router.add_get("/forbidden", forbidden)
     app.router.add_get("/big", big)
+    app.router.add_get("/challenge", challenge)
+    app.router.add_get("/slow", slow)
     app.router.add_get("/text", text)
     srv = TestServer(app)
     await srv.start_server()
@@ -392,6 +403,36 @@ async def test_http_client_retry_false_preserves_retryable_response(server: Test
     assert info.value.status == 503 and info.value.retry_after == 0.0
     assert info.value.headers.get("retry-after") == "0"
     assert "SECRET" not in str(info.value)
+
+
+async def test_http_client_does_not_retry_challenge_walls(server: TestServer, client: HttpClient) -> None:
+    with pytest.raises(HttpStatusError) as info:
+        await client.get_json(str(server.make_url("/challenge")))
+    assert info.value.status == 503
+    assert server.state["challenge"] == 1  # type: ignore[attr-defined]  # no retry storm
+
+
+async def test_http_client_session_timeout_applies_without_override(server: TestServer) -> None:
+    c = HttpClient.create(NetworkSettings(timeout_seconds=0.3, retry=BackoffPolicy(max_attempts=1), trust_env=False))
+    try:
+        started = time.perf_counter()
+        with pytest.raises((asyncio.TimeoutError, RetryExhausted)):
+            await c.get_json(str(server.make_url("/slow")))
+        assert time.perf_counter() - started < 2
+        with pytest.raises((asyncio.TimeoutError, RetryExhausted)):
+            await c.get_json(str(server.make_url("/slow")), timeout=0.2)
+    finally:
+        await c.close()
+
+
+def test_is_challenge_page_heuristics() -> None:
+    from deal_radar.core.http import is_challenge_page
+
+    assert is_challenge_page(403, {"Content-Type": "text/html"}, "<h1>Access Denied</h1>")
+    assert is_challenge_page(429, {"cf-mitigated": "challenge"}, "")
+    assert is_challenge_page(435, {"Content-Type": "application/json"}, '{"appId":"PX","blockScript":"/captcha.js"} px-captcha')
+    assert not is_challenge_page(503, {"Content-Type": "application/json"}, '{"error":"overloaded"}')
+    assert not is_challenge_page(500, {"Content-Type": "text/html"}, "Just a moment")
 
 
 async def test_http_client_max_bytes_and_text(server: TestServer, client: HttpClient) -> None:
