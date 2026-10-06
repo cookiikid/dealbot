@@ -1094,7 +1094,8 @@ async def test_concurrent_blocks_keep_the_longest_cooldown(http: HttpClient, red
     pardner = "<html><body><h1>whoa there, pardner!</h1></body></html>"
     reddit.on("POST", TOKEN_PATH, reply(200, token_payload("tok-1")), reply(200, token_payload("tok-2")))
     # buildapcsales (first in config order) is rate limited for 30 s, hardwareswap is behind a block wall.
-    reddit.on("GET", OAUTH_BAPCS, reply(429, b"", headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "30"}))
+    reddit.on("GET", OAUTH_BAPCS, reply(429, body=b"", content_type="text/plain",
+                                        headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "30"}))
     reddit.on("GET", OAUTH_HWS, reply(403, body=pardner, content_type="text/html"))
     with pytest.raises(SourceBlocked) as info:
         await ing.poll()

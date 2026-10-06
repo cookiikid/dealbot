@@ -849,6 +849,8 @@ class FbMarketplaceIngestor(BaseIngestor):
     scroll_settle_seconds: float = 3.0
     #: Max seconds to wait for in-flight GraphQL bodies before parsing.
     drain_timeout_seconds: float = 5.0
+    #: Search navigations allowed per sliding hour for the account (``None`` disables).
+    max_searches_per_hour: int | None = MAX_SEARCHES_PER_HOUR
 
     def __init__(self, cfg: FbMarketplaceSource, ctx: IngestorContext, *, base_url: str | None = None) -> None:
         super().__init__(cfg, ctx)
@@ -860,11 +862,15 @@ class FbMarketplaceIngestor(BaseIngestor):
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._needs_restart = False
+        self._restart_reason = "browser died"
+        self._page_crashed = False
         self._capture: list[str] | None = None
         self._captured = asyncio.Event()
         self._pending: set[asyncio.Task[None]] = set()
         self._cursor = 0
         self._query_estimate_s = DEFAULT_QUERY_ESTIMATE_S
+        self._clock: Callable[[], float] = time.monotonic
+        self._search_times: deque[float] = deque()
         # True once a poll succeeded, False again after a wall: only a session that
         # demonstrably works is written back over the saved one.
         self._session_ok = False
@@ -916,12 +922,18 @@ class FbMarketplaceIngestor(BaseIngestor):
                 await playwright.stop()
             raise
         self._playwright, self._browser, self._context = playwright, browser, context
+        # A dead browser/profile must be noticed even between polls (a persistent
+        # context has no Browser object whose is_connected() could be checked).
+        context.on("close", self._on_context_closed)
+        if browser is not None:
+            browser.on("disconnected", self._on_browser_disconnected)
         try:
             self._page = await self._new_page()
         except BaseException:
             await self._close_browser()
             raise
         self._needs_restart = False
+        self._restart_reason = "browser died"
         self.log.info(
             "browser ready",
             extra={
@@ -941,9 +953,12 @@ class FbMarketplaceIngestor(BaseIngestor):
             await self._close_browser()
 
     async def _close_browser(self) -> None:
-        for task in list(self._pending):
+        pending = list(self._pending)
+        for task in pending:
             task.cancel()
         self._pending.clear()
+        if pending:
+            await asyncio.wait(pending, timeout=1.0)
         page, context, browser, playwright = self._page, self._context, self._browser, self._playwright
         self._page = self._context = self._browser = self._playwright = None
         if page is not None:
@@ -963,27 +978,117 @@ class FbMarketplaceIngestor(BaseIngestor):
         assert self._context is not None
         page = await self._context.new_page()
         page.on("response", self._on_response)
+        page.on("crash", self._on_page_crash)
+        self._page_crashed = False
         return page
 
+    def _on_context_closed(self, context: "BrowserContext") -> None:
+        if context is self._context:  # our own _close_browser() detaches first
+            self._needs_restart = True
+            self._restart_reason = "browser died"
+
+    def _on_browser_disconnected(self, browser: "Browser") -> None:
+        if browser is self._browser:
+            self._needs_restart = True
+            self._restart_reason = "browser died"
+
+    def _on_page_crash(self, page: "Page") -> None:
+        # A crashed renderer is *not* closed: every call on it fails with "Page crashed"
+        # until the tab is replaced.
+        if page is self._page:
+            self._page_crashed = True
+            self.log.warning("browser tab crashed", extra={"source": self.name})
+
+    def _restart_needed(self) -> str | None:
+        if self._context is None:
+            return "not started"
+        if self._needs_restart:
+            return self._restart_reason
+        if self._browser is not None and not self._browser.is_connected():
+            return "browser died"
+        return None
+
     async def _ensure_page(self) -> "Page":
-        browser_dead = self._browser is not None and not self._browser.is_connected()
-        if self._context is None or self._needs_restart or browser_dead:
-            if self._needs_restart or browser_dead:
+        """The live search tab: (re)start the browser or replace a crashed/closed tab."""
+        reason = self._restart_needed()
+        if reason is not None:
+            if reason == "browser died":
                 self.log.warning("browser died; restarting it", extra={"source": self.name})
+            elif reason != "not started":
+                self.log.info("restarting the browser to reload the saved session", extra={"source": self.name, "reason": reason})
             await self.setup()
-        if self._page is None or self._page.is_closed():
+        page = self._page
+        if page is not None and not page.is_closed() and not self._page_crashed:
+            return page
+        if page is not None:
+            self.log.warning("replacing a crashed or closed browser tab", extra={"source": self.name})
+            with contextlib.suppress(Exception):
+                await page.close()
+        self._page = None
+        try:
             self._page = await self._new_page()
+        except PlaywrightError as exc:  # the context itself is gone (e.g. Playwright driver died)
+            self.log.warning("could not open a tab; restarting the browser", extra={"source": self.name, "error": str(exc)[:200]})
+            await self.setup()
+        assert self._page is not None
         return self._page
 
+    def _dead_after(self, page: "Page", exc: BaseException) -> str | None:
+        """Why the browser/tab cannot run further searches after ``exc`` (None = it can)."""
+        if self._needs_restart or (self._browser is not None and not self._browser.is_connected()):
+            self._needs_restart = True
+            self._restart_reason = "browser died"
+            return "browser died"
+        if page.is_closed() or self._page_crashed or "crashed" in str(exc).lower():
+            self._page_crashed = True  # the next poll opens a fresh tab
+            return "browser tab crashed"
+        return None
+
     async def _save_state(self) -> None:
-        if self._context is None:
+        """Write the context's cookies back to ``storage_state_path`` (0600, atomic).
+
+        Never replaces the file with a jar that lost the Facebook session cookies (a
+        server-side logout, a cleared profile): the operator's file stays as it was and
+        the next wall tells them to log in again.
+        """
+        context = self._context
+        if context is None:
             return
+        path = Path(self.cfg.browser.storage_state_path).expanduser()
         try:
-            await save_storage_state(self._context, self.cfg.browser.storage_state_path)
+            state = await context.storage_state()
+            cookies = state.get("cookies") if isinstance(state, Mapping) else None
+            if not has_session_cookie(cookies if isinstance(cookies, list) else []):
+                level = self.log.debug if self.cfg.browser.user_data_dir else self.log.warning
+                level("browser holds no Facebook session cookies; not overwriting the saved session",
+                      extra={"source": self.name, "path": str(path)})
+                return
+            await asyncio.to_thread(write_private_json, path, state)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed save must not fail the poll
             self.log.warning("could not save Facebook session", extra={"source": self.name, "error": repr(exc)})
+
+    # ------------------------------------------------------------------ pacing
+
+    def _searches_left(self) -> int | None:
+        """Searches still allowed in the sliding hour (``None`` = unlimited)."""
+        cap = self.max_searches_per_hour
+        if cap is None or cap <= 0:
+            return None
+        now = self._clock()
+        window = self._search_times
+        while window and now - window[0] >= SEARCH_WINDOW_SECONDS:
+            window.popleft()
+        return max(0, cap - len(window))
+
+    def next_interval(self) -> float:
+        """Jittered poll interval, stretched until the hourly search budget has room again."""
+        base = super().next_interval()
+        if self._searches_left() != 0 or not self._search_times:
+            return base
+        wait = self._search_times[0] + SEARCH_WINDOW_SECONDS - self._clock()
+        return max(base, wait + self.ctx.rng.uniform(1.0, 30.0))
 
     # ------------------------------------------------------------------ polling
 
@@ -1002,6 +1107,12 @@ class FbMarketplaceIngestor(BaseIngestor):
         """Run as many searches as fit in the poll budget, continuing round-robin next time."""
         jobs = self._jobs()
         if not jobs:
+            return []
+        if self._searches_left() == 0:
+            self.log.info(
+                "hourly Facebook search budget used up; waiting for the window to free up",
+                extra={"source": self.name, "max_searches_per_hour": self.max_searches_per_hour},
+            )
             return []
         loop = asyncio.get_running_loop()
         started = loop.time()  # browser (re)start time counts against the budget too
@@ -1025,8 +1136,15 @@ class FbMarketplaceIngestor(BaseIngestor):
                         extra={"source": self.name, "done": step, "total": len(jobs), "next_query": term},
                     )
                     break
+                if self._searches_left() == 0:
+                    self.log.info(
+                        "hourly Facebook search budget reached; continuing later",
+                        extra={"source": self.name, "done": step, "total": len(jobs), "next_query": term},
+                    )
+                    break
                 await human_pause(self.ctx.rng, *between)
             query_started = loop.time()
+            self._search_times.append(self._clock())
             try:
                 listings = await self._search(page, profile, term)
             except PlaywrightError as exc:
@@ -1034,9 +1152,9 @@ class FbMarketplaceIngestor(BaseIngestor):
                 last_error = exc
                 self._m_queries.inc(outcome="error")
                 self.log.warning("search failed", extra={"source": self.name, "query": term, "error": str(exc)[:300]})
-                if page.is_closed() or (self._browser is not None and not self._browser.is_connected()):
-                    self._needs_restart = True
-                    raise SourceError(f"browser died during search {term!r}: {exc}") from exc
+                dead = self._dead_after(page, exc)
+                if dead is not None:
+                    raise SourceError(f"{dead} during search {term!r}: {exc}") from exc
                 listings = []
             else:
                 completed += 1
@@ -1101,7 +1219,12 @@ class FbMarketplaceIngestor(BaseIngestor):
         self._m_payloads.inc(len(embedded), kind="embedded")
         self._m_payloads.inc(len(sink), kind="graphql")
         payloads = [("embedded", text) for text in embedded] + [("graphql", text) for text in sink]
-        listings, stats = await asyncio.to_thread(parse_payloads, payloads, query=term, profile_hint=profile.id)
+        try:
+            listings, stats = await asyncio.to_thread(parse_payloads, payloads, query=term, profile_hint=profile.id)
+        except Exception:  # noqa: BLE001 - one undecodable payload must not cost the whole poll
+            self._m_payloads.inc(kind="unparseable")
+            self.log.exception("could not parse Facebook payloads; using the page cards", extra={"source": self.name, "query": term})
+            listings, stats = [], ParseStats()
         for reason, count in stats.items():
             if reason not in ("documents", "withheld"):
                 self._m_skipped.inc(count, reason=reason)
@@ -1146,6 +1269,9 @@ class FbMarketplaceIngestor(BaseIngestor):
         if reason is None:
             return
         self._session_ok = False
+        if reason in _SESSION_WALLS:
+            self._needs_restart = True
+            self._restart_reason = "session wall"
         self._m_blocks.inc(reason=reason)
         where = urlsplit(page.url).path or "/"
         raise SourceBlocked(
@@ -1228,7 +1354,8 @@ class FbMarketplaceIngestor(BaseIngestor):
         text = body.decode("utf-8", errors="replace")
         if any(marker in text for marker in PAYLOAD_MARKERS):
             sink.append(text)
-            self._captured.set()
+            if sink is self._capture:  # a late body of a finished search must not wake the next one
+                self._captured.set()
 
 
 # --------------------------------------------------------------------------- CLI

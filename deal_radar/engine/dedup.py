@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import logging
 import math
 import re
 import time
@@ -133,6 +134,15 @@ _IDENTITY_ALIASES: dict[str, str] = {
     "microcentercom": "microcenter",
 }
 
+# Canonical keys of common stores (used to strip a trailing TLD typed into a store name).
+_KNOWN_STORES = frozenset(_IDENTITY_ALIASES.values()) | frozenset(
+    {
+        "bestbuy", "newegg", "walmart", "target", "microcenter", "costco", "samsclub", "adorama", "antonline",
+        "woot", "staples", "gamestop", "abt", "crutchfield", "monoprice", "nvidia", "lowes", "kohls", "macys",
+        "asus", "acer", "msi", "sony", "lenovo", "qvc", "meh", "zotac", "evga", "gigabyte", "corsair", "nzxt",
+    }
+)
+
 # Short links whose registrable domain says nothing about the store label.
 _DOMAIN_IDENTITIES: dict[str, str] = {"amzn.to": "amazon", "a.co": "amazon", "amzn.com": "amazon"}
 
@@ -185,14 +195,18 @@ def _identity_from_name(name: str) -> str | None:
     if _HOSTLIKE.match(text) and " " not in text:
         host = urlsplit(text if "://" in text else f"//{text}").hostname or ""
         return _identity_from_domain(host)
-    key = _NON_ALNUM.sub("", text.replace("&", "and") if text in ("b&h", "b & h") else text)
+    key = _NON_ALNUM.sub("", text)
     if not key:
         return None
     if key in _IDENTITY_ALIASES:
         return _IDENTITY_ALIASES[key]
-    for suffix in _TLD_SUFFIXES:  # "Amazon.com" typed with spaces / odd punctuation
-        if key.endswith(suffix) and key[: -len(suffix)] in _IDENTITY_ALIASES:
-            return _IDENTITY_ALIASES[key[: -len(suffix)]]
+    for suffix in _TLD_SUFFIXES:  # "Best Buy .com", "Newegg-com": a known store plus a TLD
+        base = key[: -len(suffix)]
+        if key.endswith(suffix) and base:
+            if base in _IDENTITY_ALIASES:
+                return _IDENTITY_ALIASES[base]
+            if base in _KNOWN_STORES:
+                return base
     return key
 
 
@@ -382,7 +396,7 @@ class Deduplicator(abc.ABC):
             decision = DedupDecision(status=status, previous_price=_to_float(reply[1]), keys=[plan.listing_redis_key])
         else:
             decision = DedupDecision(status=status, previous_price=_to_float(reply[1]), keys=[reply[2]])
-            if log.isEnabledFor(10):  # DEBUG; avoid building the record on the hot path
+            if log.isEnabledFor(logging.DEBUG):  # avoid building the record on the hot path
                 log.debug(
                     "cross-source duplicate",
                     extra={"listing": plan.listing_key, "duplicate_of": reply[3], "cluster_key": reply[2]},
@@ -726,11 +740,11 @@ class MemoryDeduplicator(Deduplicator):
                 prev_ttl = int(state.get("prev_ttl_ms") or 0) / 1000.0 - elapsed
                 if state["mode"] == "price_drop" and state.get("prev_price") and prev_ttl > 0:
                     self._listings[state["listing"]] = _ListingEntry(
-                        state["prev_price"], state.get("prev_token") or "", state.get("prev_ts") or "", now + prev_ttl
+                        price_text=state["prev_price"],
+                        ts=state.get("prev_ts") or "",
+                        token=state.get("prev_token") or "",
+                        expires_at=now + prev_ttl,
                     )
-                    # keep field order identical to the dataclass: price, ts, token
-                    restored = self._listings[state["listing"]]
-                    restored.ts, restored.token = state.get("prev_ts") or "", state.get("prev_token") or ""
                 else:
                     del self._listings[state["listing"]]
                 undone |= 1
