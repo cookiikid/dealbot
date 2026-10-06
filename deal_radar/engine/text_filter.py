@@ -182,7 +182,7 @@ def _fold_pattern(pattern: str) -> str:
 # lower-cased, whitespace-normalised text; only pattern sets whose anchors occur are
 # then actually run. Pattern sets for which no anchor can be proven always run.
 
-_MAX_ANCHORS = 64  # per pattern; beyond this the prefix stops being extended
+_MAX_ANCHORS = 256  # per pattern; beyond this the prefix stops being extended
 _WS_RUN = re.compile(r"\s+")
 
 
@@ -190,7 +190,7 @@ def _anchor_constants() -> dict[str, Any] | None:
     if _sre_c is None or _sre_p is None:
         return None
     names = (
-        "LITERAL", "IN", "CATEGORY", "CATEGORY_SPACE", "SUBPATTERN", "BRANCH", "MAX_REPEAT", "MIN_REPEAT",
+        "LITERAL", "IN", "RANGE", "CATEGORY", "CATEGORY_SPACE", "SUBPATTERN", "BRANCH", "MAX_REPEAT", "MIN_REPEAT",
         "AT", "ASSERT", "ASSERT_NOT",
     )
     try:
@@ -213,17 +213,19 @@ def _sub_items(node: Any) -> list[tuple[Any, Any]]:
 
 
 def _class_chars(items: Sequence[tuple[Any, Any]]) -> set[str] | None:
-    """Characters of a small positive class made of literals and whitespace (as " ")."""
+    """Characters of a small positive class (literals, short ranges, whitespace as " ")."""
     assert _C is not None
     chars: set[str] = set()
     for op, av in items:
         if op is _C["LITERAL"]:
             chars.add(chr(av))
+        elif op is _C["RANGE"] and av[1] - av[0] < 10:
+            chars.update(chr(c) for c in range(av[0], av[1] + 1))
         elif op is _C["CATEGORY"] and av is _C["CATEGORY_SPACE"]:
             chars.add(" ")
         else:
             return None
-    return chars if 0 < len(chars) <= 8 else None
+    return chars if 0 < len(chars) <= 10 else None
 
 
 def _anchor_seq(items: Sequence[tuple[Any, Any]]) -> tuple[set[str], bool]:
