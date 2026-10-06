@@ -359,16 +359,37 @@ def _loads_lenient(raw: str) -> Any:
     return None
 
 
+_ANSWER_KEYS = ("category", "verdict", "label")
+_MAX_OBJECTS_SCANNED = 16
+
+
+def _looks_like_answer(obj: Mapping[str, Any]) -> bool:
+    if any(k in obj for k in _ANSWER_KEYS):
+        return True
+    return any(isinstance(v, Mapping) and any(k in v for k in _ANSWER_KEYS) for v in obj.values())
+
+
 def _first_object(text: str) -> dict[str, Any] | None:
+    """First balanced JSON object in ``text``, preferring one that carries an answer."""
+    first: dict[str, Any] | None = None
     start = text.find("{")
-    while start != -1:
+    scanned = 0
+    while start != -1 and scanned < _MAX_OBJECTS_SCANNED:
         end = _matching_brace(text, start)
-        if end is not None:
-            obj = _loads_lenient(text[start : end + 1])
-            if isinstance(obj, dict):
+        if end is None:
+            start = text.find("{", start + 1)
+            continue
+        scanned += 1
+        obj = _loads_lenient(text[start : end + 1])
+        if isinstance(obj, dict):
+            if _looks_like_answer(obj):
                 return obj
-        start = text.find("{", start + 1)
-    return None
+            if first is None:
+                first = obj
+            start = text.find("{", end + 1)  # skip past this whole object, including nested ones
+        else:
+            start = text.find("{", start + 1)
+    return first
 
 
 def _salvage_fields(text: str) -> dict[str, Any] | None:
@@ -394,14 +415,14 @@ def extract_json_object(content: Any) -> dict[str, Any] | None:
         obj = _loads_lenient(text)
         if isinstance(obj, dict):
             return obj
-    for match in _FENCE.finditer(text):
-        obj = _first_object(match.group(1))
-        if obj is not None:
+    fallback: dict[str, Any] | None = None
+    for chunk in [m.group(1) for m in _FENCE.finditer(text)] + [text]:
+        obj = _first_object(chunk)
+        if obj is not None and _looks_like_answer(obj):
             return obj
-    obj = _first_object(text)
-    if obj is not None:
-        return obj
-    return _salvage_fields(text)
+        fallback = fallback or obj
+    salvaged = _salvage_fields(text)
+    return salvaged if salvaged is not None else fallback
 
 
 def normalize_category(value: Any) -> str:

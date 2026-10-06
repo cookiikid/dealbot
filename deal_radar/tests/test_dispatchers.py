@@ -523,7 +523,8 @@ async def test_discord_send_notice(discord_api: FakeAPI, http: HttpClient) -> No
     assert "components" not in req.json
     embed = req.json["embeds"][0]
     assert embed["title"] == "Source blocked"
-    assert embed["description"].startswith("fb\\_marketplace") or embed["description"].startswith("fb_marketplace")
+    assert embed["description"] == "fb_marketplace hit a login wall @everyone"
+    assert embed["color"] == 0x607D8B and embed["footer"] == {"text": "DealRadar notice"}
 
 
 # --------------------------------------------------------------------------- Telegram: formatting

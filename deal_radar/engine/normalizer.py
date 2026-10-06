@@ -178,6 +178,7 @@ _TEXT_RE = _build_money_regex(
     plain=False,
 )
 _TEXT_ANCHOR = re.compile(r"\$|[uU][sS][dD]")
+_DIGIT = re.compile(r"\d")
 _PREFIX_LOOKBACK = 6  # "-US $" / "-CAD $": a prefix match starts at most this far before "$"
 _ANCHOR_WINDOW = 48  # chars after an anchor searched for its amount
 _RUN_SEPARATORS = ",.'\u00a0\u202f\u2009"
@@ -193,6 +194,7 @@ _FREE_SHIPPING = re.compile(
     r"|^\W*(?:shipping|delivery)\s*:?\s*(?:free|included)\b",
     re.IGNORECASE,
 )
+_MAX_PRICE_FIELD_LEN = 256  # longer "price" strings are page text, not a price field
 _KEYCAP = re.compile(r"[0-9#*]\ufe0f?\u20e3")
 
 # Amounts in free text that are labelled as something other than the item price.
@@ -315,6 +317,10 @@ def _iter_text_candidates(text: str) -> Iterator[_Candidate]:
         anchor = _TEXT_ANCHOR.search(text, pos)
         if anchor is None:
             return
+        a, e = anchor.start(), anchor.end()
+        if not _DIGIT.search(text, max(pos, a - 2), min(n, e + 4)):
+            pos = e  # "$$$", "usd only": no amount can touch this anchor
+            continue
         # The window end only bounds work for an anchor without an amount ("$$$");
         # any real amount is far shorter than _ANCHOR_WINDOW characters.
         m = _TEXT_RE.search(text, _match_floor(text, anchor.start(), pos), min(n, anchor.end() + _ANCHOR_WINDOW))
@@ -367,7 +373,7 @@ def _parse_money_detail(value: str | float | int | None) -> _Money:
         return _Money(amount, "USD", False, marker == "$")
 
     text = value.strip()
-    if not text:
+    if not text or len(text) > _MAX_PRICE_FIELD_LEN:
         return _NO_MONEY
     if "\u20e3" in text:
         text = _KEYCAP.sub(" ", text)
@@ -871,8 +877,13 @@ def _image_url(url: object) -> str | None:
 
 # =========================================================================== text
 
-_TAG_DROP_BLOCKS = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
-_TAG_COMMENT = re.compile(r"<!--.*?-->|<!\[CDATA\[|\]\]>|<![A-Za-z][^>]*>", re.DOTALL)
+# Blocks and comments are removed by explicit open/close scanning, not lazy ".*?"
+# regexes: those go quadratic on hostile input ("<script>" x 5000, never closed).
+_BLOCK_OPEN = re.compile(r"<(script|style|noscript)\b", re.IGNORECASE)
+_BLOCK_CLOSE = {
+    tag: re.compile(rf"</{tag}\s*>", re.IGNORECASE) for tag in ("script", "style", "noscript")
+}
+_TAG_MARKUP = re.compile(r"<!\[CDATA\[|\]\]>|<![A-Za-z][^<>]*>")
 _TAG_BREAK = re.compile(r"<\s*/?\s*(?:br|p|div|li|tr|h[1-6]|hr|ul|ol|table|blockquote)\b[^<>]*>", re.IGNORECASE)
 _TAG_ANY = re.compile(r"</?[A-Za-z][^<>]*>")
 _ENTITY = re.compile(r"&(?:#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
@@ -880,6 +891,7 @@ _CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]")
 _HSPACE = re.compile(r"[^\S\n]+")
 _NEWLINES = re.compile(r" ?\n\s*")
 _ALNUM = re.compile(r"[^\W_]")
+_MIN_RAW_BUDGET = 4096
 
 # Trademark-ish signs are removed *before* NFKC so "RTX™" does not become "RTXTM".
 _TRADEMARKS = re.compile("[\u2122\u00ae\u00a9\u2120]")
@@ -889,11 +901,48 @@ _DOUBLE_QUOTES = re.compile("[\u201c\u201d\u201e\u201f\u2033\u2036\u00ab\u00bb]"
 _FANCY_DASHES = re.compile("[\u2010-\u2015\u2212\ufe58\ufe63]")
 
 
+def _drop_blocks(text: str) -> str:
+    """Remove <script>/<style>/<noscript> bodies; an unclosed block runs to the end."""
+    out: list[str] = []
+    pos = 0
+    while True:
+        opening = _BLOCK_OPEN.search(text, pos)
+        if opening is None:
+            break
+        out.append(text[pos : opening.start()])
+        closing = _BLOCK_CLOSE[opening.group(1).lower()].search(text, opening.end())
+        if closing is None:
+            return " ".join(out)
+        out.append(" ")
+        pos = closing.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _drop_comments(text: str) -> str:
+    """Remove <!-- ... --> comments; an unclosed comment runs to the end."""
+    out: list[str] = []
+    pos = 0
+    while True:
+        start = text.find("<!--", pos)
+        if start == -1:
+            break
+        out.append(text[pos:start])
+        end = text.find("-->", start + 4)
+        if end == -1:
+            return " ".join(out)
+        out.append(" ")
+        pos = end + 3
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _strip_tags(text: str) -> str:
     if "<s" in text or "<S" in text or "<n" in text or "<N" in text:
-        text = _TAG_DROP_BLOCKS.sub(" ", text)
+        text = _drop_blocks(text)
     if "<!" in text or "]]>" in text:
-        text = _TAG_COMMENT.sub(" ", text)
+        text = _drop_comments(text)
+        text = _TAG_MARKUP.sub(" ", text)
     text = _TAG_BREAK.sub("\n", text)
     return _TAG_ANY.sub("", text)
 
@@ -928,6 +977,12 @@ def clean_text(text: str, max_len: int | None = None, *, keep_newlines: bool = T
         return ""
     if not isinstance(text, str):
         text = str(text)
+    if max_len is not None and len(text) > max(max_len * 8, _MIN_RAW_BUDGET):
+        # Bound the work on oversized input; markup can be ~8x the visible text.
+        text = text[: max(max_len * 8, _MIN_RAW_BUDGET)]
+        cut_tag = text.rfind("<")
+        if cut_tag > text.rfind(">"):
+            text = text[:cut_tag]  # do not leave half a tag behind
     if "<" in text:
         text = _strip_tags(text)
     for _ in range(2):

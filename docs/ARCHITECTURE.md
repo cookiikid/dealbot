@@ -96,20 +96,39 @@ to minutes), and the API's own refresh cadence.
   the first byte; a warm one costs 1 RTT.
 - **Conditional requests** (`If-None-Match` / `If-Modified-Since`) when the origin
   honours them. A 304 is a ~200-byte "nothing changed".
-- **Cache-busting, honestly.** A nonce query parameter (`?_=<ns>`) forces an edge
-  miss *only* on CDNs whose cache key includes the full query string. Many
-  configurations strip unknown parameters or normalise the key; on those it does
-  nothing. Where it works it multiplies origin load, which is exactly what bot
-  managers (Akamai Bot Manager, HUMAN/PerimeterX, DataDome, Cloudflare) look for.
-  It is therefore **opt-in per endpoint** (`cache_bust: true`), never global.
-  `Cache-Control: no-cache` request headers are ignored by all major CDNs for
-  anonymous traffic and are not used.
+- **Cache-busting, honestly.** Cloudflare, Fastly and Akamai include the query
+  string in their default cache key, so a nonce parameter (`?_=<ns>`) does force an
+  *edge* miss. In practice it rarely buys fresher data:
+  * Cloudflare does not cache HTML/JSON by default. Retailer JSON was already
+    uncached (`cf-cache-status: DYNAMIC` on Shopify and Slickdeals, verified).
+  * The real staleness often lives in an **application cache behind the CDN**.
+    Newegg's `ProductRealtime` JSON advertises `max-age=10`, but the `Age` header
+    shows a ~60-65 s internal refresh that ignores random parameters and `no-cache`
+    request headers.
+  * Every busted request is extra origin load with a bot-like signature.
+
+  Cache-busting is therefore **opt-in per endpoint** (`cache_bust: true`). The
+  better tools are conditional requests where an ETag exists (Shopify returns a
+  weak `page_cache` ETag and a genuine 304), reading the `Age` header to learn the
+  true refresh interval, and polling at that interval. Request-side
+  `Cache-Control: no-cache` has no documented effect and is not used.
 - **Mobile app backends.** Retail apps often call private REST/GraphQL APIs that
   skip HTML caches. DealRadar supports them through the generic JSON adapter, but
   ships no reverse-engineered private endpoints. They change without notice, they
   are usually covered by the app's terms, and fighting a bot manager with a Python
   TLS fingerprint is a losing, account-endangering game. The supported fast path is
   official APIs plus the generic adapter.
+
+*Reachability from a GCP IP (probed live, 2026-10-06):*
+
+| Endpoint | Result | Use |
+|---|---|---|
+| Best Buy Products API (`api.bestbuy.com`) | ✅ 5 req/s, 50k/day. Quota exhaustion is a **403**, like a bad key. Keys are not issued to free-mail addresses. | primary |
+| Shopify `/products/<h>.js`, `/products.json` | ✅ uncached at edge; ETag → 304. Sporadic 429 + Cloudflare challenge HTML. | primary |
+| Newegg `ProductRealtime` | ✅ JSON; ~60 s app-level cache | poll ≥ 60 s |
+| Target RedSky | ❌ **HTTP 435** HUMAN/PerimeterX block JSON (must not be parsed as "out of stock") | home node only |
+| bestbuy.com web, Walmart, B&H, Micro Center, Amazon pages | ❌ Akamai reset / PerimeterX / Cloudflare challenge / captcha | not polled |
+| Amazon PA-API 5.0 | ❌ deprecated (403); successor Creators API needs 10 qualifying sales/30 days | via generic adapter if eligible |
 
 ### 2.2 eBay (`sources/ebay_api.py`)
 
@@ -186,10 +205,20 @@ checkpoint that stops the source for hours or costs the account.
   `storage_state.json`, logged in once by the operator through the `--login` helper.
   The page is reused across polls, because launching browsers per poll is slow and
   looks suspicious.
-- **Read the data layer, not the DOM.** The search page loads results through
-  `/api/graphql/`. We intercept those responses and walk the JSON for listing
-  nodes, so class names and layout churn do not matter. A DOM fallback covers
-  pages that render server-side.
+- **Read the data layer, not the DOM.** The first batch of results is embedded in
+  the page as Relay JSON (`<script type="application/json" data-sjs>`). Later batches
+  arrive as `POST /api/graphql/` responses, which may start with `for (;;);` and
+  hold several JSON documents per body. Both share the path
+  `data.marketplace_search.feed_units.edges[].node.listing` (`id`,
+  `marketplace_listing_title`, `listing_price.amount` in major units,
+  `primary_listing_photo.image.uri`, `location.reverse_geocode`, `is_sold` /
+  `is_pending`). We walk the JSON generically for listing nodes, so path and
+  class-name churn do not matter. The DOM grid is virtualised and is only a fallback.
+- **Logged in, on purpose.** In 2026 logged-out search redirects to `/login` for
+  most clients. When logged in, Facebook ignores the URL `radius` and uses the
+  account's saved radius. An unknown city slug silently redirects to the account
+  location, so the page URL is re-checked after navigation. `fbcdn` photo URLs
+  expire, so vision runs promptly.
 - **Consistency over randomisation.** IP geolocation (a home connection — the
   laptop node), browser geolocation pin, `timezone_id`, `locale` and
   `Accept-Language` all agree. The User-Agent is not rotated for a logged-in
@@ -200,8 +229,13 @@ checkpoint that stops the source for hours or costs the account.
   a 4-minute interval and 1-day recency. A checkpoint or login wall raises
   `SourceBlocked`, which pauses the source for hours and notifies the operator. It
   does not retry harder.
-- OfferUp and Craigslist are read through their own JSON/HTML search responses at
-  low rates from the same home node.
+- **OfferUp:** the search page's `__NEXT_DATA__` (`searchFeedResponse.looseTiles`),
+  or its Apollo endpoint `POST /api/graphql` (`GetModularFeed`). Location comes from
+  the `ou.location` cookie. Feed tiles carry no post date.
+- **Craigslist:** RSS is dead (403). The site's own JSON API
+  (`sapi.craigslist.org/web/v8/postings/search/full`) returns positional arrays
+  decoded against `data.decode` (`postingId = minPostingId + item[0]`). It is polled
+  at ≤ 1 request/s from the home node.
 
 *What we deliberately don't do:* CAPTCHA solving, account rotation or farming,
 residential proxy pools, or TLS-fingerprint impersonation. Each of these turns a
@@ -210,12 +244,27 @@ than a well-paced honest session.
 
 ### 2.6 Delivery (`dispatchers/`)
 
-Discord webhooks and the Telegram Bot API both deliver mobile pushes in well under
-a second in the common case. The dispatchers never block one another: routes
-fan out concurrently with a per-target timeout. Both also honour server back-off
-(`retry_after` on Discord 429s, `parameters.retry_after` on Telegram), because
-Discord bans IPs that keep sending invalid requests. Price errors ping a role
-(Discord) and bypass silent mode (Telegram). Medium alerts are delivered silently.
+Discord webhooks and the Telegram Bot API typically reach a phone in ~1-3 s.
+Neither publishes latency numbers, and the dominant risk is client-side
+notification settings, not the API. The dispatchers never block one another: routes
+fan out concurrently with a per-target timeout. Verified specifics:
+
+* **Discord.** Webhooks are called on the versioned `/api/v10/` path. Link buttons
+  (style 5) on non-application webhooks render **only** with `?with_components=true`;
+  otherwise they are silently dropped. The 6,000-character embed budget is shared by
+  all embeds in a message. `allowed_mentions` is always sent explicitly, so a listing
+  title containing `@everyone` can never ping anyone. Rate limits are read from
+  `X-RateLimit-*` headers (per-webhook limits are undocumented). 401/403/404
+  disable the target permanently, because webhook calls are unauthenticated and
+  Cloudflare bans IPs after 10,000 invalid requests in 10 minutes.
+* **Telegram.** HTML parse mode with `&`, `<` and `>` escaped; text ≤ 4,096 and
+  captions ≤ 1,024 characters after entity parsing. Limits are ~1 msg/s per chat and
+  20 msg/min per group. A 429 carries an integer `parameters.retry_after`. A photo URL
+  Telegram cannot fetch (`failed to get HTTP URL content`) falls back to `sendMessage`
+  with a link preview.
+
+Price errors ping a role (Discord) and bypass silent mode (Telegram). Medium alerts
+are delivered silently.
 
 ---
 
