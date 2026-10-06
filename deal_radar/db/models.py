@@ -16,6 +16,9 @@ The schema is deliberately small and portable: it must run unchanged on
   newer" comparisons work on the raw text) and are re-attached to ``timezone.utc``
   on load. PostgreSQL uses ``TIMESTAMP WITH TIME ZONE``. Callers therefore always get
   timezone-aware UTC datetimes back, on both backends.
+* **Hostile text is neutralised, not fatal.** Every string the writer binds goes through
+  :func:`db_text` (NUL removal, lone-surrogate repair, clipping to the column width), so
+  one malformed scraped listing cannot abort a batch transaction on either backend.
 * **Listings are keyed by** :attr:`DealItem.fingerprint` (20 hex chars of
   ``sha1(listing_key)``), so the hot-path writer can compute the primary key without
   a lookup and upsert with ``ON CONFLICT (id)``. ``listing_key`` stays unique and is
@@ -58,7 +61,7 @@ from sqlalchemy.types import TypeDecorator
 # --------------------------------------------------------------------------- column helpers
 
 # Column widths. VARCHAR limits are enforced by PostgreSQL (not SQLite), so every value
-# bound to a bounded column is clipped to these lengths by the writer (see ``clip``).
+# bound to a bounded column is clipped to these lengths by the writer (see ``db_text``).
 ID_LEN = 40
 SOURCE_LEN = 64
 PROFILE_LEN = 128
@@ -70,7 +73,6 @@ STATUS_LEN = 16
 SHORT_TEXT_LEN = 255
 REJECT_CODE_LEN = 64
 SEVERITY_LEN = 16
-ALERT_ID_LEN = 64
 
 
 def ensure_utc(value: datetime) -> datetime:
@@ -85,6 +87,27 @@ def clip(value: str | None, length: int) -> str | None:
     if value is None:
         return None
     return value if len(value) <= length else value[:length]
+
+
+def db_text(value: str | None, length: int | None = None) -> str | None:
+    """Make ``value`` storable on every backend, then optionally ``clip`` it to ``length``.
+
+    Scraped text is hostile: PostgreSQL rejects NUL characters in ``text``/``varchar``
+    (and ``\\u0000`` in ``jsonb``), and no driver can UTF-8-encode a lone UTF-16 surrogate
+    (e.g. an emoji cut in half by a JSON feed). Either would abort the whole batch
+    transaction, so NULs are removed and surrogates are re-paired where possible and
+    otherwise replaced by U+FFFD. Clean strings (the norm) cost two C-level scans.
+    """
+    if value is None:
+        return None
+    if "\x00" in value:
+        value = value.replace("\x00", "")
+    if not value.isascii():
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            value = value.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return value if length is None else clip(value, length)
 
 
 class UTCDateTime(TypeDecorator[datetime]):
@@ -202,7 +225,8 @@ class AlertRow(Base):
 
     __tablename__ = "alerts"
 
-    id: Mapped[str] = mapped_column(String(ALERT_ID_LEN), primary_key=True)  # Alert.alert_id
+    # Alert.alert_id: a uuid4 hex by default, but the contract puts no length limit on it.
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
     listing_id: Mapped[str] = mapped_column(String(ID_LEN), index=True)
     product_key: Mapped[str] = mapped_column(String(PRODUCT_KEY_LEN), index=True)
     severity: Mapped[str] = mapped_column(String(SEVERITY_LEN))
@@ -233,5 +257,6 @@ __all__ = [
     "PriceSnapshot",
     "UTCDateTime",
     "clip",
+    "db_text",
     "ensure_utc",
 ]
