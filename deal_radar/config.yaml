@@ -1,0 +1,900 @@
+# =============================================================================
+#  DealRadar — master configuration
+# =============================================================================
+#  * Validated by deal_radar/config_schema.py (Pydantic v2, unknown keys rejected).
+#    Check it any time with:  python -m deal_radar.main --check-config
+#  * Secrets/node-specific values come from the environment via ${VAR},
+#    ${VAR:-default} or ${VAR:?error}. Copy deploy/.env.example to .env.
+#  * Regexes are Python `re` syntax, compiled case-insensitively. YAML single
+#    quotes keep backslashes literal ('\b' is a regex word boundary).
+#  * Adding a new product class = adding one block under `profiles:`.
+# =============================================================================
+version: 1
+
+app:
+  name: dealradar
+  node_id: ${NODE_ID:-local-dev}
+  # collector = run sources; processor = filter/score/dedup/dispatch.
+  # GCP primary: "collector,processor"; home laptop (FB/OfferUp): "collector".
+  roles: ${APP_ROLES:-collector,processor}
+  log_level: ${LOG_LEVEL:-INFO}
+  log_json: ${LOG_JSON:-false}
+  timezone: ${APP_TIMEZONE:-America/New_York}
+  dry_run: ${DRY_RUN:-false}
+
+http_server:
+  enabled: true
+  host: 0.0.0.0
+  port: ${HTTP_PORT:-8080}
+  auth_token: ${HTTP_AUTH_TOKEN:-}
+
+storage:
+  # SQLite (WAL) is plenty for one processor; use Postgres for multiple processors:
+  #   postgresql+asyncpg://dealradar:pass@10.0.0.5:5432/dealradar
+  database_url: ${DATABASE_URL:-sqlite+aiosqlite:///data/dealradar.db}
+  # Unset => single-node in-memory dedup. Set for distributed mode (Valkey/Redis 7+).
+  redis_url: ${REDIS_URL:-}
+  redis_key_prefix: "dr:"
+  snapshot_batch_size: 200
+  snapshot_flush_seconds: 2.0
+  record_rejected: true
+  retention_days: 120
+
+bus:
+  # memory = in-process queue (single node). redis = Redis Streams consumer group
+  # (collector nodes XADD, processor nodes XREADGROUP).
+  backend: ${BUS_BACKEND:-memory}
+  stream_key: "stream:raw"
+  group: processors
+  maxlen: 100000
+  block_ms: 1000
+  batch_size: 64
+  workers: 8
+
+network:
+  timeout_seconds: 10
+  connect_timeout_seconds: 3
+  max_connections: 200
+  max_connections_per_host: 8
+  dns_cache_ttl_seconds: 300
+  keepalive_seconds: 60
+  trust_env: true
+  proxy: ${HTTP_PROXY_URL:-}
+  identity_rotation_minutes: 45
+  retry:
+    max_attempts: 4
+    base_delay_seconds: 0.4
+    max_delay_seconds: 15
+    max_total_seconds: 30
+  # Politeness budgets per host (suffix match). Being blocked is the slowest outcome.
+  default_host_limit: { rate_per_second: 2.0, burst: 4 }
+  host_limits:
+    api.ebay.com: { rate_per_second: 4.0, burst: 8 }
+    oauth.reddit.com: { rate_per_second: 1.5, burst: 3 }   # 100 QPM per OAuth client
+    www.reddit.com: { rate_per_second: 0.15, burst: 2 }     # unauthenticated: ~10 QPM
+    slickdeals.net: { rate_per_second: 0.5, burst: 2 }
+    api.bestbuy.com: { rate_per_second: 4.0, burst: 5 }    # official limit 5 QPS
+    redsky.target.com: { rate_per_second: 1.0, burst: 2 }
+    newegg.com: { rate_per_second: 0.5, burst: 1 }
+    offerup.com: { rate_per_second: 0.3, burst: 1 }
+    craigslist.org: { rate_per_second: 0.3, burst: 1 }
+    discord.com: { rate_per_second: 2.0, burst: 5 }
+    api.telegram.org: { rate_per_second: 10.0, burst: 20 }
+
+# -----------------------------------------------------------------------------
+#  Sources
+# -----------------------------------------------------------------------------
+sources:
+  ebay:
+    # Official Browse API (OAuth client-credentials). Free keys: developer.ebay.com
+    enabled: ${EBAY_ENABLED:-false}
+    client_id: ${EBAY_CLIENT_ID:-}
+    client_secret: ${EBAY_CLIENT_SECRET:-}
+    marketplace_id: EBAY_US
+    delivery_country: US
+    delivery_postal_code: ${HOME_ZIP:-}
+    affiliate_campaign_id: ${EBAY_CAMPAIGN_ID:-}
+    # Interval is auto-stretched so (queries x polls/day) stays inside this quota.
+    daily_call_budget: 5000
+    budget_safety_factor: 0.85
+    poll_interval_seconds: 45
+    limit: 100
+    buying_options: [FIXED_PRICE, BEST_OFFER]
+    max_concurrency: 4
+    reliability: 0.95
+    nodes: ${EBAY_NODES:-}
+
+  reddit:
+    # Without OAuth credentials the public JSON endpoints are used (10 QPM and
+    # frequently 403'd from datacenter IPs) — create a free "script" app at
+    # https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID/SECRET.
+    enabled: ${REDDIT_ENABLED:-true}
+    client_id: ${REDDIT_CLIENT_ID:-}
+    client_secret: ${REDDIT_CLIENT_SECRET:-}
+    username: ${REDDIT_USERNAME:-}
+    poll_interval_seconds: 6
+    max_item_age_minutes: 240
+    subreddits:
+      - { name: buildapcsales, mode: deals, limit: 25 }
+      - { name: hardwareswap, mode: swap, limit: 25 }
+    hardwareswap_locations: []          # e.g. [USA-TX, USA-OK]; empty = nationwide
+    reliability: 0.9
+    lease_ttl_seconds: 45                # active/passive fail-over when Redis is configured
+
+  slickdeals:
+    enabled: ${SLICKDEALS_ENABLED:-true}
+    poll_interval_seconds: 45
+    max_item_age_minutes: 360
+    feeds:
+      - name: frontpage
+        url: https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1
+      - name: hot_deals_forum
+        url: https://slickdeals.net/forums/external.php?type=rss2&forumids=9
+    search_feeds_from_profiles: true
+    reliability: 0.88
+    lease_ttl_seconds: 120
+
+  retail:
+    # First-party price/inventory endpoints. Price errors show up here first.
+    enabled: ${RETAIL_ENABLED:-false}
+    poll_interval_seconds: 20
+    max_concurrency: 6
+    reliability: 1.0
+    endpoints:
+      - name: bestbuy_flagship_gpus
+        adapter: bestbuy
+        api_key: ${BESTBUY_API_KEY:-}
+        profile_hint: rtx_5090
+        # Example SKUs (verify on bestbuy.com — SKUs change with new revisions):
+        # 6614151 RTX 5090 Founders Edition
+        skus: ["6614151"]
+        poll_interval_seconds: 15
+      # Shopify storefronts expose /products/<handle>.js without auth. Example:
+      # - name: example_shopify_store
+      #   adapter: shopify
+      #   retailer: Example Store
+      #   store_url: https://example-store.com
+      #   handles: [nvidia-geforce-rtx-5090-founders-edition]
+      #   cache_bust: true
+      # Any JSON API can be mapped without code:
+      # - name: custom_json_api
+      #   adapter: json
+      #   retailer: Example
+      #   url: https://api.example.com/v1/products?category=gpu
+      #   items_path: data.products
+      #   fields: { id: sku, title: name, price: pricing.current, list_price: pricing.regular,
+      #             in_stock: inventory.available, url: links.web, image: images[0].url }
+
+  fb_marketplace:
+    # Runs a real Chromium with a persisted logged-in session. Run it on a HOME
+    # connection (residential IP) — datacenter IPs trigger checkpoints quickly.
+    enabled: ${FB_ENABLED:-false}
+    nodes: ${FB_NODES:-}
+    poll_interval_seconds: 240
+    cooldown_seconds: 1800
+    max_item_age_minutes: 1440
+    days_since_listed: 1
+    max_listings_per_query: 40
+    scrolls_per_query: 1
+    checkpoint_pause_minutes: 180
+    reliability: 0.7
+    location:
+      latitude: ${HOME_LAT:-40.7128}
+      longitude: ${HOME_LON:--74.0060}
+      city_slug: ${FB_CITY_SLUG:-nyc}
+      radius_km: ${FB_RADIUS_KM:-60}
+      timezone_id: ${APP_TIMEZONE:-America/New_York}
+      locale: en-US
+      postal_code: ${HOME_ZIP:-}
+    browser:
+      headless: ${FB_HEADLESS:-true}
+      storage_state_path: ${FB_STORAGE_STATE:-data/fb_storage_state.json}
+      proxy: ${FB_PROXY:-}
+      min_action_delay_seconds: 1.5
+      max_action_delay_seconds: 4.5
+
+  offerup:
+    enabled: ${OFFERUP_ENABLED:-false}
+    nodes: ${OFFERUP_NODES:-}
+    poll_interval_seconds: 180
+    latitude: ${HOME_LAT:-}
+    longitude: ${HOME_LON:-}
+    zip_code: ${HOME_ZIP:-}
+    radius_miles: 30
+    reliability: 0.7
+
+  craigslist:
+    enabled: ${CRAIGSLIST_ENABLED:-false}
+    poll_interval_seconds: 300
+    sites: [newyork]
+    postal_code: ${HOME_ZIP:-}
+    search_distance_miles: 40
+    reliability: 0.65
+
+# -----------------------------------------------------------------------------
+#  Deterministic text filters (engine/text_filter.py)
+#  action: reject  -> hard reject on match
+#  action: risk    -> adds a RiskSignal with `probability` (combined by noisy-OR)
+#  negatable: true -> matches preceded (within negation_window_words, same clause)
+#                     by a negation term are ignored ("no cracks", "never mined")
+# -----------------------------------------------------------------------------
+filters:
+  negation_terms: ["no", "not", "never", "zero", "without", "nothing", "isn't", "wasn't", "free of", "none", "0"]
+  negation_window_words: 3
+  min_title_length: 6
+  allowed_currencies: [USD]
+  rules:
+    box_only:
+      action: reject
+      description: Packaging sold without the product (classic eBay/FB bait)
+      patterns:
+        - '(?<!no\s)(?<!not\s)\bbox\s*(?:only|alone)\b'
+        - '\bempty\s+(?:retail\s+|original\s+)?box(?:es)?\b'
+        - '\b(?:just|only)\s+(?:the\s+)?(?:retail\s+|original\s+|empty\s+)?(?:box|packaging)\b(?!\s+(?:is|was|has)\b)'
+        - '\b(?:box|packaging)\s+(?:and|&|\+)\s+(?:packaging|manuals?|accessories|inserts?|foam)\s+only\b'
+        - '\bpackaging\s+only\b'
+        - '\b(?:gpu|card|graphics\s+card|tv|monitor|item|unit)\s+(?:is\s+)?not\s+included\b'
+        - '\bno\s+(?:gpu|graphics\s+card|tv|monitor)\s+(?:is\s+)?included\b'
+        - '\bdoes\s+not\s+(?:include|come\s+with)\s+(?:the\s+|a\s+)?(?:gpu|card|graphics\s+card|tv|monitor)\b'
+    photo_only:
+      action: reject
+      description: '"Picture of an RTX 4090" listings'
+      patterns:
+        - '\b(?:photo|picture|image|pic|print|poster)\s+only\b'
+        - '\b(?:you\s+(?:are|will\s+be)\s+(?:buying|purchasing|receiving)|you\s+(?:will\s+)?(?:get|receive))\s+(?:a\s+|an\s+|the\s+)?(?:photo|picture|image|print|digital\s+(?:photo|image|file))\b'
+        - '\bthis\s+(?:listing\s+)?is\s+(?:for\s+)?(?:a\s+)?(?:photo|picture|image|print)\s+of\b'
+        - '\bnot\s+(?:an?\s+)?(?:actual|real|physical|working)\s+(?:gpu|graphics\s+card|card|item|product|tv|monitor)\b'
+    damaged:
+      action: reject
+      negatable: true
+      description: Broken / for-parts / non-functional items (not packaging damage)
+      patterns:
+        - '\bfor\s+parts\b'
+        - '\bparts\s+(?:only|or\s+repair)\b'
+        - '\b(?:broken|cracked|shattered|smashed|bricked|dead|defective|faulty|damaged|burnt|burned|melted)\b(?!\s+(?:box|packaging|seal|tape|bag|corner\s+of\s+(?:the\s+)?box))'
+        - '\bnot\s+(?:working|functional|functioning|turning\s+on|powering\s+on|posting|detected|recognized)\b'
+        - '\b(?:does|did|do)\s*(?:n[''’]?t|\s+not)\s+(?:work|power|post|turn\s+on|display|boot)\b'
+        - '\b(?:won[''’]?t|will\s+not|can[''’]?t|cannot)\s+(?:power|post|turn\s+on|boot|display)\b'
+        - '\bno\s+(?:display|signal|video\s+output|post)\b'
+        - '\b(?:vertical|horizontal)\s+lines?\b'
+        - '\bdead\s+pixels?\b'
+        - '\bburn[\s-]?in\b'
+        - '\bartifact(?:s|ing)\b'
+        - '\b(?:needs|need)\s+(?:repair|fixing|a\s+new\s+(?:panel|screen|board))\b'
+        - '\bwater\s+damage\b'
+    rental:
+      action: reject
+      description: GPU/compute rentals, hosting, mining contracts
+      patterns:
+        - '\brent(?:al|als|ing)?\b'
+        - '\bfor\s+lease\b|\bleasing\b'
+        - '\$\s*\d+(?:[.,]\d+)?\s*(?:/|per\s+|a\s+)\s*(?:hr|hrs|hour|day|wk|week|mo|mon|month|yr|year)\b'
+        - '\b(?:cloud|remote|hosted|virtual)\s+(?:gpu|compute|server|access|instance)s?\b'
+        - '\bgpu\s+(?:hosting|cloud|server\s+access|time|hours)\b'
+        - '\bmining\s+(?:contract|hosting|pool\s+share)\b'
+        - '\bhash\s*(?:rate|power)\s+(?:rental|contract|for\s+sale)\b'
+        - '\b(?:vast\.ai|runpod|tensordock|lambda\s+labs?|salad\.com|paperspace)\b'
+    wanted:
+      action: reject
+      field: title
+      description: Buy requests, not offers
+      patterns:
+        - '^\W*(?:wtb|iso|lf|lfm|looking\s+for|in\s+search\s+of|want(?:ed)?(?:\s+to\s+buy)?|buying|need)\b'
+        - '\b(?:wtb|iso)\b'
+        - '\bpaying\s+(?:top|cash|good)\b'
+    accessory:
+      action: reject
+      field: title
+      description: Accessories/parts for the product rather than the product
+      patterns:
+        - '\b(?:for|fits|compatible\s+with|designed\s+for)\s+(?:an?\s+|the\s+|your\s+)?(?:nvidia\s+|geforce\s+|asus\s+|msi\s+|gigabyte\s+|zotac\s+|lg\s+|samsung\s+|alienware\s+|sony\s+)?(?:rtx|gtx|rx|oled|c[1-6]|g[1-6]|aw\d|a7)'
+        - '\b(?:water\s*block|waterblock|backplate|shroud|heat\s*sink|cooler|fans?|bracket|riser|cables?|adapters?|thermal\s+pads?|stand|base|mount|remote|power\s+(?:supply|board)|psu|t-?con(?:\s+board)?|main\s*board|motherboard|screen\s+protector|case|battery|grip|charger)\s+(?:only|for)\b'
+        - '\b(?:replacement|spare)\s+(?:fans?|shroud|cooler|heat\s*sink|stand|remote|board|t-?con|power\s+board|main\s*board|panel|screen|lcd|battery|charger)\b'
+        - '\b(?:replica|dummy|mock[\s-]?up|prop|toy|keychain|sticker|decal|skin|poster|t-?shirt|mug|figurine|3d[\s-]?print(?:ed)?)\b'
+    sold_marker:
+      action: reject
+      field: title
+      description: Listing already sold / pending
+      patterns:
+        - '^\W*(?:sold|pending|on\s+hold|reserved)\b'
+        - '\b(?:sold|pending)\W*$'
+        - '\bno\s+longer\s+available\b'
+    gift_card:
+      action: reject
+      field: title
+      patterns:
+        - '\bgift\s*cards?\b'
+        - '\b(?:voucher|coupon|promo\s+code|e-?gift)\b'
+    payment_only_red_flag:
+      action: risk
+      probability: 0.6
+      description: Irreversible payment demanded
+      patterns:
+        - '\b(?:zelle|cash\s*app|cashapp|venmo(?:\s+friends(?:\s+and|\s*&)\s+family)?|wire(?:\s+transfer)?|western\s+union|moneygram|bitcoin|btc|crypto|usdt|gift\s*cards?|paypal\s+(?:friends|f&f|ff))\s+only\b'
+        - '\bonly\s+(?:accept(?:ing)?\s+)?(?:zelle|cash\s*app|venmo|wire|crypto|bitcoin|gift\s*cards?)\b'
+        - '\bpaypal\s+(?:friends\s+(?:and|&)\s+family|f&f|ff|g&s\s+not\s+accepted)\b'
+    payment_mention:
+      action: risk
+      probability: 0.12
+      source_kinds: [local]
+      patterns:
+        - '\b(?:zelle|cash\s*app|cashapp|western\s+union|moneygram|bitcoin|crypto)\b'
+    deposit_request:
+      action: risk
+      probability: 0.55
+      patterns:
+        - '\b(?:deposit|down\s+payment|holding\s+fee)\b'
+        - '\bhold\s+(?:it|the\s+item)\s+(?:for\s+you\s+)?(?:with|for)\s+(?:a\s+)?(?:\$|payment)\b'
+    off_platform_contact:
+      action: risk
+      probability: 0.35
+      patterns:
+        - '\b(?:text|call|email|whats\s?app|telegram|signal|kik)\s+me\s+(?:at|on|@)\b'
+        - '\bwhats\s?app\b'
+        - '\b\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b'
+        - '\b[\w.+-]+@(?:gmail|yahoo|hotmail|outlook|icloud|aol|proton(?:mail)?)\.\w+\b'
+    scam_story:
+      action: risk
+      probability: 0.35
+      source_kinds: [local, marketplace]
+      patterns:
+        - '\b(?:out\s+of\s+(?:town|state|the\s+country)|deployed|military\s+(?:deployment|base)|moving\s+(?:overseas|abroad)|relocat(?:ed|ing)\s+(?:overseas|abroad))\b'
+        - '\b(?:shipping|ship)\s+only\b|\bno\s+local\s+pick\s*-?\s*up\b|\b(?:will|can)\s+only\s+ship\b'
+        - '\b(?:shipped|delivered)\s+by\s+(?:fedex|ups|usps|dhl)\s+(?:agent|company)\b'
+    read_description:
+      action: risk
+      probability: 0.3
+      patterns:
+        - '\b(?:please\s+)?read\s+(?:the\s+)?(?:full\s+|entire\s+|whole\s+)?(?:description|listing|details|post)\b'
+        - '\bsee\s+(?:the\s+)?description\b'
+    untested_as_is:
+      action: risk
+      probability: 0.4
+      negatable: true
+      patterns:
+        - '\buntested\b'
+        - '\b(?:unable|not\s+able)\s+to\s+test\b|\bcan[''’]?t\s+test\b|\bhaven[''’]?t\s+tested\b'
+        - '\bas[\s-]is\b|\bsold\s+as\s+is\b'
+        - '\bno\s+returns?\b'
+    repaired_modified:
+      action: risk
+      probability: 0.25
+      negatable: true
+      patterns:
+        - '\b(?:repaired|reflowed|reballed|re-?soldered|replaced\s+(?:connector|vram|memory|chip|panel))\b'
+        - '\b(?:bios\s+(?:flashed|modded|mod)|modded\s+bios|shunt\s+mod(?:ded)?|x-?flashed)\b'
+    mining_history:
+      action: risk
+      probability: 0.08
+      negatable: true
+      categories: [gpu, workstation_gpu]
+      patterns:
+        - '\bmin(?:ed|ing)\b'
+        - '\b(?:ex|former)[\s-]?miner\b'
+    urgency:
+      action: risk
+      probability: 0.1
+      patterns:
+        - '\b(?:must\s+(?:sell|go)\s+(?:today|asap|now|tonight)|urgent(?:ly)?\s+(?:sale|selling)|need\s+(?:gone|cash)\s+(?:today|asap|fast))\b'
+
+# -----------------------------------------------------------------------------
+#  Anomaly scoring (engine/anomaly.py) — see docs/ARCHITECTURE.md §5
+#    S = 100 · O · (λ + (1-λ)·C) · (1 - R)^γ
+#    O = w_d·D + w_s·S_stat + w_t·T
+# -----------------------------------------------------------------------------
+scoring:
+  weights: { discount: 0.45, statistical: 0.30, target: 0.25 }
+  discount_saturation: 0.45       # 45% below market => D = 1
+  z_low: 1.0                      # robust z below this contributes nothing
+  z_high: 4.0                     # robust z at/above this saturates
+  confidence_floor: 0.4           # λ: low confidence scales the score down to 40%, never to zero
+  risk_exponent: 2.0              # γ: (1-R)^2 punishes risk super-linearly
+  reject_risk: 0.85               # R >= this => hard reject as probable scam
+  min_samples_for_stats: 6
+  reference_prior_strength: 8     # n0: history needs ~8 effective samples to outweigh config refs
+  history_half_life_days: 14      # depreciation-aware: old prices decay
+  history_window_days: 60
+  history_max_samples: 400
+  history_max_risk: 0.5
+  vision_trust_boost: 0.5
+  price_error_discount: 0.5       # >= 50% below market on a trusted source = probable price error
+  price_error_min_reliability: 0.9
+  price_error_max_risk: 0.3
+  extreme_discount_threshold: 0.55
+  low_trust_reliability: 0.8
+  min_seller_feedback: 5
+  min_seller_feedback_pct: 97
+  severity: { critical: 85, high: 70, medium: 55 }
+  source_history_weights:
+    retail: 1.0
+    ebay: 0.8          # asking prices: weaker evidence than completed sales
+    slickdeals: 1.0
+    reddit: 0.9
+    fb_marketplace: 0.6
+    offerup: 0.6
+    craigslist: 0.5
+
+# -----------------------------------------------------------------------------
+#  Local GPU vision validation (engine/vision_filter.py)
+#  Runs on the RTX 3060 desktop (Ollama), reached over Tailscale.
+# -----------------------------------------------------------------------------
+vision:
+  enabled: ${VISION_ENABLED:-false}
+  backend: ${VISION_BACKEND:-ollama}          # ollama | openai (vLLM / llama.cpp / LM Studio)
+  base_url: ${VISION_URL:-http://localhost:11434}
+  model: ${VISION_MODEL:-qwen2.5vl:3b}
+  escalation_model: ${VISION_ESCALATION_MODEL:-}
+  api_key: ${VISION_API_KEY:-}
+  timeout_seconds: 8
+  max_concurrency: 2
+  max_images: 2
+  resize_max_side: 672
+  jpeg_quality: 85
+  keep_alive: 30m
+  num_predict: 160
+  apply_to_kinds: [local]
+  min_prelim_score: 40
+  negative_min_confidence: 0.6
+  on_error: allow
+  cache_ttl_seconds: 86400
+
+dedup:
+  listing_ttl_hours: 72       # re-alert window for the same listing
+  cluster_ttl_hours: 12       # cross-source (same product+store+price) suppression
+  min_drop_pct: 0.05          # re-alert a listing only if price drops >= 5% ...
+  min_drop_abs: 10            # ... and >= $10
+  price_bucket_pct: 0.02
+  cross_source: true
+
+# -----------------------------------------------------------------------------
+#  Dispatch
+# -----------------------------------------------------------------------------
+dispatch:
+  timeout_seconds: 6
+  discord:
+    webhooks:
+      price_errors:
+        webhook_url: ${DISCORD_WEBHOOK_PRICE_ERRORS:-}
+        mention_role_id: ${DISCORD_ROLE_ID:-}
+      gpu:
+        webhook_url: ${DISCORD_WEBHOOK_GPU:-}
+      displays:
+        webhook_url: ${DISCORD_WEBHOOK_DISPLAYS:-}
+      general:
+        webhook_url: ${DISCORD_WEBHOOK_GENERAL:-}
+      ops:
+        webhook_url: ${DISCORD_WEBHOOK_OPS:-}
+        link_buttons: false
+  telegram:
+    bot_token: ${TELEGRAM_BOT_TOKEN:-}
+    chats:
+      main:
+        chat_id: ${TELEGRAM_CHAT_ID:-}
+        silent_below: high
+  websocket:
+    enabled: true
+    path: /ws
+    max_clients: 50
+    recent_buffer: 200
+  system_targets: [console, "discord:ops"]
+  routes:
+    - name: price_errors
+      min_severity: high
+      price_error_only: true
+      mention: true
+      targets: ["discord:price_errors", "telegram:main", websocket, console]
+    - name: critical_everything
+      min_severity: critical
+      mention: true
+      targets: ["discord:price_errors", "telegram:main", websocket, console]
+    - name: gpus
+      min_severity: medium
+      categories: [gpu, workstation_gpu, prebuilt]
+      max_per_minute: 20
+      targets: ["discord:gpu", websocket, console]
+    - name: gpus_phone
+      min_severity: high
+      categories: [gpu, workstation_gpu, prebuilt]
+      targets: ["telegram:main"]
+      quiet_hours: { start: "00:30", end: "07:30", min_severity: critical }
+    - name: displays
+      min_severity: medium
+      categories: [monitor, tv]
+      max_per_minute: 20
+      targets: ["discord:displays", websocket, console]
+    - name: everything_else
+      min_severity: medium
+      categories: [camera, handheld]
+      targets: ["discord:general", websocket, console]
+
+# -----------------------------------------------------------------------------
+#  Profiles — what to hunt. Prices in USD (late-2026 market; refresh quarterly).
+#  reference_*: typical market price per condition class (bootstraps the model
+#               until enough observed history exists).
+#  floor:   below this is bait/scam territory.   target: "great deal".
+#  ceiling: never alert above this.
+# -----------------------------------------------------------------------------
+profiles:
+  # ---------------------------------------------------------------- GPUs
+  - id: rtx_5090
+    name: NVIDIA GeForce RTX 5090 32GB
+    category: gpu
+    priority: 0
+    match:
+      any:
+        - '\brtx\s*-?\s*5090\b'
+        - '\bgeforce\s+5090\b'
+        - '(?<![\w.$])5090\s*(?:fe|founders|32\s*gb|gaming|oc|astral|tuf|suprim|vanguard|ventus|gaming\s*trio|aorus|master|windforce|solid|amp|gamerock|phantom|zotac|ichill|x3)\b'
+      none:
+        - '\b5090\s*-?\s*d\b|\b5090\s*dd\b'
+        - '\b(?:laptop|notebook|mobile|zephyrus|legion|scar\s*1[68]|razer\s+blade|alienware\s+(?:m|x)\d+|msi\s+(?:raider|titan|stealth|vector)|predator\s+helios|omen\s+max)\b'
+    price:
+      reference_new: 2399
+      reference_used: 2150
+      floor: 600
+      target: 1899
+      ceiling: 2600
+    search:
+      terms: ["rtx 5090"]
+      ebay_category_ids: ["27386"]
+    vision_hint: a desktop graphics card (GPU) with its cooler, fans and PCIe connector visible
+    tags: [ai, flagship]
+
+  - id: rtx_4090
+    name: NVIDIA GeForce RTX 4090 24GB
+    category: gpu
+    match:
+      any:
+        - '\brtx\s*-?\s*4090\b'
+        - '\bgeforce\s+4090\b'
+        - '(?<![\w.$])4090\s*(?:fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|gamerock|phantom|windforce|aero|master|ichill|x3|ventus|amp|xlr8|verto)\b'
+      none:
+        - '\b4090\s*-?\s*d\b'
+        - '\b(?:laptop|notebook|mobile|zephyrus|legion|scar\s*1[68]|razer\s+blade|alienware\s+(?:m|x)\d+|msi\s+(?:raider|titan|stealth|vector)|predator\s+helios)\b'
+    price:
+      reference_new: 2199
+      reference_used: 1750
+      floor: 450
+      target: 1400
+      ceiling: 1950
+    search:
+      terms: ["rtx 4090"]
+      ebay_category_ids: ["27386"]
+    vision_hint: a desktop graphics card (GPU) with its cooler, fans and PCIe connector visible
+    tags: [ai, flagship]
+
+  - id: rtx_3090
+    name: NVIDIA GeForce RTX 3090 / 3090 Ti 24GB
+    category: gpu
+    match:
+      any:
+        - '\brtx\s*-?\s*3090\b'
+        - '\bgeforce\s+3090\b'
+        - '(?<![\w.$])3090\s*(?:ti\b|fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|ftw3|xc3|ventus|eagle|vision|master|zotac)\b'
+      none:
+        - '\b(?:laptop|notebook|mobile)\b'
+    variants:
+      - id: ti
+        match: ['\b3090\s*-?\s*ti\b']
+        price: { reference_new: 1100, reference_used: 900, target: 700, ceiling: 1050, floor: 250 }
+    price:
+      reference_used: 820
+      reference_new: 1099
+      floor: 220
+      target: 650
+      ceiling: 950
+    search:
+      terms: ["rtx 3090"]
+      ebay_category_ids: ["27386"]
+    vision_hint: a desktop graphics card (GPU) with its cooler, fans and PCIe connector visible
+    tags: [ai]
+
+  - id: rtx_pro_6000_blackwell
+    name: NVIDIA RTX PRO 6000 Blackwell 96GB
+    category: workstation_gpu
+    priority: 5
+    match:
+      any:
+        - '\brtx\s*pro\s*6000\b'
+        - '\bpro\s*6000\s*blackwell\b'
+        - '\bblackwell\b.*\b6000\b.*\b96\s*gb\b'
+      none:
+        - '\b(?:laptop|notebook|mobile)\b'
+    price:
+      reference_new: 8500
+      reference_used: 7300
+      floor: 2000
+      target: 6500
+      ceiling: 8800
+    search:
+      terms: ["rtx pro 6000 blackwell"]
+      ebay_category_ids: ["27386"]
+    vision_hint: a workstation graphics card with a blower or flow-through cooler
+    tags: [ai, workstation]
+
+  - id: rtx_6000_ada
+    name: NVIDIA RTX 6000 Ada Generation 48GB
+    category: workstation_gpu
+    priority: 4
+    match:
+      any:
+        - '\brtx\s*6000\s*ada\b'
+        - '\b6000\s*ada\b'
+        - '\bada\s+(?:lovelace\s+)?(?:generation\s+)?(?:rtx\s*)?6000\b'
+      none:
+        - '\bpro\s*6000\b|\bblackwell\b'
+        - '\b(?:laptop|notebook|mobile)\b'
+    price:
+      reference_new: 6800
+      reference_used: 5200
+      floor: 1500
+      target: 4300
+      ceiling: 6000
+    search:
+      terms: ["rtx 6000 ada"]
+      ebay_category_ids: ["27386"]
+    vision_hint: a workstation graphics card with a blower cooler
+    tags: [ai, workstation]
+
+  - id: rtx_a6000
+    name: NVIDIA RTX A6000 48GB (Ampere)
+    category: workstation_gpu
+    priority: 3
+    match:
+      any:
+        - '\brtx\s*a\s*-?\s*6000\b'
+        - '\b(?:nvidia|quadro|pny)\s+a\s*6000\b'
+        - '(?<![\w.$-])a6000\b'
+      none:
+        - '\bada\b|\bpro\s*6000\b|\bblackwell\b'
+        - '\b(?:laptop|notebook|mobile)\b'
+    price:
+      reference_new: 4600
+      reference_used: 3900
+      floor: 1000
+      target: 3100
+      ceiling: 4200
+    search:
+      terms: ["rtx a6000"]
+      ebay_category_ids: ["27386"]
+    vision_hint: a workstation graphics card with a blower cooler
+    tags: [ai, workstation]
+
+  - id: rtx_a5000
+    name: NVIDIA RTX A5000 24GB (Ampere)
+    category: workstation_gpu
+    priority: 3
+    match:
+      any:
+        - '\brtx\s*a\s*-?\s*5000\b'
+        - '\b(?:nvidia|quadro|pny)\s+a\s*5000\b'
+        - '(?<![\w.$-])a5000\b'
+      none:
+        - '\bada\b'
+        - '\b(?:laptop|notebook|mobile|precision\s+77\d0|zbook)\b'
+    price:
+      reference_new: 2300
+      reference_used: 1350
+      floor: 300
+      target: 1050
+      ceiling: 1500
+    search:
+      terms: ["rtx a5000"]
+      ebay_category_ids: ["27386"]
+    vision_hint: a workstation graphics card with a blower cooler
+    tags: [ai, workstation]
+
+  # ---------------------------------------------------------------- displays
+  - id: oled_4k_monitor
+    name: 4K 240Hz QD-OLED / WOLED gaming monitor
+    category: monitor
+    variant_required: true
+    match:
+      any:
+        - '\baw3225qf\b|\baw2725q\b'
+        - '\bpg32ucdm\b|\bpg27ucdm\b|\bpg32ucdp\b'
+        - '\bg80sd\b|\bg81sf\b|\bls32dg80\w*|\bodyssey\s+oled\s+g8\b'
+        - '\bmpg\s*321\s*urx\b|\bmpg\s*272\s*urx\b|\b321urx\b|\b272urx\b'
+      none:
+        - '\b(?:stand|mount|arm)\s+only\b'
+    variants:
+      - id: aw3225qf
+        match: ['\baw3225qf\b']
+        price: { reference_new: 899, reference_used: 700, reference_refurb: 760, floor: 200, target: 650, ceiling: 900 }
+      - id: aw2725q
+        match: ['\baw2725q\b']
+        price: { reference_new: 749, reference_used: 600, floor: 180, target: 560, ceiling: 760 }
+      - id: pg32ucdm
+        match: ['\bpg32ucdm\b']
+        price: { reference_new: 1099, reference_used: 820, floor: 250, target: 760, ceiling: 1050 }
+      - id: pg32ucdp
+        match: ['\bpg32ucdp\b']
+        price: { reference_new: 1299, reference_used: 1000, floor: 300, target: 950, ceiling: 1250 }
+      - id: pg27ucdm
+        match: ['\bpg27ucdm\b']
+        price: { reference_new: 999, reference_used: 760, floor: 220, target: 700, ceiling: 950 }
+      - id: g80sd
+        match: ['\bg80sd\b|\bls32dg80\w*|\bodyssey\s+oled\s+g8\b.*\b32\b']
+        price: { reference_new: 899, reference_used: 680, floor: 200, target: 620, ceiling: 880 }
+      - id: g81sf
+        match: ['\bg81sf\b']
+        price: { reference_new: 799, reference_used: 620, floor: 180, target: 560, ceiling: 780 }
+      - id: mpg321urx
+        match: ['\bmpg\s*321\s*urx\b|\b321urx\b']
+        price: { reference_new: 799, reference_used: 620, floor: 180, target: 580, ceiling: 800 }
+      - id: mpg272urx
+        match: ['\bmpg\s*272\s*urx\b|\b272urx\b']
+        price: { reference_new: 799, reference_used: 600, floor: 180, target: 560, ceiling: 780 }
+    price:
+      reference_new: 899
+      reference_used: 700
+      floor: 180
+      target: 650
+      ceiling: 1250
+    search:
+      terms: ["AW3225QF", "PG32UCDM", "Odyssey OLED G8 4K", "MPG 321URX"]
+      ebay_category_ids: ["80053"]
+    vision_hint: a computer monitor with an intact, uncracked screen
+    tags: [oled, display]
+
+  - id: lg_oled_tv
+    name: LG OLED evo C/G-series TV (C4, C5, G4, G5)
+    category: tv
+    variant_required: true
+    match:
+      any:
+        - '\blg\b.*\b(?:oled|evo)\b'
+        - '\boled\d{2}[cg][4-6]\w*'
+      all:
+        - '\b(?:c[4-6]|g[4-6])\b|\boled\d{2}[cg][4-6]'
+      none:
+        - '\b(?:stand|mount|remote|t-?con|power\s+board)\s+only\b'
+    variants:
+      - id: c4_55
+        match: ['oled55c4|(?=.*\bc4\b)(?=.*\b55\b)']
+        price: { reference_new: 1199, reference_used: 850, floor: 250, target: 850, ceiling: 1150 }
+      - id: c4_65
+        match: ['oled65c4|(?=.*\bc4\b)(?=.*\b65\b)']
+        price: { reference_new: 1599, reference_used: 1150, floor: 350, target: 1100, ceiling: 1500 }
+      - id: c4_77
+        match: ['oled77c4|(?=.*\bc4\b)(?=.*\b77\b)']
+        price: { reference_new: 2399, reference_used: 1750, floor: 500, target: 1700, ceiling: 2300 }
+      - id: c5_55
+        match: ['oled55c5|(?=.*\bc5\b)(?=.*\b55\b)']
+        price: { reference_new: 1299, reference_used: 950, floor: 280, target: 950, ceiling: 1250 }
+      - id: c5_65
+        match: ['oled65c5|(?=.*\bc5\b)(?=.*\b65\b)']
+        price: { reference_new: 1699, reference_used: 1250, floor: 380, target: 1200, ceiling: 1600 }
+      - id: c5_77
+        match: ['oled77c5|(?=.*\bc5\b)(?=.*\b77\b)']
+        price: { reference_new: 2599, reference_used: 1900, floor: 550, target: 1850, ceiling: 2500 }
+      - id: g4_65
+        match: ['oled65g4|(?=.*\bg4\b)(?=.*\b65\b)']
+        price: { reference_new: 2299, reference_used: 1700, floor: 500, target: 1600, ceiling: 2200 }
+      - id: g5_65
+        match: ['oled65g5|(?=.*\bg5\b)(?=.*\b65\b)']
+        price: { reference_new: 2599, reference_used: 1950, floor: 550, target: 1850, ceiling: 2500 }
+    price:
+      reference_new: 1699
+      reference_used: 1250
+      floor: 250
+      target: 1200
+      ceiling: 2500
+    search:
+      terms: ["LG C4 OLED", "LG C5 OLED", "LG G4 OLED", "LG G5 OLED"]
+      ebay_category_ids: ["11071"]
+    vision_hint: a flat-panel OLED television with an intact, uncracked screen
+    tags: [oled, tv]
+
+  - id: samsung_s90_oled_tv
+    name: Samsung S90D / S90F QD-OLED TV
+    category: tv
+    variant_required: true
+    match:
+      any:
+        - '\bs90[df]\b|\bqn\d{2}s90[df]\w*'
+      none:
+        - '\b(?:stand|mount|remote|t-?con|power\s+board)\s+only\b'
+    variants:
+      - id: s90d_65
+        match: ['qn65s90d|(?=.*\bs90d\b)(?=.*\b65\b)']
+        price: { reference_new: 1399, reference_used: 1000, floor: 300, target: 950, ceiling: 1300 }
+      - id: s90f_65
+        match: ['qn65s90f|(?=.*\bs90f\b)(?=.*\b65\b)']
+        price: { reference_new: 1599, reference_used: 1150, floor: 350, target: 1100, ceiling: 1500 }
+    price:
+      reference_new: 1499
+      reference_used: 1050
+      floor: 300
+      target: 1000
+      ceiling: 1500
+    search:
+      terms: ["Samsung S90D 65", "Samsung S90F 65"]
+      ebay_category_ids: ["11071"]
+    vision_hint: a flat-panel OLED television with an intact, uncracked screen
+    tags: [oled, tv]
+
+  # ---------------------------------------------------------------- prebuilts
+  - id: prebuilt_flagship
+    name: Prebuilt / used desktop with RTX 4090 or 5090
+    category: prebuilt
+    priority: 10            # wins over the bare-GPU profiles when PC evidence is present
+    variant_required: true
+    match:
+      field: text
+      all:
+        - '\b(?:rtx\s*)?(?:4090|5090)\b'
+        - '\b(?:gaming\s+(?:pc|computer|desktop|rig)|pc|desktop|computer|tower|prebuilt|pre-built|workstation|full\s+(?:build|system)|custom\s+build)\b'
+        - '\b(?:i[579][\s-]?\d{4,5}[a-z]{0,2}|core\s+(?:ultra\s+)?[579]\s*\d{3,5}[a-z]{0,2}|ryzen\s+[579]\s*\d{4}x?3?d?|\d{4}x3d|threadripper|\d{2,3}\s*gb\s*(?:of\s+)?(?:ddr[45]|ram|memory))\b'
+      none:
+        - '\b(?:laptop|notebook)\b'
+    variants:
+      - id: gpu_5090
+        field: text
+        match: ['\b(?:rtx\s*)?5090\b']
+        price: { reference_new: 4300, reference_used: 3500, floor: 900, target: 3000, ceiling: 4200 }
+      - id: gpu_4090
+        field: text
+        match: ['\b(?:rtx\s*)?4090\b']
+        price: { reference_new: 3300, reference_used: 2600, floor: 700, target: 2200, ceiling: 3100 }
+    price:
+      reference_new: 3300
+      reference_used: 2600
+      floor: 700
+      target: 2200
+      ceiling: 4200
+    search:
+      terms: ["4090 gaming pc", "5090 gaming pc"]
+      ebay_category_ids: ["179"]
+    vision_hint: a complete desktop PC tower (case with components), not just a GPU or an empty case
+    tags: [prebuilt]
+
+  # ---------------------------------------------------------------- arbitrary categories
+  - id: sony_a7iv
+    name: Sony Alpha a7 IV (body)
+    category: camera
+    match:
+      any:
+        - '\b(?:sony\s+)?(?:alpha\s+)?a7\s*(?:iv|4|m4|mark\s*(?:iv|4))\b'
+        - '\bilce-?7m4\w*'
+      none:
+        - '\ba7\s*(?:r|s|c)\b|\ba7r|\ba7s|\ba7c'
+        - '\b(?:battery|grip|cage|strap|charger|screen\s+protector|lens\s+only|body\s+cap)\b'
+    price:
+      reference_new: 2199
+      reference_used: 1650
+      floor: 400
+      target: 1400
+      ceiling: 2000
+    search:
+      terms: ["sony a7 iv body"]
+      ebay_category_ids: ["31388"]
+    vision_hint: a mirrorless camera body
+    tags: [camera]
+
+  - id: steam_deck_oled
+    name: Valve Steam Deck OLED
+    category: handheld
+    match:
+      all:
+        - '\bsteam\s*deck\b'
+        - '\boled\b'
+      none:
+        - '\b(?:case|dock|skin|screen\s+protector|grip)\s+(?:only|for)\b'
+    variants:
+      - id: tb1
+        match: ['\b1\s*tb\b']
+        price: { reference_new: 649, reference_used: 530, floor: 120, target: 450, ceiling: 600 }
+      - id: gb512
+        match: ['\b512\s*gb\b']
+        price: { reference_new: 549, reference_used: 450, floor: 100, target: 380, ceiling: 520 }
+    price:
+      reference_new: 549
+      reference_used: 450
+      floor: 100
+      target: 380
+      ceiling: 600
+    search:
+      terms: ["steam deck oled"]
+    vision_hint: a handheld gaming PC with an intact screen
+    tags: [consumer]

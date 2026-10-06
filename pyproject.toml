@@ -1,0 +1,22 @@
+[project]
+name = "deal-radar"
+version = "1.0.0"
+description = "Autonomous low-latency deal & pricing-anomaly engine"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+include = ["deal_radar*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["deal_radar/tests"]
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning:feedparser.*",
+]
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
