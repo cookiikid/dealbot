@@ -28,6 +28,9 @@ Design decisions
   "chat not found" flip ``configured`` to ``False`` so the router stops hammering.
 * **The bot token lives in the URL path** (``/bot<token>/sendMessage``). URLs are
   never logged and the token is redacted from every error string.
+* **Unencodable text.** Lone UTF-16 surrogates (possible in Playwright-scraped titles)
+  are replaced before formatting (:func:`dispatchers.discord.scrub_alert`), otherwise
+  the shared ``links()`` and the JSON encoder would refuse the whole alert.
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ from deal_radar.core.http import HttpClient, json_loads
 from deal_radar.core.logs import get_logger
 from deal_radar.core.metrics import Metrics
 from deal_radar.dispatchers.base import Dispatcher, facts, headline, links, risk_summary
+from deal_radar.dispatchers.discord import NOT_SENT_ERRORS, scrub_alert, scrub_surrogates
 from deal_radar.engine.types import Alert, DispatchResult
 
 log = get_logger("dispatch.telegram")
@@ -110,7 +114,10 @@ def fit_escaped(text: str, budget: int, ellipsis: str = "…") -> str:
 def _valid_url(url: str | None, limit: int = BUTTON_URL_LIMIT) -> bool:
     if not url or len(url) > limit or any(ch.isspace() for ch in url):
         return False
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # e.g. "https://[broken" (unbalanced IPv6 bracket)
+        return False
     return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
@@ -357,13 +364,14 @@ class TelegramDispatcher(Dispatcher):
 
     async def send(self, alert: Alert) -> DispatchResult:
         try:
-            steps = self.plan(alert)
+            steps = self.plan(scrub_alert(alert))
         except Exception as exc:  # formatting bugs must never take the pipeline down
             log.exception("telegram payload build failed", extra={"target": self.target, "alert_id": alert.alert_id})
             return DispatchResult(target=self.target, ok=False, error=f"payload build failed: {exc!r}"[:300])
         return await self._deliver(steps, alert_id=alert.alert_id)
 
     async def send_notice(self, title: str, message: str) -> DispatchResult:
+        title, message = scrub_surrogates(title), scrub_surrogates(message)
         text = f"<b>{fit_escaped(title.strip() or 'Notice', 256)}</b>\n{fit_escaped(message.strip(), MESSAGE_LIMIT - 300)}"
         payload = self._common(silent=False)
         payload.update({"text": text, "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}})
@@ -427,7 +435,8 @@ class TelegramDispatcher(Dispatcher):
                 )
             except asyncio.CancelledError:
                 raise
-            except aiohttp.ClientConnectorError as exc:
+            except NOT_SENT_ERRORS as exc:
+                # Nothing reached Telegram (connect/TLS failed): safe to retry, no duplicate.
                 status = None
                 error = f"connection failed: {type(exc).__name__}: {exc}"
                 delay = SERVER_ERROR_BASE_DELAY * (2 ** (attempts - 1))

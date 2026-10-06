@@ -33,9 +33,15 @@ Design decisions
   token is wrong; the dispatcher flips ``configured`` to ``False`` (the router then
   skips it) and stops sending until the process restarts with a fixed config.
 * **Graceful degradation.** A 400 (e.g. an image URL Discord refuses) is retried once
-  with a minimal payload: no buttons, no thumbnail, no embed URL.
+  with a minimal payload: no buttons, no thumbnail, no embed URL, no username/avatar
+  override (Discord refuses e.g. usernames containing "discord"). Whitespace-only
+  field values (which Discord rejects) become a zero-width space, and lone UTF-16
+  surrogates (Playwright-scraped titles can carry them; they are not valid UTF-8 so
+  the JSON encoder refuses them) are replaced by U+FFFD before formatting.
 * **Secrets.** The webhook URL *is* the credential; it is never logged and is
-  redacted from every error string.
+  redacted from every error string (also in percent-encoded form). A webhook URL
+  that is not an http(s) URL disables the target at construction with an error that
+  does not echo it.
 """
 
 from __future__ import annotations
@@ -43,11 +49,12 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -63,7 +70,6 @@ log = get_logger("dispatch.discord")
 
 # --------------------------------------------------------------------------- Discord limits
 
-CONTENT_LIMIT = 2000
 USERNAME_LIMIT = 80
 TITLE_LIMIT = 256
 DESCRIPTION_LIMIT = 4096
@@ -71,7 +77,6 @@ FIELDS_LIMIT = 25
 FIELD_NAME_LIMIT = 256
 FIELD_VALUE_LIMIT = 1024
 FOOTER_LIMIT = 2048
-AUTHOR_LIMIT = 256
 EMBED_TOTAL_LIMIT = 6000
 BUTTON_LABEL_LIMIT = 80
 BUTTON_URL_LIMIT = 512
@@ -83,6 +88,7 @@ EXPLAIN_LINES = 6  # how many ScoreResult.explain lines make it into the descrip
 MIN_FIELD_VALUE = 16  # below this a truncated field is useless; drop it instead
 NOTICE_COLOR = 0x607D8B
 ZWSP = "​"  # Discord rejects empty field names/values
+FORBIDDEN_USERNAME_PARTS = ("discord", "clyde")  # webhook username overrides containing these are refused (400)
 
 # --------------------------------------------------------------------------- delivery policy
 
@@ -94,6 +100,11 @@ MAX_ATTEMPTS = 5
 MIN_ATTEMPT_SECONDS = 0.25  # never start a request with less budget than this
 DEFAULT_RETRY_AFTER = 1.0  # 429 without any hint (e.g. Cloudflare HTML page)
 SERVER_ERROR_BASE_DELAY = 0.25
+# Failures raised before any byte of the request left the machine: retrying them can
+# never post a duplicate message. (ConnectionTimeoutError exists since aiohttp 3.10.)
+NOT_SENT_ERRORS: tuple[type[BaseException], ...] = (aiohttp.ClientConnectorError,) + tuple(
+    cls for cls in (getattr(aiohttp, "ConnectionTimeoutError", None),) if cls is not None
+)
 
 
 # --------------------------------------------------------------------------- text helpers
@@ -125,18 +136,70 @@ def truncate(text: str, limit: int, ellipsis: str = "…") -> str:
 
 
 _MD_SPECIAL = re.compile(r"([\\*_~`|\[\]])")
+# Block-level markers only count at the start of a line: headings ("# ", "-# "),
+# quotes ("> ", ">>> "), bullets ("- ") and ordered lists ("1. ").
+_MD_LINE_MARKER = re.compile(r"(?m)^([ \t]*)([#>-])(?=[ \t#>-])")
+_MD_ORDERED_LIST = re.compile(r"(?m)^([ \t]*\d+)\.(?=[ \t])")
 
 
 def escape_markdown(text: str) -> str:
     """Neutralise Discord markdown in untrusted listing text (titles, seller names...)."""
-    return _MD_SPECIAL.sub(r"\\\1", text)
+    text = _MD_SPECIAL.sub(r"\\\1", text)
+    text = _MD_LINE_MARKER.sub(r"\1\\\2", text)
+    return _MD_ORDERED_LIST.sub(r"\1\\.", text)
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+_WEBHOOK_PATH = re.compile(r"(/webhooks/\d+/)[^/?#\s'\"<>]+")  # token segment of any webhook URL in a message
+
+
+def scrub_surrogates(value: Any) -> Any:
+    """``value`` with lone UTF-16 surrogates replaced by U+FFFD in every nested string.
+
+    Lone surrogates are not encodable as UTF-8, so ``quote_plus`` (inside the shared
+    ``links()``) and the JSON encoder both refuse them; one in a scraped title would
+    otherwise fail the alert on every channel. Returns the *same* object when nothing
+    needed replacing, so callers can detect the (rare) dirty case by identity.
+    """
+    if isinstance(value, str):
+        if value.isascii() or _SURROGATE.search(value) is None:
+            return value
+        return _SURROGATE.sub("\ufffd", value)
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        changed = False
+        for key, item in value.items():
+            new_key, new_item = scrub_surrogates(key), scrub_surrogates(item)
+            changed = changed or new_key is not key or new_item is not item
+            out[new_key] = new_item
+        return out if changed else value
+    if isinstance(value, (list, tuple)):
+        items = [scrub_surrogates(item) for item in value]
+        return items if any(new is not old for new, old in zip(items, value)) else value
+    return value
+
+
+def scrub_alert(alert: Alert) -> Alert:
+    """``alert`` itself, or a sanitised copy when any of its strings holds a lone surrogate."""
+    data = alert.model_dump()
+    clean = scrub_surrogates(data)
+    return alert if clean is data else Alert.model_validate(clean)
 
 
 def _valid_url(url: str | None, limit: int = URL_LIMIT) -> bool:
     if not url or len(url) > limit or any(ch.isspace() for ch in url):
         return False
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # e.g. "https://[broken" (unbalanced IPv6 bracket)
+        return False
     return parts.scheme in ("http", "https") and bool(parts.netloc)
+
+
+def _field_text(text: str, limit: int) -> str:
+    """Truncated field name/value; Discord rejects empty *and* whitespace-only ones."""
+    out = truncate(text, limit)
+    return out if out.strip() else ZWSP
 
 
 def _iso(ts: datetime) -> str:
@@ -224,8 +287,8 @@ def build_embed(alert: Alert, *, node_id: str | None = None) -> dict[str, Any]:
         embed["description"] = description
     fields = [
         {
-            "name": truncate(fact.name, FIELD_NAME_LIMIT) or ZWSP,
-            "value": truncate(escape_markdown(fact.value), FIELD_VALUE_LIMIT) or ZWSP,
+            "name": _field_text(fact.name, FIELD_NAME_LIMIT),
+            "value": _field_text(escape_markdown(fact.value), FIELD_VALUE_LIMIT),
             "inline": fact.inline,
         }
         for fact in facts(alert)[:FIELDS_LIMIT]
@@ -253,8 +316,17 @@ def link_button_rows(alert: Alert) -> list[dict[str, Any]]:
     return rows[:ACTION_ROWS_LIMIT]
 
 
+def username_allowed(username: str) -> bool:
+    """Discord refuses webhook username overrides containing "discord" or "clyde"."""
+    lowered = username.lower()
+    return not any(part in lowered for part in FORBIDDEN_USERNAME_PARTS)
+
+
 def _base_payload(cfg: DiscordTarget) -> dict[str, Any]:
-    payload: dict[str, Any] = {"username": truncate(cfg.username.strip(), USERNAME_LIMIT) or "DealRadar"}
+    payload: dict[str, Any] = {}
+    username = truncate(cfg.username.strip(), USERNAME_LIMIT) or "DealRadar"
+    if username_allowed(username):  # else the webhook's own name is used
+        payload["username"] = username
     if _valid_url(cfg.avatar_url):
         payload["avatar_url"] = cfg.avatar_url
     return payload
@@ -275,8 +347,8 @@ def build_discord_payload(alert: Alert, cfg: DiscordTarget, *, mention: bool, no
 
 
 def minimal_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Degraded copy for a retry after a 400: no components, thumbnail or embed URL."""
-    out = {k: v for k, v in payload.items() if k != "components"}
+    """Degraded copy for a retry after a 400: no components, thumbnail, embed URL or identity override."""
+    out = {k: v for k, v in payload.items() if k not in ("components", "username", "avatar_url")}
     embeds = []
     for embed in payload.get("embeds", ()):
         embeds.append({k: v for k, v in embed.items() if k not in ("thumbnail", "url", "image")})
@@ -297,7 +369,7 @@ def build_notice_payload(title: str, message: str, cfg: DiscordTarget) -> dict[s
     _enforce_total(embed)
     payload = _base_payload(cfg)
     payload.update({"content": "", "allowed_mentions": {"parse": []}, "embeds": [embed]})
-    return payload
+    return scrub_surrogates(payload)
 
 
 def webhook_url(base: str, *, with_components: bool, thread_id: str | None) -> str:
@@ -391,11 +463,21 @@ class DiscordDispatcher(Dispatcher):
         self.metrics = metrics or Metrics()
         self._disabled_reason: str | None = None
         self._blocked_until = 0.0  # monotonic; per-webhook bucket exhausted / 429
-        self._role_warned = False
         self._requests = self.metrics.counter("discord_requests_total", "Discord webhook requests", ("target", "status"))
         self._rate_limited = self.metrics.counter("discord_rate_limited_total", "Discord 429 responses", ("target",))
+        self._secrets = self._secret_forms()
+        secret = self._secret()
+        if secret is not None and not _valid_url(secret, limit=len(secret)):
+            # Never echo the URL: it is the credential. The router skips unconfigured targets.
+            self._disabled_reason = "invalid webhook URL (expected https://discord.com/api/webhooks/<id>/<token>)"
+            log.error("discord webhook_url is not an http(s) URL; target disabled", extra={"target": self.target})
         if cfg.mention_role_id and _snowflake(cfg.mention_role_id) is None:
             log.warning("discord mention_role_id is not a numeric role id; mentions disabled", extra={"target": self.target})
+        if not username_allowed(cfg.username):
+            log.warning(
+                "discord refuses webhook usernames containing 'discord' or 'clyde'; using the webhook's own name",
+                extra={"target": self.target},
+            )
 
     # ------------------------------------------------------------------ state
 
@@ -415,13 +497,21 @@ class DiscordDispatcher(Dispatcher):
     def _secret(self) -> str | None:
         return self.cfg.webhook_url.get_secret_value() if self.cfg.webhook_url is not None else None
 
-    def _redact(self, text: str) -> str:
+    def _secret_forms(self) -> list[tuple[str, str]]:
+        """(needle, replacement) pairs: the URL and its token, raw and percent-encoded."""
         secret = self._secret()
         if not secret:
-            return text
-        text = text.replace(secret, "<webhook>")
-        token = urlsplit(secret).path.rstrip("/").rsplit("/", 1)[-1]
-        return text.replace(token, "<redacted>") if len(token) >= 8 else text
+            return []
+        forms = [(secret, "<webhook>"), (quote(secret, safe=":/?&="), "<webhook>")]
+        tail = secret.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        if len(tail) >= 8:  # the token; also catches it inside URLs normalised by yarl
+            forms += [(tail, "<redacted>"), (quote(tail, safe=""), "<redacted>")]
+        return forms
+
+    def _redact(self, text: str) -> str:
+        for needle, replacement in self._secrets:
+            text = text.replace(needle, replacement)
+        return _WEBHOOK_PATH.sub(r"\1<redacted>", text)
 
     def _note_rate_headers(self, headers: Mapping[str, str]) -> None:
         remaining = headers.get("X-RateLimit-Remaining")
@@ -443,7 +533,7 @@ class DiscordDispatcher(Dispatcher):
 
     async def send(self, alert: Alert) -> DispatchResult:
         try:
-            payload = build_discord_payload(alert, self.cfg, mention=alert.mention, node_id=self.node_id)
+            payload = build_discord_payload(scrub_alert(alert), self.cfg, mention=alert.mention, node_id=self.node_id)
         except Exception as exc:  # formatting bugs must never take the pipeline down
             log.exception("discord payload build failed", extra={"target": self.target, "alert_id": alert.alert_id})
             return DispatchResult(target=self.target, ok=False, error=f"payload build failed: {exc!r}"[:300])
@@ -512,7 +602,7 @@ class DiscordDispatcher(Dispatcher):
                 )
             except asyncio.CancelledError:
                 raise
-            except aiohttp.ClientConnectorError as exc:
+            except NOT_SENT_ERRORS as exc:
                 # The TCP/TLS connection was never established, so nothing was posted:
                 # safe to retry without risking a duplicate message.
                 status = None
@@ -530,7 +620,16 @@ class DiscordDispatcher(Dispatcher):
             except Exception as exc:  # never raise from send()
                 status = None
                 error = f"unexpected error: {exc!r}"
-                log.exception("discord send crashed", extra={"target": self.target, "alert_id": alert_id})
+                # No log.exception: the traceback could quote the webhook URL; log a redacted copy.
+                log.error(
+                    "discord send crashed",
+                    extra={
+                        "target": self.target,
+                        "alert_id": alert_id,
+                        "error": self._redact(error)[:300],
+                        "traceback": self._redact("".join(traceback.format_exception(exc)))[-4000:],
+                    },
+                )
                 break
 
             status = resp.status

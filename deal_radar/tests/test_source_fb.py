@@ -1218,7 +1218,8 @@ def test_currency_from_iso_codes(text: str, code: str | None) -> None:
 
 
 def test_iso_formatted_price_is_not_mislabelled_usd() -> None:
-    node = {"id": "88", "marketplace_listing_title": "RTX 3090", "listing_price": {"formatted_amount": "PHP6,500", "amount": "6500.00"}}
+    price = {"formatted_amount": "PHP6,500", "amount": "6500.00", "amount_with_offset_in_currency": "10766"}
+    node = {"id": "88", "marketplace_listing_title": "RTX 3090", "listing_price": price}
     (listing,) = fb.parse_graphql_payload(json.dumps({"data": node}))
     assert listing.price == 6500.0 and listing.currency == "PHP"
 
@@ -1542,3 +1543,44 @@ async def test_teardown_is_bounded_when_the_browser_is_wedged(tmp_path: Path, ht
     await asyncio.wait_for(ingestor.teardown(), timeout=5.0)
     assert ingestor._context is None and ingestor._playwright is None
     assert Path(cfg.browser.storage_state_path).read_text() == original
+
+
+class _EmptySearchMarketplace(FakeMarketplace):
+    """A search with no results: an empty feed in the page JSON, plus suggestion cards in the DOM."""
+
+    async def search(self, request: web.Request) -> web.Response:
+        self.searches.append({"slug": request.match_info["slug"], "query": dict(request.query)})
+        empty = {"data": {"marketplace_search": {"feed_units": {"edges": [], "page_info": {"end_cursor": None,
+                                                                                         "has_next_page": False}}}}}
+        body = (
+            f"<script type='application/json' data-sjs>{json.dumps(empty)}</script>"
+            "<h2>Results outside your search</h2>"
+            "<a href='/marketplace/item/5151515151515151/'><div>$20</div><div>Phone case</div><div>Queens, NY</div></a>"
+        )
+        return web.Response(text=_HTML_HEAD + body + _HTML_TAIL, content_type="text/html")
+
+
+async def test_empty_search_feed_does_not_fall_back_to_suggestion_cards(tmp_path: Path, http: HttpClient) -> None:
+    exe = await _require_chromium("full")
+    market = _EmptySearchMarketplace("ssr")
+    server = TestServer(market.app(), host="127.0.0.1")
+    await server.start_server()
+    cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0)
+    _write_state(Path(cfg.browser.storage_state_path))
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()), base_url=str(server.make_url("/")))
+    ingestor.results_timeout_seconds = 1.0
+    try:
+        listings = await ingestor.poll()
+    finally:
+        await ingestor.teardown()
+        await server.close()
+    assert len(market.searches) == 1
+    assert listings == []
+
+
+def test_parse_stats_report_search_feeds() -> None:
+    empty = {"data": {"marketplace_search": {"feed_units": {"edges": []}}}}
+    _, stats = fb.parse_payloads([("embedded", json.dumps(empty))])
+    assert stats["search_feeds"] == 1 and stats["nodes"] == 0
+    _, stats = fb.parse_payloads([("graphql", json.dumps({"data": [{"id": "1", "marketplace_listing_title": "x"}]}))])
+    assert stats["search_feeds"] == 0 and stats["nodes"] == 1

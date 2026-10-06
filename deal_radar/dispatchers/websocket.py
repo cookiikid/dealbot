@@ -30,7 +30,9 @@ Design decisions
 * **Heartbeat.** aiohttp pings every 20 s and closes peers that stop answering, which
   reaps half-open connections (laptops going to sleep, NAT timeouts).
 * **Shutdown** closes every socket with 1001 (going away); the hub registers itself in
-  the application's ``on_shutdown`` hooks so the ops server does not wait on them.
+  the application's ``on_shutdown`` hooks so the ops server does not wait on them. A
+  handshake that completes while the hub is closing is closed with 1001 right away
+  instead of registering a client nobody would ever close.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from deal_radar.core.http import json_dumps, json_loads
 from deal_radar.core.logs import get_logger
 from deal_radar.core.metrics import Metrics
 from deal_radar.dispatchers.base import Dispatcher
+from deal_radar.dispatchers.discord import scrub_surrogates
 from deal_radar.engine.types import Alert, DispatchResult, utcnow
 
 log = get_logger("dispatch.websocket")
@@ -179,6 +182,11 @@ class WebSocketHub(Dispatcher):
             await ws.prepare(request)
         finally:
             self._pending -= 1
+        if self._closing:  # close() ran while the handshake was in flight
+            self._rejected.inc(reason="shutting_down")
+            late = _Client(ws=ws, peer=request.remote or "?", transport=request.transport)
+            await self._close_client(late, WSCloseCode.GOING_AWAY, b"server shutdown")
+            return ws
 
         client = _Client(ws=ws, peer=request.remote or "?", transport=request.transport)
         # Register and snapshot the replay without an await in between: alerts that
@@ -315,7 +323,11 @@ class WebSocketHub(Dispatcher):
     async def send(self, alert: Alert) -> DispatchResult:
         started = time.perf_counter()
         try:
-            body = json_dumps(alert.model_dump(mode="json"))
+            data = alert.model_dump(mode="json")
+            try:
+                body = json_dumps(data)
+            except TypeError:  # lone UTF-16 surrogates are not valid UTF-8 (see dispatchers.discord)
+                body = json_dumps(scrub_surrogates(data))
         except Exception as exc:
             log.exception("websocket alert serialisation failed", extra={"alert_id": alert.alert_id})
             return DispatchResult(target=self.target, ok=False, error=f"serialisation failed: {exc!r}"[:300])
@@ -335,7 +347,8 @@ class WebSocketHub(Dispatcher):
 
     async def send_notice(self, title: str, message: str) -> DispatchResult:
         started = time.perf_counter()
-        frame = json_dumps({"type": "notice", "title": title, "message": message, "ts": utcnow().isoformat()})
+        notice = {"type": "notice", "title": title, "message": message, "ts": utcnow().isoformat()}
+        frame = json_dumps(scrub_surrogates(notice))
         await self._broadcast(frame, "notice")
         return DispatchResult(target=self.target, ok=True, latency_ms=round((time.perf_counter() - started) * 1000.0, 3))
 

@@ -13,9 +13,16 @@ reads, so this ingestor is built around restraint rather than throughput:
   checkpoint: a login wall, checkpoint or "temporarily blocked" page raises
   :class:`SourceBlocked` with a long cooldown and the base loop notifies the operator.
 * **Sequential, paced queries.** Search terms run one after another with human-like
-  pauses and wheel scrolling. A poll is time-boxed to ``poll_timeout_seconds``;
-  terms that did not fit continue next poll from a rotating cursor, so every term is
-  covered over a few polls without ever bursting.
+  pauses and wheel scrolling. A poll is time-boxed to ``poll_timeout_seconds`` and the
+  account is held to ``MAX_SEARCHES_PER_HOUR`` search navigations per sliding hour
+  (research guidance for one logged-in account: about 40/hour); terms that did not fit
+  continue from a rotating cursor and :meth:`FbMarketplaceIngestor.next_interval`
+  sleeps until the hourly window has room, so every term is covered without bursting.
+* **Self-healing session.** A dead browser (crash, killed profile, dead Playwright
+  driver) is relaunched on the next poll and a crashed tab is replaced. After a login /
+  checkpoint wall the next poll reloads the storage-state file, so a session refreshed
+  with ``--login`` is picked up without restarting the process. Cookies are only written
+  back while they still hold a Facebook session, and every shutdown step is time-boxed.
 
 Data extraction (most robust first, merged and de-duplicated by listing id):
 
@@ -30,12 +37,15 @@ Data extraction (most robust first, merged and de-duplicated by listing id):
 
 Facebook reshuffles GraphQL paths regularly, so listings are found by walking every
 document generically for objects that look like a listing (``marketplace_listing_title``
-plus ``listing_price``/``id``) rather than by one hard-coded path. The commonly
+plus ``listing_price``/``id``) rather than by one hard-coded path; when a document has a
+``marketplace_search`` root only listings below it count (other rails such as "Today's
+picks" are ignored). The DOM fallback only runs when the page carried no search JSON at
+all: an empty feed is an answer, and cards shown then are suggestions. The commonly
 observed path is ``data.marketplace_search.feed_units.edges[].node.listing`` with
 fields ``id``, ``marketplace_listing_title``, ``listing_price{amount, formatted_amount}``,
 ``strikethrough_price``, ``primary_listing_photo.image.uri``,
 ``location.reverse_geocode{city, state, city_page.display_name}``, ``is_sold``,
-``is_pending``, ``delivery_types``, ``marketplace_listing_seller{name}`` (field names as
+``is_pending``, ``is_hidden``, ``delivery_types``, ``marketplace_listing_seller{name}`` (field names as
 used by several independent open-source Marketplace tools; not an official contract).
 Search results rarely carry a timestamp, so ``posted_at`` is only set when a
 ``creation_time`` is present.
@@ -316,6 +326,18 @@ def _raw_decode_all(line: str) -> Iterator[Any]:
         yield value
 
 
+def _try_loads(text: str) -> tuple[bool, Any]:
+    """``(True, value)`` for one complete JSON document, else ``(False, None)``.
+
+    ``RecursionError`` is caught as well: pathologically nested input must cost one
+    payload, never the whole poll.
+    """
+    try:
+        return True, json_loads(text)
+    except (ValueError, RecursionError):
+        return False, None
+
+
 def iter_json_documents(text: str) -> Iterator[Any]:
     """Yield every JSON document in a Facebook response body.
 
@@ -326,23 +348,19 @@ def iter_json_documents(text: str) -> Iterator[Any]:
     body = _strip_xssi(text.lstrip("﻿ \t\r\n"))
     if not body:
         return
-    try:
-        document = json_loads(body)
-    except (ValueError, RecursionError):
-        pass
-    else:
+    ok, document = _try_loads(body)
+    if ok:
         yield document
         return
     for raw_line in body.splitlines():
         line = _strip_xssi(raw_line.strip())
         if not line or line[0] not in "{[":
             continue
-        try:
-            document = json_loads(line)
-        except (ValueError, RecursionError):
-            yield from _raw_decode_all(line)
-        else:
+        ok, document = _try_loads(line)
+        if ok:
             yield document
+        else:
+            yield from _raw_decode_all(line)
 
 
 def _is_listing_node(node: Mapping[str, Any]) -> bool:
@@ -400,7 +418,10 @@ def search_listing_nodes(document: Any) -> tuple[list[dict[str, Any]], int]:
     it count; otherwise (``@defer`` chunks addressed by ``path``, or a renamed root) the
     whole document is walked generically.
     """
-    roots = _search_roots(document)
+    return _scoped_listing_nodes(document, _search_roots(document))
+
+
+def _scoped_listing_nodes(document: Any, roots: list[Any]) -> tuple[list[dict[str, Any]], int]:
     if not roots:
         return list(iter_listing_nodes(document)), 0
     nodes: list[dict[str, Any]] = []
@@ -670,7 +691,15 @@ def _merge(existing: RawListing, newer: RawListing) -> None:
 
 
 class ParseStats(Counter):
-    """Skipped nodes per reason (``sold``, ``pending``, ``no_id``...) plus ``documents`` and ``withheld``."""
+    """Skipped nodes per reason (``sold``, ``pending``, ``no_id``, ``other_rail``...) plus bookkeeping.
+
+    Bookkeeping keys (not skip reasons): ``documents`` (JSON documents decoded),
+    ``search_feeds`` (documents carrying a ``marketplace_search`` root), ``nodes``
+    (search listing nodes examined) and ``withheld`` (feeds whose cursor reports matches
+    that were not returned).
+    """
+
+    BOOKKEEPING: ClassVar[frozenset[str]] = frozenset({"documents", "search_feeds", "nodes", "withheld"})
 
 
 def parse_payloads(
@@ -695,9 +724,13 @@ def parse_payloads(
             withheld = count_withheld_feeds(document)
             if withheld:
                 stats["withheld"] += withheld
-            nodes, other_rail = search_listing_nodes(document)
+            roots = _search_roots(document)
+            if roots:
+                stats["search_feeds"] += 1
+            nodes, other_rail = _scoped_listing_nodes(document, roots)
             if other_rail:
                 stats["other_rail"] += other_rail
+            stats["nodes"] += len(nodes)
             for node in nodes:
                 listing, reason = _listing_from_node(node, query=query, profile_hint=profile_hint, via=via)
                 if listing is None:
@@ -922,7 +955,7 @@ class FbMarketplaceIngestor(BaseIngestor):
             browser, context = await new_stealth_context(playwright, self.cfg.browser, geo)
         except BaseException:
             with contextlib.suppress(Exception):
-                await playwright.stop()
+                await asyncio.wait_for(playwright.stop(), timeout=self.close_timeout_seconds)
             raise
         self._playwright, self._browser, self._context = playwright, browser, context
         # A dead browser/profile must be noticed even between polls (a persistent
@@ -974,12 +1007,11 @@ class FbMarketplaceIngestor(BaseIngestor):
         if playwright is not None:
             steps.append(("playwright", playwright.stop))  # also kills a browser that ignored close()
         for what, close in steps:
-            try:
-                await asyncio.wait_for(close(), timeout=self.close_timeout_seconds)
-            except asyncio.TimeoutError:
-                self.log.warning("browser shutdown step timed out", extra={"source": self.name, "step": what})
-            except Exception:  # noqa: BLE001, S110 - already dead objects raise on close; nothing to do
-                pass
+            with contextlib.suppress(Exception):  # already dead objects raise on close; nothing to do
+                try:
+                    await asyncio.wait_for(close(), timeout=self.close_timeout_seconds)
+                except asyncio.TimeoutError:
+                    self.log.warning("browser shutdown step timed out", extra={"source": self.name, "step": what})
 
     async def _new_page(self) -> "Page":
         assert self._context is not None
@@ -1240,10 +1272,12 @@ class FbMarketplaceIngestor(BaseIngestor):
             listings, stats = await asyncio.to_thread(parse_payloads, payloads, query=term, profile_hint=profile.id)
         except Exception:  # noqa: BLE001 - one undecodable payload must not cost the whole poll
             self._m_payloads.inc(kind="unparseable")
-            self.log.exception("could not parse Facebook payloads; using the page cards", extra={"source": self.name, "query": term})
+            self.log.exception(
+                "could not parse Facebook payloads; using the page cards", extra={"source": self.name, "query": term}
+            )
             listings, stats = [], ParseStats()
         for reason, count in stats.items():
-            if reason not in ("documents", "withheld"):
+            if reason not in ParseStats.BOOKKEEPING:
                 self._m_skipped.inc(count, reason=reason)
         if stats["withheld"] and not listings:
             self._m_blocks.inc(reason="withheld")
@@ -1251,7 +1285,10 @@ class FbMarketplaceIngestor(BaseIngestor):
                 "Facebook reported matches but returned no listings (results withheld; possible soft block)",
                 extra={"source": self.name, "query": term},
             )
-        if not listings:
+        if not listings and not stats["search_feeds"] and not stats["nodes"]:
+            # Only when the page carried no search JSON at all: an empty (or withheld)
+            # feed is an answer, and the cards then on the page are suggestions
+            # ("results outside your search"), not results.
             cards = await page.evaluate(_DOM_CARDS_JS, [ITEM_LINK_SELECTOR, limit])
             cards = [card for card in cards if isinstance(card, Mapping)] if isinstance(cards, list) else []
             listings = parse_dom_cards(cards, query=term, profile_hint=profile.id)
@@ -1264,7 +1301,7 @@ class FbMarketplaceIngestor(BaseIngestor):
                 "query": term,
                 "listings": len(listings),
                 "payloads": len(payloads),
-                "skipped": {k: v for k, v in stats.items() if k not in ("documents", "withheld")},
+                "skipped": {k: v for k, v in stats.items() if k not in ParseStats.BOOKKEEPING},
             },
         )
         return listings[:limit]
@@ -1573,6 +1610,7 @@ __all__ = [
     "parse_payloads",
     "run_check",
     "run_login",
+    "search_listing_nodes",
     "session_problem",
 ]
 
