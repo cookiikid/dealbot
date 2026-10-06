@@ -214,6 +214,11 @@ def looks_blocked(body: str | bytes | None, headers: Mapping[str, str] | None = 
     """True for an HTML block wall (edge WAF / bot challenge) rather than an eBay API answer."""
     if not body:
         return False
+    try:
+        json_loads(body)
+        return False  # any JSON body is the API talking (eBay's own 403 says "Access denied" too)
+    except ValueError:
+        pass
     text = body.decode("utf-8", "replace") if isinstance(body, bytes) else body
     head = text[:4096]
     content_type = str((headers or {}).get("Content-Type", "")).lower()
@@ -604,7 +609,8 @@ class SearchQuery:
 
     @property
     def key(self) -> str:
-        return f"{self.label}:{self.term}"
+        """Unique per distinct request (two searches with the same URL are merged)."""
+        return self.url
 
 
 def _fmt_amount(value: float) -> str:
@@ -802,7 +808,14 @@ def build_queries(
     """
     if cfg.queries:
         lookup = known_profiles if known_profiles is not None else {p.id: p for p in profiles}
-        return [build_configured_query(cfg, spec, lookup.get(spec.profile_hint or ""), search_url) for spec in cfg.queries]
+        configured: list[SearchQuery] = []
+        for spec in cfg.queries:
+            query = build_configured_query(cfg, spec, lookup.get(spec.profile_hint or ""), search_url)
+            if any(q.url == query.url for q in configured):
+                log.warning("duplicate sources.ebay.queries entry ignored", extra={"term": query.term})
+                continue
+            configured.append(query)
+        return configured
     queries: list[SearchQuery] = []
     for profile in profiles:
         lo, hi = price_bounds(profile)
@@ -1155,20 +1168,35 @@ def parse_search_page(
 
 @dataclass(slots=True)
 class _PollState:
-    stop_reason: str | None = None  # "throttled" | "auth": skip queries not yet started
-    calls: int = 0
+    stop_reason: str | None = None  # "blocked" | "auth" | "token" | "throttled": skip queries not yet started
+    calls: int = 0  # Browse calls spent (HTTP attempts) for the quota ledger
+    started: set[str] = field(default_factory=set)  # keys of queries that went to the network
 
 
 @dataclass(slots=True)
 class _QueryOutcome:
-    query: EbayQuery
+    query: SearchQuery
     page: SearchPage | None = None
     error: SourceError | None = None
     skipped: bool = False
 
 
+# Errors that every remaining query of the poll would hit too: (type, stop reason, metric outcome).
+_STOP_ERRORS: tuple[tuple[type[SourceError], str, str], ...] = (
+    (SourceBlocked, "blocked", "blocked"),
+    (SourceAuthError, "auth", "auth_error"),
+    (EbayTokenUnavailable, "token", "token_error"),
+    (EbayRateLimited, "throttled", "throttled"),
+)
+
+
 def classify_error(exc: BaseException) -> SourceError:
-    """Map transport/HTTP failures onto the source error hierarchy."""
+    """Map transport/HTTP failures onto the source error hierarchy.
+
+    A 403 carrying eBay's JSON ``errors[]`` (errorId 1100) is an access problem of the
+    keyset (:class:`SourceAuthError`); a 403 HTML page is an edge block wall
+    (:class:`SourceBlocked`, so the base loop cools down and notifies the operator).
+    """
     if isinstance(exc, SourceError):
         return exc
     if isinstance(exc, HttpStatusError):
@@ -1178,6 +1206,8 @@ def classify_error(exc: BaseException) -> SourceError:
             err: SourceError = EbayRateLimited(f"eBay throttled the request (HTTP 429: {detail})")
         elif exc.status == 401:
             err = SourceAuthError(f"eBay rejected the access token (HTTP 401: {detail})")
+        elif exc.status == 403 and not errors and looks_blocked(exc.body, exc.headers):
+            err = SourceBlocked("eBay API answered with a block page (HTTP 403 HTML, not an API error)")
         elif exc.status == 403:
             err = SourceAuthError(
                 f"eBay denied access (HTTP 403: {detail}); check the keyset is activated "
@@ -1197,6 +1227,33 @@ def classify_error(exc: BaseException) -> SourceError:
         err = SourceError(f"eBay query failed: {exc!r}")
     err.__cause__ = exc
     return err
+
+
+def decode_search_body(body: Any, headers: Mapping[str, str] | None = None) -> Mapping[str, Any]:
+    """JSON object of a 200 search response.
+
+    Raises :class:`SourceBlocked` for a bot wall served with 200, and
+    :class:`EbayResponseError` for anything else that is not a JSON object (empty body,
+    ``null``, a list, a proxy error page). Such a reply must not count as an empty,
+    successful search.
+    """
+    if isinstance(body, Mapping):
+        return body
+    if isinstance(body, (bytes, str)):
+        if not body.strip():
+            raise EbayResponseError("eBay returned an empty search response")
+        try:
+            data = json_loads(body)
+        except ValueError as exc:
+            text = body[:4096].decode("utf-8", "replace") if isinstance(body, bytes) else body[:4096]
+            if _BLOCK_WALL.search(text):
+                raise SourceBlocked("eBay API answered with a block page (HTTP 200 HTML)") from exc
+            content_type = (headers or {}).get("Content-Type", "?")
+            raise EbayResponseError(f"eBay returned a non-JSON search response ({content_type})") from exc
+        if isinstance(data, Mapping):
+            return data
+        body = data
+    raise EbayResponseError(f"eBay returned an unexpected search response ({type(body).__name__})")
 
 
 class EbayIngestor(BaseIngestor):
@@ -1226,7 +1283,7 @@ class EbayIngestor(BaseIngestor):
         self.ledger = QuotaLedger(
             cfg.daily_call_budget, redis=ctx.redis, key_prefix=f"{prefix}ebay:calls:{cfg.environment}:{keyset}:"
         )
-        self._queries: list[EbayQuery] | None = None
+        self._queries: list[SearchQuery] | None = None
         self._monotonic: Callable[[], float] = time.monotonic
         self._throttle_strikes = 0
         self._throttled_until = 0.0
@@ -1244,9 +1301,10 @@ class EbayIngestor(BaseIngestor):
     # ------------------------------------------------------------------ queries & quota
 
     @property
-    def queries(self) -> list[EbayQuery]:
+    def queries(self) -> list[SearchQuery]:
         if self._queries is None:
-            self._queries = build_queries(self.cfg, self.search_profiles(), self.endpoints.search_url)
+            known = {p.id: p for p in self.ctx.config.profiles}
+            self._queries = build_queries(self.cfg, self.search_profiles(), self.endpoints.search_url, known_profiles=known)
             self._m_calls_per_poll.set(len(self._queries))
         return self._queries
 
@@ -1284,6 +1342,14 @@ class EbayIngestor(BaseIngestor):
         self._m_interval.set(round(delay, 3))
         return max(0.05, delay)
 
+    def poll_budget(self) -> float:
+        """Seconds a poll may spend on searches before unfinished ones are abandoned.
+
+        It stays below ``poll_timeout_seconds`` so a hung or throttled request cannot
+        make the base loop's timeout discard the results that already arrived.
+        """
+        return max(0.05, float(self.cfg.poll_timeout_seconds) * POLL_BUDGET_FRACTION)
+
     # ------------------------------------------------------------------ lifecycle
 
     async def setup(self) -> None:
@@ -1291,13 +1357,17 @@ class EbayIngestor(BaseIngestor):
             raise SourceAuthError("sources.ebay requires client_id and client_secret (EBAY_CLIENT_ID / EBAY_CLIENT_SECRET)")
         queries = self.queries
         if not queries:
-            self.log.warning("no enabled profile has search terms for eBay; nothing to poll", extra={"source": self.name})
+            self.log.warning(
+                "no eBay searches configured (no enabled profile has search terms and sources.ebay.queries is empty)",
+                extra={"source": self.name},
+            )
         self.log.info(
             "eBay polling plan",
             extra={
                 "source": self.name,
                 "environment": self.cfg.environment,
                 "queries": len(queries),
+                "coalesced": bool(self.cfg.queries),
                 "daily_call_budget": self.cfg.daily_call_budget,
                 "interval_s": round(self.quota_interval(), 1),
             },
@@ -1312,7 +1382,7 @@ class EbayIngestor(BaseIngestor):
         queries = self.queries
         if not queries:
             return []
-        used = self.ledger.used()
+        used = await self.ledger.sync()  # other nodes may have spent the shared quota meanwhile
         if used + len(queries) > self.cfg.daily_call_budget:
             day = self.ledger.day()
             if self._exhausted_day != day:
@@ -1325,12 +1395,19 @@ class EbayIngestor(BaseIngestor):
 
         state = _PollState()
         semaphore = asyncio.Semaphore(self.cfg.max_concurrency)
+        tasks = [asyncio.create_task(self._run_query(q, semaphore, state)) for q in queries]
         try:
-            async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(self._run_query(q, semaphore, state)) for q in queries]
+            await asyncio.wait(tasks, timeout=self.poll_budget())
         finally:
+            # Past the deadline (or when the poll itself is cancelled) abandon whatever is
+            # still running, so the searches that finished are not lost with it.
+            unfinished = [t for t in tasks if not t.done()]
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.wait(unfinished)
             self._m_used.set(await self.ledger.record(state.calls))
-        outcomes = [t.result() for t in tasks]
+        outcomes = [self._outcome(q, t, state) for q, t in zip(queries, tasks)]
 
         succeeded = [o for o in outcomes if o.page is not None]
         failed = [o for o in outcomes if o.error is not None]
@@ -1340,9 +1417,10 @@ class EbayIngestor(BaseIngestor):
 
         if not succeeded:
             errors = [o.error for o in failed if o.error is not None]
-            auth = next((e for e in errors if isinstance(e, SourceAuthError)), None)
-            if auth is not None:
-                raise auth
+            for kind in (SourceBlocked, SourceAuthError, EbayTokenUnavailable):
+                hit = next((e for e in errors if isinstance(e, kind)), None)
+                if hit is not None:
+                    raise hit
             if throttled:
                 raise EbayRateLimited(
                     f"eBay throttled the poll (HTTP 429 / errorId 2001): {len(failed)} failed, {len(skipped)} skipped"
@@ -1376,6 +1454,22 @@ class EbayIngestor(BaseIngestor):
             )
         return listings
 
+    def _outcome(self, query: SearchQuery, task: "asyncio.Task[_QueryOutcome]", state: _PollState) -> _QueryOutcome:
+        if task.cancelled():  # abandoned at the poll deadline
+            if query.key not in state.started:
+                self._m_queries.inc(profile=query.label, outcome="skipped")
+                return _QueryOutcome(query, skipped=True)
+            self._m_queries.inc(profile=query.label, outcome="timeout")
+            self.log.warning(
+                "eBay query abandoned at the poll deadline",
+                extra={"source": self.name, "profile": query.label, "term": query.term, "budget_s": self.poll_budget()},
+            )
+            return _QueryOutcome(query, error=SourceError(f"eBay query did not finish within {self.poll_budget():.1f}s"))
+        exc = task.exception()
+        if exc is not None:  # _run_query handles every Exception; this is only a safety net
+            return _QueryOutcome(query, error=classify_error(exc))
+        return task.result()
+
     def _update_throttle(self, throttled: bool) -> None:
         if not throttled:
             self._throttle_strikes = 0
@@ -1388,43 +1482,42 @@ class EbayIngestor(BaseIngestor):
             "eBay burst throttle hit; stretching the poll interval", extra={"source": self.name, "penalty_s": penalty}
         )
 
-    async def _run_query(self, query: EbayQuery, semaphore: asyncio.Semaphore, state: _PollState) -> _QueryOutcome:
+    async def _run_query(self, query: SearchQuery, semaphore: asyncio.Semaphore, state: _PollState) -> _QueryOutcome:
         async with semaphore:
             if state.stop_reason is not None:
-                self._m_queries.inc(profile=query.profile_id, outcome="skipped")
+                self._m_queries.inc(profile=query.label, outcome="skipped")
                 return _QueryOutcome(query, skipped=True)
+            state.started.add(query.key)
             started_at = utcnow()
             try:
                 data = await self._search(query, state)
                 page = parse_search_page(
                     data,
                     query=query.term,
-                    profile_hint=query.profile_id,
+                    profile_hint=query.profile_hint,
                     prefer_affiliate=bool(self.cfg.affiliate_campaign_id),
                 )
+                self._after_page(query, page, started_at)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one failing query must not sink the poll
                 error = classify_error(exc)
-                if isinstance(error, EbayRateLimited):
-                    state.stop_reason = "throttled"
-                    outcome = "throttled"
-                elif isinstance(error, SourceAuthError):
-                    state.stop_reason = "auth"
-                    outcome = "auth_error"
-                else:
-                    outcome = "error"
-                self._m_queries.inc(profile=query.profile_id, outcome=outcome)
+                outcome = "error"
+                for kind, reason, label in _STOP_ERRORS:
+                    if isinstance(error, kind):
+                        state.stop_reason = state.stop_reason or reason
+                        outcome = label
+                        break
+                self._m_queries.inc(profile=query.label, outcome=outcome)
                 self.log.warning(
                     "eBay query failed",
-                    extra={"source": self.name, "profile": query.profile_id, "term": query.term, "error": str(error)},
+                    extra={"source": self.name, "profile": query.label, "term": query.term, "error": str(error)},
                 )
                 return _QueryOutcome(query, error=error)
-        self._m_queries.inc(profile=query.profile_id, outcome="ok")
-        self._after_page(query, page, started_at)
+        self._m_queries.inc(profile=query.label, outcome="ok")
         return _QueryOutcome(query, page=page)
 
-    def _after_page(self, query: EbayQuery, page: SearchPage, started_at: datetime) -> None:
+    def _after_page(self, query: SearchQuery, page: SearchPage, started_at: datetime) -> None:
         for reason, count in page.skipped.items():
             self._m_skipped.inc(count, reason=reason)
         for warning in page.warnings:
@@ -1435,7 +1528,7 @@ class EbayIngestor(BaseIngestor):
                     "eBay returned a search warning",
                     extra={
                         "source": self.name,
-                        "profile": query.profile_id,
+                        "profile": query.label,
                         "term": query.term,
                         "warning": describe_errors([warning]),
                     },
@@ -1448,14 +1541,14 @@ class EbayIngestor(BaseIngestor):
             and page.oldest_origin is not None
             and page.oldest_origin > previous
         ):
-            self._m_saturated.inc(profile=query.profile_id)
+            self._m_saturated.inc(profile=query.label)
             self.log.warning(
                 "eBay result page saturated; listings may have been missed (raise sources.ebay.limit)",
-                extra={"source": self.name, "profile": query.profile_id, "term": query.term, "limit": self.cfg.limit},
+                extra={"source": self.name, "profile": query.label, "term": query.term, "limit": self.cfg.limit},
             )
         self._last_query_success[query.key] = started_at
 
-    async def _search(self, query: EbayQuery, state: _PollState) -> Any:
+    async def _search(self, query: SearchQuery, state: _PollState) -> Mapping[str, Any]:
         token = await self.tokens.get_token()
         try:
             response = await self._get(query.url, token, state)
@@ -1472,7 +1565,7 @@ class EbayIngestor(BaseIngestor):
                     detail = describe_errors(ebay_errors(retry_exc.body)) or "HTTP 401"
                     raise SourceAuthError(f"eBay rejected a freshly minted application token ({detail})") from retry_exc
                 raise
-        return response.data
+        return decode_search_body(response.data, response.headers)
 
     async def _get(self, url: str, token: str, state: _PollState) -> HttpResponse:
         try:
@@ -1481,6 +1574,7 @@ class EbayIngestor(BaseIngestor):
                 url,
                 headers=build_headers(self.cfg, token),
                 accept="application/json",
+                parse="bytes",  # decoded by decode_search_body, which can tell a block page from a bad reply
                 policy=self.policy,
             )
         except HttpStatusError as exc:
@@ -1488,6 +1582,9 @@ class EbayIngestor(BaseIngestor):
             raise
         except RetryExhausted as exc:
             state.calls += exc.attempts
+            raise
+        except asyncio.CancelledError:
+            state.calls += 1  # abandoned in flight: eBay may well have counted it
             raise
         except Exception:
             state.calls += 1
@@ -1500,13 +1597,16 @@ __all__ = [
     "APP_SCOPE",
     "EbayEndpoints",
     "EbayIngestor",
-    "EbayQuery",
     "EbayRateLimited",
     "EbayRequestError",
+    "EbayResponseError",
     "EbayTokenManager",
+    "EbayTokenUnavailable",
     "QuotaLedger",
     "SearchPage",
+    "SearchQuery",
     "api_policy",
+    "build_configured_query",
     "build_enduserctx",
     "build_filter",
     "build_headers",
@@ -1514,9 +1614,11 @@ __all__ = [
     "build_search_url",
     "classify_error",
     "collect_images",
+    "decode_search_body",
     "describe_errors",
     "ebay_errors",
     "keyset_id",
+    "looks_blocked",
     "parse_item_summary",
     "parse_search_page",
     "parse_shipping",

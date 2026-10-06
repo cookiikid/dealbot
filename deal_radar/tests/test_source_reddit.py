@@ -996,3 +996,131 @@ async def test_location_filter_applies_only_to_swap_subreddits(http: HttpClient,
     deals = [raw for raw in listings if raw.source_kind is SourceKind.AGGREGATOR]
     assert [raw.source_id for raw in swap] == ["t3_1nyk1e6"]
     assert len(deals) == 4
+
+
+# --------------------------------------------------------------------------- adversarial-review regressions
+
+
+def test_urls_keep_query_params_that_look_like_html_entities() -> None:
+    # raw_json=1 delivers URLs verbatim; html.unescape() would turn "&region=" into "®ion=",
+    # "&gtin=" into ">in=", "&section=" into "§ion=" (HTML5 legacy entities need no ";").
+    link = "https://www.bestbuy.com/site/x/6524436.p?skuId=6524436&region=us&gtin=0195553&section=gpu&timestamp=1&notify=1"
+    data = post("buildapcsales_new.json", "1nyk2gq")
+    data.update(url=link, url_overridden_by_dest=link)
+    data["preview"]["images"][0]["source"]["url"] = "https://external-preview.redd.it/x.jpeg?width=640&crop=smart&auto=webp&s=ab"
+    raw = parse_deal_post(data, subreddit="buildapcsales")
+    assert raw.outbound_url == link
+    assert raw.retailer == "Best Buy"
+    assert raw.image_urls == ["https://external-preview.redd.it/x.jpeg?width=640&crop=smart&auto=webp&s=ab"]
+
+
+def test_escaped_urls_from_non_raw_payloads_and_editor_entities_are_decoded() -> None:
+    data = post("buildapcsales_new.json", "1nyjz7d")  # self post: link comes from the markdown body
+    data["selftext"] = (
+        "Deal here: https://www.newegg.com/p/N82E16824026292?Item=N82E16824026292&amp;cm_sp=Homepage&#x200B;\n\n&#x200B;\n"
+    )
+    data["preview"] = {"images": [{"source": {"url": "https://preview.redd.it/a.png?width=960&amp;format=png&amp;s=1f"}}]}
+    raw = parse_deal_post(data, subreddit="buildapcsales")
+    assert raw.outbound_url == "https://www.newegg.com/p/N82E16824026292?Item=N82E16824026292&cm_sp=Homepage"
+    assert raw.retailer == "Newegg"
+    assert raw.image_urls == ["https://preview.redd.it/a.png?width=960&format=png&s=1f"]
+
+
+def test_swap_title_colons_and_markdown_price_variants() -> None:
+    swap = parse_swap_title("[USA-CA] [H]: RTX 4090 FE [W]: PayPal")
+    assert swap is not None and swap.have == "RTX 4090 FE" and swap.want == "PayPal"
+    data = post("hardwareswap_new.json", "1nyk1e6")
+    data["selftext"] = "**$400** shipped, timestamps below"
+    raw = parse_swap_post(data, subreddit="hardwareswap")
+    assert raw.price == 400.0 and raw.shipping == 0.0
+    data["selftext"] = "EVGA 3080 - Sold for $400 to /u/buyer\n\nEVGA 3080 Ti - $520 (shipped)"
+    raw = parse_swap_post(data, subreddit="hardwareswap")
+    assert raw.price == 520.0 and raw.shipping == 0.0
+    assert raw.extra["prices"] == [520.0]
+
+
+def test_per_post_lists_are_bounded() -> None:
+    data = post("hardwareswap_new.json", "1nyk1e6")
+    data["selftext"] = "".join(f"| item {i} | ${100 + i} | https://i.imgur.com/img{i:04d}x.jpg |\n" for i in range(500))
+    raw = parse_swap_post(data, subreddit="hardwareswap")
+    assert raw.price == 100.0
+    assert len(raw.image_urls) <= 20 and raw.image_urls[0] == "https://i.imgur.com/img0000x.jpg"
+    assert len(raw.extra["prices"]) <= 20
+
+
+async def test_large_listing_is_parsed_off_the_event_loop(
+    http: HttpClient, reddit: FakeReddit, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    import deal_radar.sources.reddit_stream as module
+
+    threads: list[int] = []
+    real_parse = module.parse_listing
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        threads.append(threading.get_ident())
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(module, "parse_listing", spy)
+    ing = make_ingestor(http, reddit, subreddits=[{"name": "hardwareswap", "mode": "swap"}])
+    small = fixture("hardwareswap_new.json")
+    big = copy.deepcopy(small)
+    for child in big["data"]["children"]:
+        child["data"]["selftext_html"] = "<div>" + "x" * 60_000 + "</div>"
+    reddit.on("GET", PUBLIC_HWS, reply(200, small), reply(200, big))
+    loop_thread = threading.get_ident()
+    assert len(await ing.poll()) == 3
+    assert len(await ing.poll()) == 3
+    assert threads[0] == loop_thread  # small bodies: inline, no thread hop
+    assert threads[1] != loop_thread  # large bodies: decoded and parsed in a worker thread
+
+
+async def test_oversized_listing_body_fails_the_subreddit_not_the_process(
+    http: HttpClient, reddit: FakeReddit, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import deal_radar.sources.reddit_stream as module
+    from deal_radar.core.http import ResponseTooLarge
+
+    monkeypatch.setattr(module, "MAX_LISTING_BYTES", 4096)
+    ing = make_ingestor(http, reddit, subreddits=[{"name": "buildapcsales"}])
+    reddit.on("GET", PUBLIC_BAPCS, listing_reply("buildapcsales_new.json"))
+    with pytest.raises(ResponseTooLarge):
+        await ing.poll()
+
+
+async def test_concurrent_blocks_keep_the_longest_cooldown(http: HttpClient, reddit: FakeReddit) -> None:
+    ing = make_ingestor(http, reddit, env=OAUTH_ENV)
+    pardner = "<html><body><h1>whoa there, pardner!</h1></body></html>"
+    reddit.on("POST", TOKEN_PATH, reply(200, token_payload("tok-1")), reply(200, token_payload("tok-2")))
+    # buildapcsales (first in config order) is rate limited for 30 s, hardwareswap is behind a block wall.
+    reddit.on("GET", OAUTH_BAPCS, reply(429, b"", headers={"x-ratelimit-remaining": "0", "x-ratelimit-reset": "30"}))
+    reddit.on("GET", OAUTH_HWS, reply(403, body=pardner, content_type="text/html"))
+    with pytest.raises(SourceBlocked) as info:
+        await ing.poll()
+    assert info.value.cooldown_seconds is not None and info.value.cooldown_seconds >= BLOCK_COOLDOWN_SECONDS
+
+
+async def test_token_expires_in_given_as_epoch_is_handled(http: HttpClient, reddit: FakeReddit) -> None:
+    clock = FakeClock()
+    ing = make_ingestor(http, reddit, env=OAUTH_ENV, clock=clock, subreddits=[{"name": "buildapcsales"}])
+    epoch_expiry = int(time.time()) + 3600  # the OAuth2 wiki words expires_in as "Unix Epoch Seconds"
+    reddit.on("POST", TOKEN_PATH, reply(200, token_payload("tok-1", epoch_expiry)), reply(200, token_payload("tok-2")))
+    reddit.on("GET", OAUTH_BAPCS, listing_reply("buildapcsales_new.json", headers=RL_OK))
+    await ing.poll()
+    clock.now += 3600  # an hour later the epoch-style token must have been renewed
+    await ing.poll()
+    assert [s.headers["Authorization"] for s in reddit.calls("GET", OAUTH_BAPCS)] == ["bearer tok-1", "bearer tok-2"]
+
+
+def test_oauth_secret_is_not_held_in_plain_text(http: HttpClient) -> None:
+    ing = make_ingestor(http, env=OAUTH_ENV)
+    assert ing.oauth is not None
+    assert "s3cr3t" not in repr(vars(ing.oauth))
+
+
+async def test_unknown_inaccessible_reasons_do_not_explode_metric_labels(http: HttpClient, reddit: FakeReddit) -> None:
+    ing = make_ingestor(http, reddit, subreddits=[{"name": "hardwareswap", "mode": "swap"}])
+    reddit.on("GET", PUBLIC_HWS, reply(403, {"reason": "Some new reason 8f2a1c0d9e!", "error": 403}))
+    assert await ing.poll() == []
+    assert ing.m_posts.value(subreddit="hardwareswap", outcome="inaccessible_other") == 1

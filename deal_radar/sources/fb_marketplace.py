@@ -71,8 +71,8 @@ import math
 import re
 import sys
 import time
-from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections import Counter, deque
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -91,6 +91,7 @@ from deal_radar.sources.stealth import (
     human_scroll,
     new_stealth_context,
     save_storage_state,
+    write_private_json,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -103,6 +104,8 @@ SOURCE_NAME = "fb_marketplace"
 GRAPHQL_PATH = "/api/graphql"
 ITEM_LINK_SELECTOR = 'a[href*="/marketplace/item/"]'
 LISTING_MARKER = "marketplace_listing_title"
+#: Root field of the search query's response; listings outside it belong to other rails.
+SEARCH_ROOT_KEY = "marketplace_search"
 #: Substrings that make a JSON payload worth parsing (listings, or an empty/withheld feed).
 PAYLOAD_MARKERS: tuple[str, ...] = (LISTING_MARKER, '"feed_units"')
 XSSI_PREFIX = "for (;;);"
@@ -113,6 +116,11 @@ RADIUS_MISMATCH_TOLERANCE = 0.25
 
 #: Fraction of ``poll_timeout_seconds`` a poll may use before it stops starting queries.
 POLL_BUDGET_FRACTION = 0.8
+#: Account-level ceiling on search navigations per sliding hour (research: keep a single
+#: logged-in account at or below ~40 Marketplace navigations/hour). Terms that do not fit
+#: continue from the rotating cursor once the window frees up.
+MAX_SEARCHES_PER_HOUR = 40
+SEARCH_WINDOW_SECONDS = 3600.0
 #: Initial guess for one query's duration (navigation + waits + scrolls), seconds.
 DEFAULT_QUERY_ESTIMATE_S = 12.0
 
@@ -127,10 +135,24 @@ _ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
 _DECIMAL_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*$")
 _SOLD_TITLE_RE = re.compile(r"^\s*(?:\[\s*sold\s*\]|\(\s*sold\s*\)|sold\s*[-–—:!|]|sold\s*$)", re.IGNORECASE)
 _PRICE_LINE_RE = re.compile(
-    r"^(?:free|(?:[A-Z]{1,2})?[$€£¥₹₱]\s?\d[\d,.\s]*|\d[\d,.\s]*\s?(?:[$€£¥₹₱]|zł|kr|USD|CAD|EUR|GBP|AUD))$",
+    r"^(?:free|(?:[A-Z]{1,2})?[$€£¥₹₱]\s?\d[\d,.\s]*"
+    r"|(?:USD|CAD|AUD|NZD|MXN|EUR|GBP|CHF|SEK|NOK|DKK|PLN|PHP|INR|BRL|ZAR|SGD|HKD|JPY)\s?\d[\d,.\s]*"
+    r"|\d[\d,.\s]*\s?(?:[$€£¥₹₱]|zł|kr|USD|CAD|AUD|NZD|MXN|EUR|GBP|CHF|SEK|NOK|DKK|PLN|PHP|INR|BRL|ZAR|SGD|HKD|JPY))$",
     re.IGNORECASE,
 )
 _STATUS_LINES = frozenset({"sold", "pending", "sold out"})
+#: ISO 4217 codes Facebook prints in ``formatted_amount`` for some markets ("PHP6,500").
+_ISO_CURRENCIES: frozenset[str] = frozenset(
+    "USD CAD AUD NZD MXN EUR GBP CHF SEK NOK DKK ISK PLN CZK HUF RON BGN UAH TRY ILS AED SAR QAR KWD EGP MAD "
+    "NGN KES ZAR INR PKR BDT JPY KRW CNY HKD TWD SGD MYR THB IDR VND PHP BRL ARS CLP COP PEN".split()
+)
+_ISO_ALT = "|".join(sorted(_ISO_CURRENCIES))
+_ISO_CURRENCY_RE = re.compile(rf"(?<![A-Za-z])({_ISO_ALT})(?![A-Za-z])")
+#: One price token inside a card line ("$350", "CA$1,200"); used to split "$350$400".
+_PRICE_TOKEN_RE = re.compile(r"(?:[A-Z]{1,3})?[$€£¥₹₱]\s?\d[\d,.]*")
+#: Walls that mean the stored session is unusable: the next poll reloads the session
+#: file from disk (the operator may have refreshed it with ``--login`` meanwhile).
+_SESSION_WALLS = frozenset({"login_required", "checkpoint", "consent_required"})
 _CURRENCY_TOKENS: tuple[tuple[str, str], ...] = (
     ("CA$", "CAD"),
     ("C$", "CAD"),
@@ -289,7 +311,7 @@ def _raw_decode_all(line: str) -> Iterator[Any]:
             return
         try:
             value, index = decoder.raw_decode(line, index)
-        except ValueError:
+        except (ValueError, RecursionError):  # the stdlib decoder recurses per nesting level
             return
         yield value
 
@@ -305,18 +327,22 @@ def iter_json_documents(text: str) -> Iterator[Any]:
     if not body:
         return
     try:
-        yield json_loads(body)
-        return
-    except ValueError:
+        document = json_loads(body)
+    except (ValueError, RecursionError):
         pass
+    else:
+        yield document
+        return
     for raw_line in body.splitlines():
         line = _strip_xssi(raw_line.strip())
         if not line or line[0] not in "{[":
             continue
         try:
-            yield json_loads(line)
-        except ValueError:
+            document = json_loads(line)
+        except (ValueError, RecursionError):
             yield from _raw_decode_all(line)
+        else:
+            yield document
 
 
 def _is_listing_node(node: Mapping[str, Any]) -> bool:
@@ -345,6 +371,49 @@ def iter_listing_nodes(document: Any) -> Iterator[dict[str, Any]]:
         stack.extend(reversed([child for child in children if isinstance(child, (dict, list))]))
 
 
+def _search_roots(document: Any) -> list[Any]:
+    """Values of every ``marketplace_search`` field in ``document`` (document order)."""
+    roots: list[Any] = []
+    stack: list[Any] = [document]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            children: list[Any] = []
+            for key, value in node.items():
+                if not isinstance(value, (dict, list)):
+                    continue
+                if key == SEARCH_ROOT_KEY:
+                    roots.append(value)
+                else:
+                    children.append(value)
+            stack.extend(reversed(children))
+        elif isinstance(node, list):
+            stack.extend(reversed([child for child in node if isinstance(child, (dict, list))]))
+    return roots
+
+
+def search_listing_nodes(document: Any) -> tuple[list[dict[str, Any]], int]:
+    """Listing nodes of the *search feed* in ``document`` + how many other-rail nodes were ignored.
+
+    A search page can carry other listing rails ("Today's picks", suggestions) next to
+    the results. When the document has a ``marketplace_search`` root only listings below
+    it count; otherwise (``@defer`` chunks addressed by ``path``, or a renamed root) the
+    whole document is walked generically.
+    """
+    roots = _search_roots(document)
+    if not roots:
+        return list(iter_listing_nodes(document)), 0
+    nodes: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for root in roots:
+        for node in iter_listing_nodes(root):
+            if id(node) not in seen:
+                seen.add(id(node))
+                nodes.append(node)
+    other = sum(1 for node in iter_listing_nodes(document) if id(node) not in seen)
+    return nodes, other
+
+
 def _cursor_match_count(page_info: Any) -> int:
     """Matches announced by a feed cursor (``end_cursor`` is a JSON string with c2c/b2c ``it``)."""
     cursor = page_info.get("end_cursor") if isinstance(page_info, Mapping) else None
@@ -352,7 +421,7 @@ def _cursor_match_count(page_info: Any) -> int:
         return 0
     try:
         data = json.loads(cursor)
-    except ValueError:
+    except (ValueError, RecursionError):
         return 0
     total = 0
     for key in ("c2c", "b2c"):
@@ -388,6 +457,9 @@ def currency_from_text(text: str | None) -> str | None:
     """ISO currency for a formatted price ("CA$1,200" -> CAD, "350 €" -> EUR)."""
     if not text:
         return None
+    iso = _ISO_CURRENCY_RE.search(text)  # explicit code first: "CAD $500" is CAD, "PHP6,500" is PHP
+    if iso is not None:
+        return iso.group(1)
     for token, code in _CURRENCY_TOKENS:
         if token in text:
             return code
@@ -523,6 +595,8 @@ def _listing_from_node(
         return None, "sold"
     if node.get("is_pending") is True:
         return None, "pending"
+    if node.get("is_hidden") is True:
+        return None, "hidden"
 
     price, currency = _price_of(node.get("listing_price"))
     list_price, list_currency = _price_of(node.get("strikethrough_price"))
@@ -609,7 +683,8 @@ def parse_payloads(
 
     The same id may appear in several payloads/chunks (SSR page and a pagination
     response, a deferred chunk adding the price...): later sightings only fill gaps.
-    Ids skipped as sold/pending stay skipped even if another chunk omits the flag.
+    Ids skipped as sold/pending/hidden stay skipped even if another chunk omits the flag.
+    Listings from other rails of the page are ignored (see :func:`search_listing_nodes`).
     """
     stats = ParseStats()
     found: dict[str, RawListing] = {}
@@ -620,11 +695,14 @@ def parse_payloads(
             withheld = count_withheld_feeds(document)
             if withheld:
                 stats["withheld"] += withheld
-            for node in iter_listing_nodes(document):
+            nodes, other_rail = search_listing_nodes(document)
+            if other_rail:
+                stats["other_rail"] += other_rail
+            for node in nodes:
                 listing, reason = _listing_from_node(node, query=query, profile_hint=profile_hint, via=via)
                 if listing is None:
                     stats[reason or "invalid"] += 1
-                    if reason in ("sold", "pending") and isinstance(node.get("id"), (str, int)):
+                    if reason in ("sold", "pending", "hidden") and isinstance(node.get("id"), (str, int)):
                         gone = str(node["id"]).strip()
                         excluded.add(gone)
                         found.pop(gone, None)
@@ -643,6 +721,16 @@ def parse_graphql_payload(text: str, *, query: str | None = None, profile_hint: 
     """Listings contained in one GraphQL (or SSR-embedded) response body."""
     listings, _ = parse_payloads([("graphql", text)], query=query, profile_hint=profile_hint)
     return listings
+
+
+def _price_parts(line: str) -> list[str]:
+    """Price tokens of a card line: ``["$350"]``, ``["$350", "$400"]`` for "$350$400", or ``[]``."""
+    if _PRICE_LINE_RE.match(line):
+        return [line]
+    parts = _PRICE_TOKEN_RE.findall(line)
+    if len(parts) >= 2 and "".join(part.replace(" ", "") for part in parts) == "".join(line.split()):
+        return [part.strip() for part in parts]
+    return []
 
 
 def parse_dom_cards(
@@ -668,8 +756,14 @@ def parse_dom_cards(
         lines = [_clean(line) for line in raw_lines if isinstance(line, str) and line.strip()]
         if any(line.lower() in _STATUS_LINES for line in lines):
             continue
-        prices = [line for line in lines if _PRICE_LINE_RE.match(line)]
-        texts = [line for line in lines if not _PRICE_LINE_RE.match(line)]
+        prices: list[str] = []
+        texts: list[str] = []
+        for line in lines:
+            parts = _price_parts(line)
+            if parts:
+                prices.extend(parts)  # price and strike-through price may share one line
+            else:
+                texts.append(line)
         alt = _clean(card.get("alt"))
         title = texts[0] if texts else (alt.rsplit(" in ", 1)[0] if alt else "")
         if not title or _SOLD_TITLE_RE.match(title):
@@ -710,7 +804,11 @@ def _is_facebook_domain(domain: Any) -> bool:
 
 def has_session_cookie(cookies: Iterable[Mapping[str, Any]]) -> bool:
     """True when Facebook's logged-in cookies (``c_user`` + ``xs``) are present."""
-    names = {str(c.get("name")) for c in cookies if _is_facebook_domain(c.get("domain")) and c.get("value")}
+    names = {
+        str(c.get("name"))
+        for c in cookies
+        if isinstance(c, Mapping) and _is_facebook_domain(c.get("domain")) and c.get("value")
+    }
     return {"c_user", "xs"} <= names
 
 

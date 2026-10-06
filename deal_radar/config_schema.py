@@ -645,14 +645,14 @@ class VisionSection(Strict):
     enabled: bool = False
     backend: Literal["ollama", "openai"] = "ollama"
     base_url: str = "http://localhost:11434"
-    model: str = "qwen2.5vl:3b"
+    model: str = "qwen3-vl:4b-instruct"
     escalation_model: OptStr = None  # bigger model for UNCERTAIN verdicts (two-stage cascade)
     api_key: OptSecret = None  # OpenAI-compatible servers (vLLM/LM Studio) that require one
     timeout_seconds: float = Field(default=8.0, gt=0)
     max_concurrency: int = Field(default=2, ge=1, le=16)
     max_images: int = Field(default=2, ge=1, le=6)
     max_image_bytes: int = Field(default=8_000_000, ge=10_000)
-    resize_max_side: int = Field(default=672, ge=224, le=2048)
+    resize_max_side: int = Field(default=512, ge=224, le=2048)
     jpeg_quality: int = Field(default=85, ge=40, le=100)
     keep_alive: str = "30m"
     num_predict: int = Field(default=160, ge=16, le=2048)

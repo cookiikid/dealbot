@@ -432,18 +432,19 @@ def _required(items: Sequence[tuple[Any, Any]], aligned: bool = False) -> set[st
             aligned = _aligned_after(op, av, aligned)
             continue
         strings, complete = node
+        node_aligned = aligned  # word-start knowledge where THIS node begins
         if run == {""}:
-            run_aligned = aligned
+            run_aligned = node_aligned
         combined = {p + s for p in run for s in strings}
         if len(combined) > _MAX_ANCHORS:
             close()
-            run_aligned = aligned
+            run_aligned = node_aligned
             combined = set(strings)
         run = combined
-        aligned = _ends_aligned(strings, aligned)
+        aligned = _ends_aligned(strings, node_aligned)
         if not complete:
             close()
-            nested = _nested_required(op, av, run_aligned)
+            nested = _nested_required(op, av, node_aligned)
             if nested:
                 candidates.append(nested)
             aligned = False
@@ -580,7 +581,7 @@ class _AnchorGate:
     searches with a fast literal-prefix loop.
     """
 
-    __slots__ = ("_regexes", "_sets_for", "anchor_count")
+    __slots__ = ("_regexes", "_sets_for", "_everything", "anchor_count")
 
     def __init__(self, pattern_sets: Iterable[_PatternSet]) -> None:
         owners: dict[str, set[_PatternSet]] = {}
@@ -588,6 +589,7 @@ class _AnchorGate:
             for anchor in ps.anchors or ():
                 owners.setdefault(anchor, set()).add(ps)
         self.anchor_count = len(owners)
+        self._everything: frozenset[_PatternSet] = frozenset(ps for sets in owners.values() for ps in sets)
         self._sets_for: dict[str, frozenset[_PatternSet]] = {}
         for anchor in owners:
             closure: set[_PatternSet] = set()
@@ -618,7 +620,10 @@ class _AnchorGate:
                 key = m.group()
                 if "  " in key:  # the gate text keeps whitespace runs; anchors are single-spaced
                     key = _SPACE_RUN.sub(" ", key)
-                hits |= sets_for[key]
+                found = sets_for.get(key)
+                if found is None:  # cannot happen for a well-formed trie; fail open, never skip
+                    return set(self._everything)
+                hits |= found
                 pos = m.start() + 1
         return hits
 

@@ -5,7 +5,7 @@ This guide takes you from a fresh clone to the full three-machine deployment:
 | Machine | Role | Runs |
 |---|---|---|
 | **GCP VM** (`e2-micro` Always Free, us-east1) | primary: collector + processor | Valkey, DealRadar (eBay, Slickdeals, Reddit, retail), dedup, scoring, alerts |
-| **Desktop** (RTX 3060 12 GB) | vision API | Ollama with `qwen2.5vl:3b` (+ optional `qwen2.5vl:7b` escalation) |
+| **Desktop** (RTX 3060 12 GB) | vision API | Ollama with `qwen3-vl:4b-instruct` (+ optional `qwen3-vl:8b-instruct` escalation) |
 | **Laptop** (RTX 3080 8 GB) | local collector + standby | Facebook Marketplace / OfferUp via Playwright on your home IP |
 
 You can stop at any step: step 1 alone is a working single-machine DealRadar.
@@ -89,19 +89,20 @@ GCP VM runs.
 
    ```bash
    echo "OLLAMA_BIND=100.64.0.10" >> .env
-   echo "VISION_MODEL=qwen2.5vl:3b" >> .env
-   echo "VISION_ESCALATION_MODEL=qwen2.5vl:7b" >> .env
+   echo "VISION_MODEL=qwen3-vl:4b-instruct" >> .env
+   echo "VISION_ESCALATION_MODEL=qwen3-vl:8b-instruct" >> .env
    docker compose --env-file .env -f deal_radar/deploy/docker-compose.yml --profile vision up -d ollama ollama-pull
    curl http://100.64.0.10:11434/api/tags           # both models listed
    ```
 
    Native alternative: install Ollama, set `OLLAMA_HOST=100.64.0.10:11434`,
-   `OLLAMA_KEEP_ALIVE=30m`, `OLLAMA_MAX_LOADED_MODELS=2`, then `ollama pull qwen2.5vl:3b`.
+   `OLLAMA_KEEP_ALIVE=30m`, `OLLAMA_MAX_LOADED_MODELS=2`, then `ollama pull qwen3-vl:4b-instruct`.
 4. On the processor (VM) set:
    `VISION_ENABLED=true`, `VISION_URL=http://100.64.0.10:11434`.
 
-VRAM budget: the 3B model at Q4 uses ≈ 3-4 GB, the 7B ≈ 6-7 GB, so both stay resident
-on 12 GB. Any OpenAI-compatible server works too (`VISION_BACKEND=openai`, e.g. vLLM
+VRAM budget: the 4B model at Q4 uses ≈ 3.5-4.5 GB and the 8B ≈ 6-7 GB, plus KV cache and
+CUDA context; check `ollama ps` that both stay resident on 12 GB (drop the escalation
+model if not). Any OpenAI-compatible server works too (`VISION_BACKEND=openai`, e.g. vLLM
 `--served-model-name` or LM Studio) — set `VISION_URL` to its base URL.
 
 ---

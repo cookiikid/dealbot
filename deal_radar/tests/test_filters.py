@@ -693,6 +693,53 @@ def test_anchor_gate_is_exact(config: AppConfig, tf: TextFilter) -> None:
         assert gated == plain, (item.title, item.description)
 
 
+_TRICKY_PATTERNS = [
+    r"\bfoo(?:bar\d|baz\d)",  # incomplete node right after a word-char literal
+    r"(?<![\w.$-])a6000\b",  # look-behind proving a word start
+    r"^\W*rent\b",
+    r"\$\s*\d[\d,.]*(?:\s*/\s*|\s+(?:per|an?)\s+)(?:hr|day)\b",
+    r"^(?:[\w-]+\s+){0,2}battery\b",
+    r"\bcan['’]?t\s+test\b",
+    r"\be-?gift\s*cards?",
+    r"(?<=\d)x3d\b",
+    r"\b(?:no|zero)\s+(?:dead|stuck)\s+pixels?\b",
+    r"[\[(]\s*sold\s*[\])]",
+    r"\bw/o\b",
+    r"x{2,}y",
+    r"(?:ab|cd)+ef",
+    r"\d(?<!\d\d)\d{2}-\d{4}",
+    r"(?=.*\bqq\b)(?=.*\b55(?:\s*-?\s*in)?(?!\w))",
+    r"\b(?:x|y)\s+(?:z\s+)?end\b",
+    r"(?i:mixed)case",
+]
+_TRICKY_FRAGMENTS = [
+    "foobar1", "foobaz2", "foo bar1", "xa6000", "a6000", "-a6000", "rent", "  rent", "_rent", "$5/hr", "$5 / hr",
+    "$5 per day", "$5 a day", "$5hr", "battery", "aa battery", "aa bb battery", "aa bb cc battery", "can't test",
+    "cant test", "can’t  test", "egift card", "e-gift cards", "e gift card", "9800x3d", "x3d", "no dead pixel",
+    "zero  stuck pixels", "(sold)", "[ sold ]", "w/o", "w / o", "xxy", "xy", "abcdabef", "ef", "555-1234", "5555-1234",
+    "qq", "55", "55in", "55 in", "550", "x end", "y z end", "xend", "MIXEDcase", "mixedCASE", "\n", ",", ".", "-",
+    "🔥", "Ü", "widget",
+]
+
+
+def test_anchor_gate_is_exact_on_tricky_patterns() -> None:
+    rules = {f"r{i}": {"action": "risk", "probability": 0.1, "patterns": [p]} for i, p in enumerate(_TRICKY_PATTERNS)}
+    cfg = custom_config([{"id": "w", "match": {"field": "text", "any": [r"\bwidget\b"]}}], rules)
+    gated, ungated = TextFilter(cfg), TextFilter(cfg, literal_gate=False)
+    rng = random.Random(7)
+    hits = 0
+    for _ in range(3000):
+        parts = [rng.choice(_TRICKY_FRAGMENTS) for _ in range(rng.randint(1, 8))]
+        joiner = rng.choice([" ", "", "  ", "\n", " - "])
+        desc = joiner.join(parts).replace("\\n", "\n")
+        item = make_item("widget listing", desc)
+        a = gated.evaluate(item).model_dump(exclude={"elapsed_us"})
+        b = ungated.evaluate(item).model_dump(exclude={"elapsed_us"})
+        assert a == b, desc
+        hits += len(a["risk_signals"])
+    assert hits > 1000  # the corpus really exercises the patterns
+
+
 # ============================================================================ performance
 
 

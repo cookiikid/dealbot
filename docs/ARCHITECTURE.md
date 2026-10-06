@@ -275,7 +275,7 @@ are delivered silently.
    ┌──────────────────────────────────────────┐        ┌───────────────────────────────┐
    │ GCP VM  us-east1  e2-micro (Always Free)   │        │ Desktop · RTX 3060 12 GB       │
    │  ├ Valkey 8: dedup Lua, Streams bus, leases│◄──────►│  └ Ollama vision API           │
-   │  ├ collectors: eBay, Slickdeals, Reddit,   │ HTTP   │     qwen2.5vl:3b (+7b escalate)│
+   │  ├ collectors: eBay, Slickdeals, Reddit,   │ HTTP   │     qwen3-vl:4b (+8b escalate) │
    │  │   retail endpoints                      │        └───────────────────────────────┘
    │  ├ processor: filter · score · dedup ·     │        ┌───────────────────────────────┐
    │  │   dispatch, SQLite/WAL history          │◄──────►│ Laptop · RTX 3080 8 GB         │
@@ -291,19 +291,40 @@ are delivered silently.
 | Valkey (dedup, stream, leases) | GCP VM | always on, same host as the processor (sub-ms Lua), single source of truth |
 | API/feed collectors (eBay, Slickdeals, Reddit, retail) | GCP VM | always on, stable egress IP for official APIs. **Region: us-east1** (Always Free). us-east4/Ashburn is ~10-15 ms closer to AWS us-east-1, but every target answers from a CDN edge 1-10 ms from any US-East region, and server think time (100-500 ms) and poll intervals (seconds) dwarf it. The "RTT < 5 ms to retail origins" goal is not meaningful for edge-served traffic, so the free tier wins. Telegram's Bot API is in Amsterdam (~75-90 ms from US-East) regardless of region. |
 | Processor + history DB | GCP VM | needs every collector's stream; the history model is in-memory with a SQLite (WAL) or Postgres warm start |
-| Vision model (Ollama) | Desktop RTX 3060 12 GB | free inference; 12 GB holds a 3B VLM and a 7B escalation model resident (`OLLAMA_MAX_LOADED_MODELS=2`) |
+| Vision model (Ollama) | Desktop RTX 3060 12 GB | free inference; 12 GB holds a 4B VLM and an 8B escalation model resident at Q4 (`OLLAMA_MAX_LOADED_MODELS=2`; verify with `ollama ps`) |
 | FB Marketplace / OfferUp collectors | Laptop RTX 3080 8 GB | residential IP that matches the logged-in session's history and location |
-| Fallback | Laptop | holds standby leases for API sources (takes over within `lease_ttl_seconds` if the VM dies); can serve `qwen2.5vl:3b` if the desktop is off |
+| Fallback | Laptop | holds standby leases for API sources (takes over within `lease_ttl_seconds` if the VM dies); can serve `qwen3-vl:4b-instruct` (Q4 fits 8 GB) if the desktop is off |
 
 **Vision is on the critical path only where it pays.** It runs only for `LOCAL`
 listings that survived the text filter *and* have a preliminary score ≥
-`vision.min_prelim_score`. That is typically a handful per hour, not thousands. A
-small VLM on a 3060 needs a few hundred milliseconds to ~1.5 s per downscaled image.
-Image-token prefill dominates, which is why images are downscaled to ≤ 672 px and
-the answer is a short JSON object. A sub-200 ms budget is realistic only for tiny
-models (Florence-2-base / moondream-class) at small resolutions, so the design treats
-vision as a *gate on candidates*, not on the firehose. Verdicts are cached per
-image URL so re-observations never re-infer.
+`vision.min_prelim_score`. That is typically a handful per hour, not thousands.
+
+Realistic numbers (2026 benchmarks: PhotoPrism, Ollama 0.32-0.35, 720 px, 8-12 GB
+cards):
+
+| Model (Ollama tag) | Short-answer p50 | Notes |
+|---|---|---|
+| `minicpm-v4.6:1b` | ≈ 0.6 s | smallest; weakest on fine detail |
+| `gemma4:e2b` | ≈ 0.7 s | ≈ 208 visual tokens per image: cheapest prefill |
+| `qwen3.5:4b` | ≈ 0.9 s | **thinks by default — must send `think: false`** (6.4 s otherwise) |
+| `qwen3-vl:4b-instruct` | ≈ 1.2 s | default primary (no thinking); `qwen3-vl:8b-instruct` for escalation |
+
+* **< 200 ms is not achievable with a generative VLM returning JSON.** A 3060 does
+  ≈ 0.25-0.4 s per image for a single-token answer and ≈ 0.5-1.5 s for a small JSON
+  object. Sub-200 ms needs an encoder classifier (SigLIP2 zero-shot / linear probe)
+  or Florence-2-base captioning with greedy decoding. That is a future pre-filter;
+  the gate placement above makes the current latency acceptable.
+* **Image tokens drive latency.** Qwen-family models spend one token per 28-32 px
+  tile, so images are downscaled to ≤ 512 px before upload. `num_ctx` stays constant
+  (changing it reloads the model) and `keep_alive` keeps the weights resident.
+* **Confidence is self-reported and uncalibrated.** A schema-constrained answer
+  guarantees the shape, not the truth. Negative verdicts need ≥ 0.6 confidence, and
+  a single box photo next to genuine photos of the card does not condemn a listing.
+* Ollama has no authentication: it binds to the desktop's tailnet IP only. A 503
+  from its queue (`OLLAMA_MAX_QUEUE`) degrades to `UNCERTAIN` rather than retrying.
+
+Verdicts are cached per image URL, so re-observations never re-infer. Facebook CDN
+photo URLs are signed and expire, so vision runs within seconds of discovery.
 
 ---
 

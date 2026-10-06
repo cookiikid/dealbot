@@ -146,7 +146,7 @@ services:
     command:
       - >-
         sleep 3 &&
-        ollama pull ${VISION_MODEL:-qwen2.5vl:3b} &&
+        ollama pull ${VISION_MODEL:-qwen3-vl:4b-instruct} &&
         { [ -z "${VISION_ESCALATION_MODEL:-}" ] || ollama pull ${VISION_ESCALATION_MODEL}; }
 
 volumes:
