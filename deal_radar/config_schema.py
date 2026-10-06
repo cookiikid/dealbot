@@ -270,6 +270,14 @@ class RedditSource(SourceCommon):
     hardwareswap_locations: list[str] = Field(default_factory=list)  # e.g. ["USA-TX", "USA-CA"]; empty = all
     skip_flairs: list[str] = Field(default_factory=lambda: ["Expired", "Closed", "Buying", "BUYING", "CLOSED"])
 
+    @model_validator(mode="after")
+    def _creds(self) -> "RedditSource":
+        # Unauthenticated .json has been blocked since 2026-05-28 (verified); enabling the
+        # source without OAuth credentials can only produce a permanently blocked poller.
+        if self.enabled and self.client_id is None:
+            raise ValueError("sources.reddit.enabled requires OAuth credentials (REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET)")
+        return self
+
 
 class FeedSpec(Strict):
     name: str

@@ -37,7 +37,9 @@ def test_shipped_config_loads_with_defaults_only() -> None:
         assert required in ids
     assert cfg.storage.redis_url is None and cfg.bus.backend == "memory"
     assert cfg.sources.ebay.enabled is False  # credentials-gated sources are off without env
-    assert cfg.sources.reddit.enabled is True
+    assert cfg.sources.reddit.enabled is False  # OAuth-only since unauthenticated access was shut down
+    assert cfg.sources.slickdeals.enabled is True and not cfg.sources.slickdeals.search_feeds_from_profiles
+    assert len(cfg.sources.ebay.queries) >= 5
     assert {"box_only", "damaged", "rental"} <= set(cfg.filters.rules)
     assert cfg.known_targets() >= {"console", "websocket", "discord:gpu", "telegram:main"}
     # every price band (incl. variant overrides) is internally consistent
@@ -164,6 +166,10 @@ def test_credentials_required_when_source_enabled(raw_config: dict) -> None:
     data = copy.deepcopy(raw_config)
     data["sources"]["retail"]["enabled"] = True
     with pytest.raises(Exception, match="BESTBUY_API_KEY"):
+        _validate(data)
+    data = copy.deepcopy(raw_config)
+    data["sources"]["reddit"]["enabled"] = True
+    with pytest.raises(Exception, match="REDDIT_CLIENT_ID"):
         _validate(data)
 
 

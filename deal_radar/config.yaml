@@ -70,12 +70,12 @@ network:
   default_host_limit: { rate_per_second: 2.0, burst: 4 }
   host_limits:
     api.ebay.com: { rate_per_second: 4.0, burst: 8 }
-    oauth.reddit.com: { rate_per_second: 1.5, burst: 3 }   # 100 QPM per OAuth client
-    www.reddit.com: { rate_per_second: 0.15, burst: 2 }     # unauthenticated: ~10 QPM
+    oauth.reddit.com: { rate_per_second: 1.5, burst: 3 }   # 100 QPM per OAuth client id (fleet-wide)
+    www.reddit.com: { rate_per_second: 0.2, burst: 2 }     # token endpoint only
     slickdeals.net: { rate_per_second: 0.5, burst: 2 }
-    api.bestbuy.com: { rate_per_second: 4.0, burst: 5 }    # official limit 5 QPS
-    redsky.target.com: { rate_per_second: 1.0, burst: 2 }
-    newegg.com: { rate_per_second: 0.5, burst: 1 }
+    api.bestbuy.com: { rate_per_second: 4.0, burst: 4 }    # official 5 QPS / 50k per day; quota exhaustion = 403
+    redsky.target.com: { rate_per_second: 1.0, burst: 2 }   # HTTP 435 (PerimeterX) from cloud IPs
+    newegg.com: { rate_per_second: 0.5, burst: 1 }          # ProductRealtime refreshes ~every 60 s anyway
     offerup.com: { rate_per_second: 0.3, burst: 1 }
     craigslist.org: { rate_per_second: 0.3, burst: 1 }
     discord.com: { rate_per_second: 2.0, burst: 5 }
@@ -103,12 +103,28 @@ sources:
     max_concurrency: 4
     reliability: 0.95
     nodes: ${EBAY_NODES:-}
+    # Coalesced searches (eBay OR syntax: "rtx (5090, 4090)" = rtx AND (5090 OR 4090)).
+    # 9 calls per poll instead of one per profile term (21) => the 5,000/day quota
+    # allows a poll every ~3 min instead of ~7. The text filter assigns profiles.
+    queries:
+      - { q: "rtx (5090, 4090, 3090)", category_id: "27386", price_min: 200, price_max: 2600 }
+      - { q: "rtx (a6000, a5000)", category_id: "27386", price_min: 250, price_max: 4500 }
+      - { q: "rtx 6000 (ada, blackwell)", category_id: "27386", price_min: 1000, price_max: 9000 }
+      - { q: "(AW3225QF, AW2725Q, PG32UCDM, PG32UCDP, PG27UCDM, G80SD, G81SF, 321URX, 272URX)", category_id: "80053", price_min: 150, price_max: 1300 }
+      - { q: "lg oled (C4, C5, G4, G5)", category_id: "11071", price_min: 250, price_max: 2600 }
+      - { q: "samsung (S90D, S90F) oled", category_id: "11071", price_min: 250, price_max: 1600 }
+      - { q: "gaming pc (4090, 5090)", category_id: "179", price_min: 700, price_max: 4300 }
+      - { q: "sony a7 iv", category_id: "31388", price_min: 400, price_max: 2100 }
+      - { q: "steam deck oled", price_min: 100, price_max: 650 }
 
   reddit:
-    # Without OAuth credentials the public JSON endpoints are used (10 QPM and
-    # frequently 403'd from datacenter IPs) — create a free "script" app at
-    # https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID/SECRET.
-    enabled: ${REDDIT_ENABLED:-true}
+    # OAuth app-only access ONLY (verified 2026-10-06): unauthenticated .json has been
+    # blocked since 2026-05-28, logged-out RSS retires 2026-11-13, new Data API access
+    # requests close 2026-10-31 and public Data API access ends in March 2027.
+    # Needs an approved app (https://www.reddit.com/prefs/apps, registered at
+    # https://developers.reddit.com/app-registration). 100 QPM per client id, shared
+    # by every node, so one leased poller. Content must be purged after 48 h.
+    enabled: ${REDDIT_ENABLED:-false}
     client_id: ${REDDIT_CLIENT_ID:-}
     client_secret: ${REDDIT_CLIENT_SECRET:-}
     username: ${REDDIT_USERNAME:-}
@@ -122,15 +138,25 @@ sources:
     lease_ttl_seconds: 45                # active/passive fail-over when Redis is configured
 
   slickdeals:
+    # The Hot Deals FORUM feed surfaces new threads 0-22 s after creation (measured);
+    # the frontpage feed's pubDate is the promotion time, 3-12 h later (quality signal).
+    # No ETag/Last-Modified: change detection happens locally. robots.txt disallows
+    # keyword-search RSS and the ToS restricts automation: keep it low-volume, one
+    # leased poller, alerts private.
     enabled: ${SLICKDEALS_ENABLED:-true}
-    poll_interval_seconds: 45
+    poll_interval_seconds: 30
     max_item_age_minutes: 360
     feeds:
+      - name: hot_deals_forum
+        url: https://slickdeals.net/newsearch.php?searchin=first&forumchoice%5B%5D=9&rss=1
       - name: frontpage
         url: https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1
-      - name: hot_deals_forum
-        url: https://slickdeals.net/forums/external.php?type=rss2&forumids=9
-    search_feeds_from_profiles: true
+        interval_seconds: 180
+      - name: popular
+        url: https://slickdeals.net/newsearch.php?mode=popdeals&searcharea=deals&searchin=first&rss=1
+        interval_seconds: 300
+    search_feeds_from_profiles: false   # robots.txt: Disallow /newsearch.php?*rss=*
+    search_feed_template: "https://slickdeals.net/newsearch.php?q={query}&searcharea=deals&searchin=first&rss=1"
     reliability: 0.88
     lease_ttl_seconds: 120
 
@@ -155,7 +181,8 @@ sources:
       #   retailer: Example Store
       #   store_url: https://example-store.com
       #   handles: [nvidia-geforce-rtx-5090-founders-edition]
-      #   cache_bust: true
+      #   # Shopify JSON is uncached at the edge and returns a real 304 on its ETag:
+      #   # conditional GET (the default) beats cache_bust here.
       # Any JSON API can be mapped without code:
       # - name: custom_json_api
       #   adapter: json
@@ -181,7 +208,9 @@ sources:
     location:
       latitude: ${HOME_LAT:-40.7128}
       longitude: ${HOME_LON:--74.0060}
-      city_slug: ${FB_CITY_SLUG:-nyc}
+      city_slug: ${FB_CITY_SLUG:-nyc}   # a numeric Marketplace location id is more reliable
+      # Logged-in Facebook IGNORES the URL radius and uses the radius saved on the
+      # account (Marketplace > Location); this value only drives a mismatch warning.
       radius_km: ${FB_RADIUS_KM:-60}
       timezone_id: ${APP_TIMEZONE:-America/New_York}
       locale: en-US
@@ -189,11 +218,14 @@ sources:
     browser:
       headless: ${FB_HEADLESS:-true}
       storage_state_path: ${FB_STORAGE_STATE:-data/fb_storage_state.json}
+      user_data_dir: ${FB_USER_DATA_DIR:-}      # optional persistent Chrome profile
+      executable_path: ${FB_BROWSER_PATH:-}     # optional real Chrome/Chromium binary
       proxy: ${FB_PROXY:-}
       min_action_delay_seconds: 1.5
       max_action_delay_seconds: 4.5
 
   offerup:
+    # Datacenter IPs get 403/Cloudflare challenges: run on the home (residential) node.
     enabled: ${OFFERUP_ENABLED:-false}
     nodes: ${OFFERUP_NODES:-}
     poll_interval_seconds: 180
@@ -204,7 +236,9 @@ sources:
     reliability: 0.7
 
   craigslist:
+    # RSS is dead (403); uses the site's own JSON search API at <= 1 request/s.
     enabled: ${CRAIGSLIST_ENABLED:-false}
+    nodes: ${CRAIGSLIST_NODES:-}
     poll_interval_seconds: 300
     sites: [newyork]
     postal_code: ${HOME_ZIP:-}
