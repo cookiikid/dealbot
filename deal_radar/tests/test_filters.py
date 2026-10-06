@@ -122,6 +122,8 @@ OUTCOME_CASES: list[tuple[str, str, str]] = [
     ("Samsung QN65S90D", "No cracks, no dead pixels, no burn in. Box was damaged in shipping.", "samsung_s90_oled_tv/s90d_65"),
     ("RTX 4090 FE", "Burn-in tested for 24h with FurMark, runs cool.", "rtx_4090"),
     ("Alienware AW3225QF", "Dead pixels: none. Burn-in: no. Always used dark mode.", "oled_4k_monitor/aw3225qf"),
+    ("RTX 4090 FE", "Overheating? No. Coil whine? A little under load.", "rtx_4090"),
+    ("Alienware AW3225QF", "Burn-in - no returns, sold as seen", "reject:damaged"),
     ("ASUS PG32UCDM", "Zero dead pixels and free of burn-in.", "oled_4k_monitor/pg32ucdm"),
     ("Alienware AW3225QF", "No box cracked screen", "reject:damaged"),
     ("Alienware AW3225QF", "No issues except dead pixels in the corner", "reject:damaged"),
@@ -592,8 +594,10 @@ def _negation_filter(window: int = 3, terms: list[str] | None = None) -> TextFil
         ("totally free of any scratches", False),
         ("Scratches: none", False),  # form-style answer
         ("dent: no", False),
-        ("Dent - none", True),  # only ':' / '=' introduce a form answer
-        ("scratches? none visible", True),
+        ("Dent - none", False),
+        ("scratches? none visible", False),
+        ("dent - no returns", True),  # 'no' governs 'returns', not the dent
+        ("dent-free? no", True),  # i.e. it HAS a dent: the answer does not follow the match
         ("PCIe 4.0 x16 slot scratched", True),  # "4.0" is one token: no stray "0" term
         ("0 scratches", False),
         ("isn't scratched", False),

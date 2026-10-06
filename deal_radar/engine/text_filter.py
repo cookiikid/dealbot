@@ -40,7 +40,8 @@ Negation (``negatable`` groups only) is evaluated per match, not by masking:
   "no **returns** untested", "no issues **except** dead pixels") the term is
   attached to that word and does not negate the match.
 * Form-style answers after the match (optionally after up to two more label
-  words) are negations too: "Dead pixels: none", "Burn-in: no", "Mining: never".
+  words) are negations too: "Dead pixels: none", "Overheating? No", "Mining - never"
+  (but not "Burn-in - no returns", where the term governs a scope ender).
 * A negation distributes over a list of matches of the same group: in "no dead
   pixels, burn-in or scratches" every item is negated. A bare comma only counts
   when the list goes on ("no dead pixels, cracked screen" still rejects).
@@ -729,8 +730,12 @@ class TextFilter:
         self._trailing_neg: re.Pattern[str] | None = None
         if terms:
             alts = "|".join(r"\W+".join(re.escape(w).replace("'", "['’]") for w in t) for t in terms)
-            # "Dead pixels: none" - the label may continue for up to two words after the match
-            self._trailing_neg = re.compile(rf"(?:[ \t]+[^\W\d_]+){{0,2}}?\s*[:=]\s*(?:{alts})(?![\w'’])")
+            enders = "|".join(sorted(_NEGATION_SCOPE_ENDERS))
+            # "Dead pixels: none" / "Overheating? No." / "Mining - never": the label may run on for up
+            # to two words; "Burn-in - no returns" is not an answer (the term governs a scope ender).
+            self._trailing_neg = re.compile(
+                rf"(?:[ \t]+[^\W\d_]+){{0,2}}?\s*(?:[:=?]|\s[-–—]+\s)\s*(?:{alts})(?![\w'’])(?!\s+(?:{enders})\b)"
+            )
 
         self._profiles: tuple[_Profile, ...] = tuple(
             sorted(
