@@ -1196,6 +1196,9 @@ class VisionFilter:
                 "stream": False,
                 "format": VISION_SCHEMA,
                 "keep_alive": cfg.keep_alive,
+                # Reasoning builds (qwen3.5, *-thinking) think by default: 6.4 s vs 1.2 s per
+                # image in 2026 benchmarks. The verdict needs no chain of thought.
+                "think": False,
                 "options": {"temperature": 0, "num_predict": cfg.num_predict},
             }
         return {
@@ -1294,6 +1297,11 @@ class VisionFilter:
             except TimeoutError as exc:  # before OSError: TimeoutError subclasses it
                 raise self._fail(model, "timeout", f"timeout after {cfg.timeout_seconds:g}s", started) from exc
             except HttpStatusError as exc:
+                if exc.status == 503:
+                    # OLLAMA_MAX_QUEUE overflow: backpressure from a healthy server, not a fault.
+                    # Do not trip the breaker; this image simply goes unverified.
+                    self._m_calls.inc(model=model, outcome="busy")
+                    raise _BackendFailure("backend_busy (HTTP 503)") from exc
                 raise self._fail(model, "http_error", f"HTTP {exc.status}: {_short(exc.body)}", started) from exc
             except (RetryExhausted, ResponseTooLarge, aiohttp.ClientError, OSError, ValueError) as exc:
                 raise self._fail(model, "transport_error", f"{type(exc).__name__}: {_short(exc)}", started) from exc

@@ -592,7 +592,7 @@ async def test_ollama_genuine_and_request_shape(backend, http: HttpClient, base_
     assert result.model == SMALL and result.images_checked == 1 and result.cached is False
     assert result.error is None and result.latency_ms > 0
     assert result.details["reason"] == "card with three fans visible"
-    assert result.details["answers"][0]["image"] == "672x504"
+    assert result.details["answers"][0]["image"] == "512x384"
 
     assert len(state.chat) == 1
     call = state.chat[0]
@@ -608,7 +608,7 @@ async def test_ollama_genuine_and_request_shape(backend, http: HttpClient, base_
     assert profile.name in message["content"] and "PCB" in message["content"]
     assert len(message["images"]) == 1 and not message["images"][0].startswith("data:")
     # the model received the downscaled re-encoded JPEG, not the 1600x1200 original
-    assert call["color"] == "red" and call["size"] == (672, 504) and call["format"] == "JPEG"
+    assert call["color"] == "red" and call["size"] == (512, 384) and call["format"] == "JPEG"
     # image fetched once, looking like an <img> load from the listing page
     assert state.image_hits == {"red.jpg": 1}
     sent = state.image_headers[0]
@@ -761,9 +761,21 @@ async def test_timeout_gives_error_verdict(backend, http: HttpClient, base_confi
     assert result.latency_ms < 550
 
 
+async def test_ollama_queue_full_503_does_not_trip_breaker(backend, http: HttpClient, base_config: AppConfig) -> None:
+    server, state = backend
+    state.fail_status = 503  # OLLAMA_MAX_QUEUE overflow
+    vf = VisionFilter(configure(base_config, server), http)
+    profile = gpu_profile(base_config)
+    for _ in range(5):
+        result = await vf.check(make_item(server, "red.jpg"), profile)
+        assert result.verdict is VisionVerdict.ERROR and "busy" in (result.error or "")
+    assert vf.breaker.state == CircuitBreaker.CLOSED
+    assert state.chat[-1]["payload"]["think"] is False
+
+
 async def test_circuit_opens_and_fails_fast_then_recovers(backend, http: HttpClient, base_config: AppConfig) -> None:
     server, state = backend
-    state.fail_status = 503
+    state.fail_status = 500
     clock = FakeClock()
     metrics = Metrics()
     vf = VisionFilter(configure(base_config, server), http, metrics=metrics, clock=clock)
@@ -1016,7 +1028,7 @@ async def test_openai_backend_request_shape(backend, http: HttpClient, base_conf
     assert parts[0]["type"] == "text" and gpu_profile(config).name in parts[0]["text"]
     assert parts[1]["type"] == "image_url"
     assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
-    assert call["size"] == (672, 504)
+    assert call["size"] == (512, 384)
 
 
 async def test_openai_backend_without_api_key_sends_no_auth(backend, http: HttpClient, base_config: AppConfig) -> None:
