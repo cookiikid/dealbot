@@ -77,6 +77,7 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 BUDGET_FRACTION = 0.8  # share of poll_timeout_seconds a poll may spend issuing queries
 PRIMARY_RETRY_SECONDS = 1800.0  # after switching to the fallback, re-try the primary this often
 GEOCODE_RETRY_SECONDS = 3600.0
+BLOCK_COOLDOWN_SECONDS = 1800.0  # minimum pause after a 403/challenge wall (429 uses the configured cooldown)
 STRATEGY_PAGE = "page"
 STRATEGY_GRAPHQL = "graphql"
 
@@ -132,8 +133,9 @@ _NEXT_DATA_RE = re.compile(r"<script[^>]*\bid=[\"']__NEXT_DATA__[\"'][^>]*>(.*?)
 # mention "captcha" (login modal scripts), a challenge page never carries __NEXT_DATA__.
 _BLOCK_RE = re.compile(
     r"cf-chl|challenge-platform|cf-turnstile|cf-browser-verification|checking your browser"
-    r"|just a moment\.\.\.|attention required!? \| cloudflare|px-captcha|access to this page has been denied"
-    r"|<title>\s*access denied\s*</title>|captcha",
+    r"|just a moment\.\.\.|attention required!? \| cloudflare|px-captcha|captcha-delivery"
+    r"|access to this page has been denied|verify you are (?:a )?human|<title>\s*access denied\s*</title>"
+    r"|\bcaptcha\b",  # word-bounded: a page that merely loads reCAPTCHA is not a wall
     re.I,
 )
 _LISTING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -173,6 +175,11 @@ def location_cookie(latitude: float | None, longitude: float | None, zip_code: s
         return None
     payload["source"] = "user"
     return quote(json.dumps(payload, separators=(",", ":")), safe="")
+
+
+def block_cooldown(reason: str, configured: float) -> float | None:
+    """Cooldown for a block: rate limits use the configured pause, walls at least 30 min."""
+    return None if reason == "http_429" else max(configured, BLOCK_COOLDOWN_SECONDS)
 
 
 def detect_block(status: int, body: str | None) -> str | None:
@@ -670,7 +677,9 @@ class OfferUpIngestor(BaseIngestor):
             except SourceBlocked as exc:
                 if results:
                     self._deferred_block = exc
-                    self.log.warning("blocked mid-poll; returning partial results", extra={"source": self.name, "error": str(exc)})
+                    self.log.warning(
+                        "blocked mid-poll; returning partial results", extra={"source": self.name, "error": str(exc)}
+                    )
                     break
                 raise
             except asyncio.TimeoutError as exc:
@@ -685,7 +694,9 @@ class OfferUpIngestor(BaseIngestor):
             except Exception as exc:  # noqa: BLE001 - one failing query must not sink the poll
                 failed += 1
                 last_error = exc
-                self.log.warning("offerup query failed", extra={"source": self.name, "query": task.term, "error": repr(exc)[:300]})
+                self.log.warning(
+                    "offerup query failed", extra={"source": self.name, "query": task.term, "error": repr(exc)[:300]}
+                )
                 continue
             for raw in listings:
                 results.setdefault(raw.source_id, raw)
@@ -720,7 +731,9 @@ class OfferUpIngestor(BaseIngestor):
             except Exception as exc:  # noqa: BLE001 - try the other strategy
                 last_error = exc
                 self._m_queries.inc(strategy=strategy, outcome="error")
-                self.log.debug("offerup strategy failed", extra={"strategy": strategy, "query": task.term, "error": repr(exc)[:300]})
+                self.log.debug(
+                    "offerup strategy failed", extra={"strategy": strategy, "query": task.term, "error": repr(exc)[:300]}
+                )
                 continue
             self._m_queries.inc(strategy=strategy, outcome="ok")
             if strategy != self._preferred:
@@ -772,7 +785,7 @@ class OfferUpIngestor(BaseIngestor):
         except OfferUpParseError:
             reason = detect_block(resp.status, body)
             if reason is not None:
-                raise SourceBlocked(f"offerup search page blocked ({reason})") from None
+                raise self._blocked(f"offerup search page blocked ({reason})", reason) from None
             raise
         self._record_skips(stats)
         return listings
@@ -814,14 +827,16 @@ class OfferUpIngestor(BaseIngestor):
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
-        resp = await self._call("POST", f"{self.base_url}/api/graphql", json=payload, headers=headers, accept="application/json")
+        resp = await self._call(
+            "POST", f"{self.base_url}/api/graphql", payload=payload, headers=headers, accept="application/json"
+        )
         body = resp.data if isinstance(resp.data, str) else ""
         try:
             return json_loads(body)
         except ValueError:
             reason = detect_block(resp.status, body)
             if reason is not None:
-                raise SourceBlocked(f"offerup graphql blocked ({reason})") from None
+                raise self._blocked(f"offerup graphql blocked ({reason})", reason) from None
             raise OfferUpParseError(f"non-JSON GraphQL response ({len(body)} bytes)") from None
 
     async def _call(
@@ -830,7 +845,7 @@ class OfferUpIngestor(BaseIngestor):
         url: str,
         *,
         params: Mapping[str, str] | None = None,
-        json: Any = None,
+        payload: Any = None,
         headers: Mapping[str, str] | None = None,
         accept: str,
     ) -> HttpResponse:
@@ -839,7 +854,7 @@ class OfferUpIngestor(BaseIngestor):
                 method,
                 url,
                 params=params,
-                json=json,
+                json=payload,
                 headers=headers,
                 browser_identity=True,
                 accept=accept,
@@ -849,8 +864,11 @@ class OfferUpIngestor(BaseIngestor):
         except HttpStatusError as exc:
             reason = detect_block(exc.status, exc.body if exc.status in (401, 403, 429) else None)
             if reason is not None:
-                raise SourceBlocked(f"offerup {method} {url.rsplit('/', 1)[-1]} blocked ({reason})") from exc
+                raise self._blocked(f"offerup {method} {url.rsplit('/', 1)[-1]} blocked ({reason})", reason) from exc
             raise
+
+    def _blocked(self, message: str, reason: str) -> SourceBlocked:
+        return SourceBlocked(message, cooldown_seconds=block_cooldown(reason, self.cfg.cooldown_seconds))
 
     async def _ensure_coordinates(self) -> None:
         """Resolve a ZIP-only config to coordinates once (best effort, retried hourly)."""
@@ -889,6 +907,7 @@ __all__ = [
     "OfferUpParseError",
     "RADIUS_CHOICES",
     "SearchTask",
+    "block_cooldown",
     "build_tasks",
     "coerce_price",
     "detect_block",

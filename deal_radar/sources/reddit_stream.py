@@ -1,66 +1,91 @@
 """Reddit ingestor: r/buildapcsales-style deal feeds and r/hardwareswap-style swap posts.
 
+Platform status (verified 2026-10-06)
+-------------------------------------
+Reddit shut down the unauthenticated ``.json`` endpoints on 2026-05-28 (they now answer
+HTTP 403 "You've been blocked by network security"), new Data API apps need manual
+approval (no new requests accepted after 2026-10-31), unregistered apps lose access
+from 2027-01-12 and public Data API access ends in March 2027. Application-only OAuth
+with an approved app is therefore the only supported transport; the unauthenticated
+path is kept only so a misconfigured node fails loudly (operator notice + long
+cooldown) instead of silently.
+
 Transport
 ---------
-* **Application-only OAuth** (recommended) when ``client_id`` is configured:
+* **Application-only OAuth** when ``client_id`` is configured:
   ``POST https://www.reddit.com/api/v1/access_token`` with HTTP Basic auth
-  (``client_id:client_secret``) and ``grant_type=client_credentials`` (confidential
+  (``client_id:client_secret``), ``grant_type=client_credentials`` (confidential
   "script"/"web" apps) — or ``grant_type=https://oauth.reddit.com/grants/installed_client``
   plus a stable 25-char ``device_id`` when only a client id is configured ("installed"
-  apps have no secret). App-only tokens never come with a refresh token, so the token
-  is cached and simply re-requested shortly before ``expires_in`` runs out; a 401 on
-  a listing call invalidates it and the request is retried exactly once with a fresh
-  token. Listings are read from ``https://oauth.reddit.com/r/{sub}/new`` with
-  ``Authorization: bearer <token>``.
-* **Unauthenticated fallback**: ``https://www.reddit.com/r/{sub}/new.json``. It has a
-  much smaller budget and datacenter IPs regularly get an HTML "blocked by network
-  security" page with HTTP 403 — that (and a 429) is raised as :class:`SourceBlocked`
-  with a long cooldown instead of hammering the wall. A warning is logged once.
+  apps authenticate with an empty secret) — and ``scope=read`` (all ``/new`` needs).
+  App-only tokens never come with a refresh token and ``expires_in`` differs between
+  reports (3600 vs 86400), so the value is read at runtime and the grant is simply
+  re-run :data:`TOKEN_REFRESH_MARGIN_SECONDS` before expiry. A 401 — or the HTML
+  network-policy 403 Reddit serves for invalid bearer tokens — invalidates the token
+  and the request is retried exactly once with a fresh one. Listings come from
+  ``https://oauth.reddit.com/r/{sub}/new`` with ``Authorization: bearer <token>``.
+* **Unauthenticated fallback**: ``https://www.reddit.com/r/{sub}/new.json``. A 403/429
+  block page raises :class:`SourceBlocked` with a multi-hour cooldown; a warning is
+  logged once at startup.
 * ``raw_json=1`` opts out of Reddit's legacy HTML escaping of ``<``, ``>`` and ``&``
   in JSON bodies, so titles and preview image URLs arrive verbatim.
 * The User-Agent follows Reddit's API rules (``<platform>:<app id>:<version> (by
-  /u/<username>)``) and is *never* a browser identity — spoofing browsers is
-  explicitly forbidden and gets clients blocked faster.
+  /u/<username>)``) and is *never* a browser identity — Reddit forbids lying about
+  the User-Agent and blocks spoofed ones.
 
 Rate limits
 -----------
-Every response carries ``X-Ratelimit-Used`` / ``X-Ratelimit-Remaining`` /
+The budget is per OAuth client id (100 QPM averaged over 10 minutes; possibly lower
+for app-only grants), shared by every node using the app — enable
+``lease_ttl_seconds`` so only one node polls. Every response carries
+``X-Ratelimit-Used`` / ``X-Ratelimit-Remaining`` (a float string) /
 ``X-Ratelimit-Reset`` (seconds until the window ends). Subreddits are polled
-concurrently, so the most pessimistic ``remaining`` seen in the current window wins.
+concurrently, so the most pessimistic ``remaining`` of the current window wins.
 :meth:`RedditIngestor.next_interval` (a) sleeps until the reset when fewer requests
-remain than one poll cycle needs (minimum 2), and otherwise (b) spreads the remaining
-budget evenly over the rest of the window, never polling faster than configured.
-Without headers in unauthenticated mode the interval is floored at the documented
-public budget (:data:`UNAUTH_QPM`).
+remain than one poll cycle needs (minimum :data:`RATE_LIMIT_MIN_REMAINING`), and
+otherwise (b) spreads the remaining budget evenly over the rest of the window, never
+polling faster than configured. A 429 (often with an empty body and no
+``Retry-After``) pauses the source until ``X-Ratelimit-Reset``.
 
 Freshness without the ``before`` cursor
 ---------------------------------------
 ``/new?before=<fullname>`` looks like the obvious incremental cursor, but it is
 fragile: when the anchor post is deleted, removed by a moderator or filtered by
-AutoModerator, Reddit returns an *empty* listing forever (nothing is "before" a
-fullname that is no longer in the listing), silently stalling the feed. Instead every
-poll fetches the newest ``limit`` posts (≤100, one request per subreddit) and relies on
+AutoModerator (about a quarter of r/hardwareswap posts are removed within minutes),
+the anchor vanishes from the listing and Reddit returns an *empty* page — or, as
+observed live, a stale slice from the middle of the listing — instead of the new
+posts, silently stalling the feed. Every poll therefore fetches the head of ``/new``
+(``limit`` ≤ 100, one request per subreddit) and relies on
 :class:`~deal_radar.sources.base.ChangeDetector` (only new/changed listings are
-emitted) plus ``max_item_age_minutes`` (restarts never replay old posts).
+emitted, keyed by the ``t3_`` fullname) plus ``max_item_age_minutes`` (restarts never
+replay old posts).
 
 Parsing
 -------
 * **deals** mode (r/buildapcsales): ``"[GPU] Brand Model ... - $1199 ($1599 - $400)"``
-  → ``extra["category_tag"]="GPU"``, price = first ``$`` amount after the last
-  top-level ``" - "`` separator (amounts inside parentheses are ignored, so the
-  ``($1599 - $400)`` breakdown never wins; rebate/coupon amounts such as ``"- $50
-  MIR"`` are skipped), list price from a following parenthetical that shows the
-  original price. ``outbound_url`` is the linked retailer page (or, for self posts, the
-  first external link in the body), ``retailer`` is derived from its domain. Condition
-  is left to the normalizer (it reads "Open Box"/"Refurb" from the title).
+  → ``extra["category_tag"]="GPU"`` (falling back to the link flair, which carries the
+  category), price = the poster's explicit final price (``"= $269"``, ``"$84.99 AR"``)
+  when present, else the first ``$`` amount after the last top-level ``" - "``
+  separator (amounts inside parentheses never win and rebate/coupon/shipping amounts
+  such as ``"- $50 MIR"`` are skipped), else the first plain amount. ``list_price``
+  comes from a parenthetical showing the original price (``($1599 - $400)``,
+  ``(reg $399.99)``, ``(829.99-130)``). ``outbound_url`` is the linked retailer page
+  (or, for self posts, the first external link in the body) and ``retailer`` is
+  derived from its domain. Condition is left to the normalizer ("Open Box"/"Refurb"
+  in the title). Expired deals (flair ``"Expired :table_flip:"`` / css ``expired``),
+  stickied, removed and NSFW posts are skipped.
 * **swap** mode (r/hardwareswap): ``"[USA-CA] [H] RTX 4090 FE, 32GB DDR5 [W] PayPal"``.
   Only *selling* posts are emitted (``[W]`` names a payment method, ``[H]`` does not,
-  flair is not BUYING/CLOSED/TRADING) with ``source_kind=LOCAL``. Title = the ``[H]``
-  part, price = first ``$`` amount in the body that is not struck through
-  (``~~$500~~`` marks sold items/old prices), ``extra["multi_item"]`` when ``[H]``
-  lists several items, seller trade count from the ``"Trades: N"`` user flair, images
-  from direct i.imgur.com / i.redd.it links and inline media, timestamp album link in
-  ``extra["timestamps_url"]``.
+  flair is not BUYING/CLOSED/TRADING — the flair bot can lag, so the title decides
+  when it is missing) with ``source_kind=LOCAL``. Title = the ``[H]`` part; prices are
+  banned from swap titles, so price = the first ``$`` amount in the body that is not
+  struck through (``~~$500~~``) or marked sold (``[$200 Sold for $185 to /u/x]``);
+  ``extra["multi_item"]`` when ``[H]`` lists several items; seller trade count from
+  the ``"Trades: N"`` user flair; images from direct i.imgur.com / i.redd.it links and
+  inline media; the timestamp album link in ``extra["timestamps_url"]``; payment
+  methods named in ``[W]`` in ``extra["payment_methods"]`` and the ones the subreddit
+  bans (Zelle, Venmo, Cash App, F&F, crypto, gift cards, wire) in
+  ``extra["payment_red_flags"]``.
 """
 
 from __future__ import annotations
@@ -101,10 +126,13 @@ INSTALLED_CLIENT_GRANT = "https://oauth.reddit.com/grants/installed_client"
 UNAUTH_QPM = 10.0  # documented budget for logged-out access; floors the interval without headers
 RATE_LIMIT_MIN_REMAINING = 2  # wait for the window reset below this many remaining requests
 RATE_LIMIT_RESET_MARGIN_SECONDS = 1.0
-TOKEN_REFRESH_MARGIN_SECONDS = 300.0  # refresh this long before expiry (capped at 10% of lifetime)
+TOKEN_REFRESH_MARGIN_SECONDS = 120.0  # re-run the grant this long before expiry (capped at 10% of lifetime)
+TOKEN_SCOPE = "read"  # least privilege: /r/{sub}/new only needs the read scope
 DEFAULT_TOKEN_LIFETIME_SECONDS = 3600.0  # used if the token response omits expires_in
-BLOCK_COOLDOWN_SECONDS = 1800.0  # HTML block wall / unauthenticated 429: back off for a long time
+BLOCK_COOLDOWN_SECONDS = 1800.0  # HTML network-policy wall in OAuth mode
+UNAUTH_BLOCK_COOLDOWN_SECONDS = 6 * 3600.0  # public .json is shut down: a 403/429 there will not heal soon
 OAUTH_429_MIN_COOLDOWN_SECONDS = 30.0
+OAUTH_429_DEFAULT_COOLDOWN_SECONDS = 60.0  # 429 without X-Ratelimit-Reset / Retry-After
 
 # 429 is accepted (not retried by the HTTP layer) because a short retry cannot fix an
 # exhausted window; 401/403/404 bodies are needed to tell token expiry, private
@@ -141,16 +169,20 @@ _MONEY_RE = re.compile(
     r"|(?<![$\d.,])(?P<b>\d{1,3}(?:,\d{3})+|\d+)(?:\.(?P<bc>\d{1,2}))?\$"
 )
 _TAG_RE = re.compile(r"^\s*\[\s*([^\[\]]{1,40}?)\s*\]")
-_SEPARATOR_RE = re.compile(r"\s[-–—]{1,2}(?:\s+|(?=\$))")
+_SEPARATOR_RE = re.compile(r"\s[-\u2013\u2014]{1,2}(?:\s+|(?=\$))")
 _DISCOUNT_AFTER_RE = re.compile(
-    r"^\s*(?:off\b|mir\b|rebate|coupon|promo|discount|instant\b|gc\b|gift\s*card|cash\s*back|savings|credit|sc\b)",
+    r"^\s*(?:off\b|mir\b|rebate|coupon|promo|discount|instant\b|gc\b|gift\s*card|cash\s*back|savings|credit|sc\b"
+    r"|ship(?:ping)?\b|s&h\b)",
     re.IGNORECASE,
 )
+_FINAL_EQ_RE = re.compile(r"=\s*")  # "... - $30 MIR = $269": the poster's computed final price
+_AFTER_REBATE_RE = re.compile(r"^\s*(?:AR\b|after\s+(?:mail[-\s]?in\s+)?(?:rebates?|mir)\b)", re.IGNORECASE)
+_BARE_SUBTRACTION_RE = re.compile(r"^\s*(\d[\d,]*(?:\.\d{1,2})?)\s*[-\u2013\u2212]\s*(\d[\d,]*(?:\.\d{1,2})?)\b")
 _DISCOUNT_BEFORE_RE = re.compile(r"\b(?:save|saving|rebate|coupon|mir|off|promo)\b", re.IGNORECASE)
 _LIST_CUE_RE = re.compile(
     r"\b(?:was|reg(?:ular(?:ly)?)?|msrp|list|orig(?:inal(?:ly)?)?|retail|normally|usually)\b", re.IGNORECASE
 )
-_SUBTRACTION_RE = re.compile(r"\$\s?[\d,.]+[kK]?\s*[-–−]\s*\$")
+_SUBTRACTION_RE = re.compile(r"\$\s?[\d,.]+[kK]?\s*[-\u2013\u2212]\s*\$")
 _PAREN_GROUP_RE = re.compile(r"\(([^()]*)\)")
 _ONLY_MONEY_RE = re.compile(r"^\s*\$\s?[\d,.]+[kK]?\s*$")
 
@@ -166,6 +198,22 @@ _MONEY_ONLY_HAVE_RE = re.compile(r"^[\s$\d,.kK+]*$")  # "[H] $$$" / "[H] $1500" 
 _ITEM_SPLIT_RE = re.compile(r"\s*(?:,|;|\s\+\s|\s&\s|\band\b)\s*", re.IGNORECASE)
 _TRADES_RE = re.compile(r"\btrades?\s*:\s*(\d+)", re.IGNORECASE)
 _STRIKE_RE = re.compile(r"~~.*?~~", re.DOTALL)
+# "[$200 Sold for $185 to /u/x]", "$400 - SOLD": amounts of items that are gone.
+_SOLD_RE = re.compile(r"\$\s?[\d,.]+[kK]?[\s\[\]()\-\u2013:]*sold\b[^\n|\]]*", re.IGNORECASE)
+_REMOVED_TITLE_RE = re.compile(r"^\s*\[\s*removed\b", re.IGNORECASE)  # "[ Removed by moderator ]"
+_PAYMENT_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("paypal", re.compile(r"\bpay\s?pal\b|\bpp\b|\bg&s\b", re.IGNORECASE)),
+    ("cash", re.compile(r"\bcash\b(?!\s?app)", re.IGNORECASE)),
+    ("zelle", re.compile(r"\bzelle\b", re.IGNORECASE)),
+    ("venmo", re.compile(r"\bvenmo\b", re.IGNORECASE)),
+    ("cashapp", re.compile(r"\bcash\s?app\b", re.IGNORECASE)),
+    ("friends_family", re.compile(r"\bf&f\b|\bfriends\s*(?:and|&)\s*family\b", re.IGNORECASE)),
+    ("crypto", re.compile(r"\b(?:crypto|bitcoin|btc|usdt)\b", re.IGNORECASE)),
+    ("gift_card", re.compile(r"\bgift\s*cards?\b", re.IGNORECASE)),
+    ("wire", re.compile(r"\bwire\b|\bwestern\s+union\b|\bmoneygram\b", re.IGNORECASE)),
+)
+# r/hardwareswap only allows PayPal Goods & Services and local cash; the rest are bannable.
+_DISALLOWED_PAYMENTS = frozenset({"zelle", "venmo", "cashapp", "friends_family", "crypto", "gift_card", "wire"})
 _SHIPPED_AFTER_RE = re.compile(r"^[\s,.)]*(?:\+\s*)?(?:shipped|ship(?:ping)?\s+incl|free\s+ship)", re.IGNORECASE)
 
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]\"'|`]+", re.IGNORECASE)
@@ -231,10 +279,34 @@ class DealTitle:
     price_span: tuple[int, int] | None = None
 
 
-def _is_discount_amount(text: str, span: MoneySpan, sep_end: int) -> bool:
-    if _DISCOUNT_AFTER_RE.match(text[span.end : span.end + 24]):
-        return True
-    return bool(_DISCOUNT_BEFORE_RE.search(text[sep_end : span.start]))
+def _discount_after(text: str, span: MoneySpan) -> bool:
+    return bool(_DISCOUNT_AFTER_RE.match(text[span.end : span.end + 24]))
+
+
+def _explicit_final_price(title: str, spans: Sequence[MoneySpan]) -> MoneySpan | None:
+    """``"... = $269"`` (last one wins) or ``"$84.99 AR"`` / ``"$84.99 after rebate"``."""
+    starts = {s.start: s for s in spans}
+    final: MoneySpan | None = None
+    for m in _FINAL_EQ_RE.finditer(title):
+        if m.end() in starts:
+            final = starts[m.end()]
+    if final is not None:
+        return final
+    after_rebate = [s for s in spans if _AFTER_REBATE_RE.match(title[s.end :])]
+    return after_rebate[-1] if after_rebate else None
+
+
+def _separator_price(title: str, top: Sequence[MoneySpan], depth: Sequence[int]) -> MoneySpan | None:
+    """First top-level amount after the last ``" - "`` separator that is not a rebate/coupon."""
+    separators = [m for m in _SEPARATOR_RE.finditer(title) if depth[m.start()] == 0]
+    for sep in reversed(separators):
+        candidate = next((s for s in top if s.start >= sep.end()), None)
+        if candidate is None:
+            continue
+        if _discount_after(title, candidate) or _DISCOUNT_BEFORE_RE.search(title[sep.end() : candidate.start]):
+            continue
+        return candidate
+    return None
 
 
 def parse_deal_title(title: str) -> DealTitle:
@@ -246,34 +318,31 @@ def parse_deal_title(title: str) -> DealTitle:
         return DealTitle(category, None, None)
     depth = _depths(title)
     top = [s for s in spans if depth[s.start] == 0]
-    separators = [m for m in _SEPARATOR_RE.finditer(title) if depth[m.start()] == 0]
-
-    chosen: MoneySpan | None = None
-    fallback: MoneySpan | None = None
-    for sep in reversed(separators):
-        candidate = next((s for s in top if s.start >= sep.end()), None)
-        if candidate is None:
-            continue
-        if fallback is None:
-            fallback = candidate
-        if not _is_discount_amount(title, candidate, sep.end()):
-            chosen = candidate
-            break
-    if chosen is None:
-        chosen = fallback
-    if chosen is None:
-        chosen = next((s for s in top if not _DISCOUNT_AFTER_RE.match(title[s.end : s.end + 24])), None)
-    if chosen is None:
-        chosen = top[0] if top else spans[0]
-    return DealTitle(category, chosen.value, _list_price_after(title, chosen), (chosen.start, chosen.end))
+    chosen = (
+        _explicit_final_price(title, spans)
+        or _separator_price(title, top, depth)
+        or next((s for s in top if not _discount_after(title, s)), None)
+        or next((s for s in spans if not _discount_after(title, s)), None)
+        or spans[0]
+    )
+    return DealTitle(category, chosen.value, _list_price(title, chosen), (chosen.start, chosen.end))
 
 
-def _list_price_after(title: str, price: MoneySpan) -> float | None:
-    """Original price from a parenthetical after the price: ``($1599 - $400)``, ``(reg $1599)``."""
-    for group in _PAREN_GROUP_RE.finditer(title, price.end):
+def _list_price(title: str, price: MoneySpan) -> float | None:
+    """Original price from a parenthetical at/after the price: ``($1599 - $400)``, ``(reg $1599)``, ``(829.99-130)``."""
+    for group in _PAREN_GROUP_RE.finditer(title):
+        if group.end() <= price.start:
+            continue  # breakdowns precede nothing; only groups at or after the price count
         inner = group.group(1)
         amounts = find_money(inner)
-        if not amounts or amounts[0].value <= price.value:
+        if not amounts:
+            bare = _BARE_SUBTRACTION_RE.match(inner)
+            if bare:
+                original, saving = (float(x.replace(",", "")) for x in bare.groups())
+                if saving < original and original > price.value:
+                    return round(original, 2)
+            continue
+        if amounts[0].value <= price.value:
             continue
         if _SUBTRACTION_RE.search(inner) or _LIST_CUE_RE.search(inner) or _ONLY_MONEY_RE.match(inner):
             return amounts[0].value
@@ -428,7 +497,11 @@ def common_skip_reason(post: Mapping[str, Any], skip_flairs: Sequence[str] = ())
     """Reasons that apply to every subreddit: pinned/removed/NSFW/expired/skip-flair posts."""
     if post.get("stickied") or post.get("pinned"):
         return "stickied"
-    if post.get("removed_by_category") or _str(post.get("selftext")).strip() in ("[removed]", "[deleted]"):
+    if (
+        post.get("removed_by_category")
+        or _str(post.get("selftext")).strip() in ("[removed]", "[deleted]")
+        or _REMOVED_TITLE_RE.match(_str(post.get("title")))
+    ):
         return "removed"
     if post.get("over_18"):
         return "nsfw"
@@ -504,7 +577,7 @@ def parse_deal_post(post: Mapping[str, Any], *, subreddit: str, skip_flairs: Seq
     extra: dict[str, Any] = {
         "subreddit": _str(post.get("subreddit")) or subreddit,
         "mode": "deals",
-        "category_tag": parsed.category,
+        "category_tag": parsed.category or _flair(post) or None,
         "flair": _flair(post) or None,
         "author": _str(post.get("author")) or None,
         "domain": _str(post.get("domain")) or None,
@@ -565,12 +638,23 @@ def swap_intent(swap: SwapTitle, flair: str | None) -> str:
     return "trading"
 
 
+def _location_keys(location_tag: str) -> list[str]:
+    """``"USA-NY, NJ"`` → ``["USA-NY,NJ", "USA-NY", "USA-NJ"]`` (one key per listed state)."""
+    tag = re.sub(r"\s+", "", location_tag).upper()
+    keys = [tag]
+    parts = [p for p in re.split(r"[-,/]", tag) if p]
+    if len(parts) >= 2:
+        keys += [f"{parts[0]}-{p}" for p in parts[1:] if re.fullmatch(r"[A-Z]{2}", p)]
+    return keys
+
+
 def location_allowed(location_tag: str, allowed: Sequence[str]) -> bool:
-    """Prefix match of the title's location tag against ``hardwareswap_locations``."""
+    """Prefix match of the title's location tag(s) against ``hardwareswap_locations``."""
     if not allowed:
         return True
-    tag = re.sub(r"\s+", "", location_tag).upper()
-    return any(tag.startswith(re.sub(r"\s+", "", prefix).upper()) for prefix in allowed if prefix.strip())
+    keys = _location_keys(location_tag)
+    prefixes = [re.sub(r"\s+", "", p).upper() for p in allowed if p.strip()]
+    return any(key.startswith(prefix) for key in keys for prefix in prefixes)
 
 
 def parse_location_tag(tag: str) -> Location:
@@ -583,6 +667,8 @@ def parse_location_tag(tag: str) -> Location:
         for rest in parts[2:]:
             if re.fullmatch(r"\d{5}", rest):
                 postal = rest
+            elif re.fullmatch(r"[A-Za-z]{2}", rest):
+                continue  # additional state ("USA-NY, NJ"); Location holds a single region
             elif city is None and re.search(r"[A-Za-z]", rest):
                 city = rest
     return Location(text=tag.strip(), country=country, region=region, city=city, postal_code=postal)
@@ -590,7 +676,7 @@ def parse_location_tag(tag: str) -> Location:
 
 def _swap_price(selftext: str, have: str) -> tuple[float | None, float | None, list[float]]:
     """(price, shipping, all amounts) — struck-through ``~~$x~~`` amounts are ignored."""
-    body = _STRIKE_RE.sub(" ", selftext or "")
+    body = _SOLD_RE.sub(" ", _STRIKE_RE.sub(" ", selftext or ""))
     amounts = find_money(body)
     text = body
     if not amounts:
@@ -605,6 +691,11 @@ def _swap_price(selftext: str, have: str) -> tuple[float | None, float | None, l
         if span.value not in distinct:
             distinct.append(span.value)
     return first.value, shipping, distinct
+
+
+def payment_methods(text: str) -> list[str]:
+    """Normalised payment methods named in ``text`` (e.g. the ``[W]`` part), in a fixed order."""
+    return [name for name, pattern in _PAYMENT_TERMS if pattern.search(text)]
 
 
 def _have_items(have: str) -> list[str]:
@@ -663,6 +754,7 @@ def parse_swap_post(
     selftext = _str(post.get("selftext"))
     price, shipping, amounts = _swap_price(selftext, swap.have)
     location = parse_location_tag(swap.location)
+    methods = payment_methods(swap.want)
     trades_match = _TRADES_RE.search(_str(post.get("author_flair_text")))
     extra: dict[str, Any] = {
         "subreddit": _str(post.get("subreddit")) or subreddit,
@@ -670,6 +762,8 @@ def parse_swap_post(
         "full_title": title,
         "location_tag": swap.location,
         "want": swap.want,
+        "payment_methods": methods,
+        "payment_red_flags": [m for m in methods if m in _DISALLOWED_PAYMENTS],
         "multi_item": len(_have_items(swap.have)) >= 2,
         "prices": amounts,
         "flair": flair or None,
@@ -828,7 +922,7 @@ class RedditOAuth:
     async def _refresh(self) -> str:
         secret = self._client_secret or ""  # installed apps authenticate with an empty password
         basic = base64.b64encode(f"{self._client_id}:{secret}".encode("utf-8")).decode("ascii")
-        form = {"grant_type": self.grant_type}
+        form = {"grant_type": self.grant_type, "scope": TOKEN_SCOPE}
         if not self._client_secret:
             form["device_id"] = self._device_id
         try:
@@ -980,7 +1074,6 @@ class RedditIngestor(BaseIngestor):
         self.endpoints = endpoints or RedditEndpoints()
         self.user_agent = build_user_agent(cfg)
         self.rate_limit = RateLimitState()
-        self.block_cooldown = max(BLOCK_COOLDOWN_SECONDS, cfg.cooldown_seconds)
         self._unauth_warned = False
         m = ctx.metrics
         self.m_posts = m.counter("reddit_posts_total", "Reddit posts by parse outcome", ("subreddit", "outcome"))
@@ -988,6 +1081,7 @@ class RedditIngestor(BaseIngestor):
         self.m_remaining = m.gauge("reddit_ratelimit_remaining", "X-Ratelimit-Remaining of the last Reddit response")
         self.oauth: RedditOAuth | None = None
         client_id = cfg.client_id.get_secret_value().strip() if cfg.client_id is not None else ""
+        self.block_cooldown = max(BLOCK_COOLDOWN_SECONDS if client_id else UNAUTH_BLOCK_COOLDOWN_SECONDS, cfg.cooldown_seconds)
         if client_id:
             secret = cfg.client_secret.get_secret_value().strip() if cfg.client_secret is not None else ""
             device_id = hashlib.sha256(f"{ctx.node_id}:{client_id}".encode("utf-8")).hexdigest()[:25]
@@ -1135,6 +1229,19 @@ class RedditIngestor(BaseIngestor):
                 raise SourceBlocked(f"r/{spec.name}: Reddit requires authentication (HTTP 401)", cooldown_seconds=self.block_cooldown)
             if resp.status == 429:
                 raise SourceBlocked(f"r/{spec.name}: Reddit rate limit exceeded (HTTP 429)", cooldown_seconds=self._cooldown_429(resp))
+            if (
+                resp.status == 403
+                and self.oauth is not None
+                and token is not None
+                and not refreshed
+                and _looks_like_html(resp.headers, bytes(body))
+            ):
+                # Reddit answers an invalid/expired bearer with its HTML network-policy page
+                # rather than a 401 from some networks: one fresh token before giving up.
+                self.oauth.invalidate(token)
+                refreshed = True
+                self.log.info("reddit 403 block page with OAuth; retrying once with a fresh token", extra={"source": self.name, "subreddit": spec.name})
+                continue
             return self._inaccessible(spec, resp, bytes(body))
 
     def _inaccessible(self, spec: "SubredditSpec", resp: HttpResponse, body: bytes) -> None:
@@ -1171,6 +1278,8 @@ class RedditIngestor(BaseIngestor):
         )
         if self.oauth is None:
             return max(self.block_cooldown, hint)
+        if hint <= 0:
+            return OAUTH_429_DEFAULT_COOLDOWN_SECONDS
         return max(OAUTH_429_MIN_COOLDOWN_SECONDS, hint + RATE_LIMIT_RESET_MARGIN_SECONDS)
 
     def _observe_rate_limit(self, resp: HttpResponse) -> None:
@@ -1186,9 +1295,10 @@ class RedditIngestor(BaseIngestor):
             return
         self._unauth_warned = True
         self.log.warning(
-            "reddit OAuth credentials not configured: using the public JSON endpoints, which are heavily "
-            "rate-limited and frequently 403-blocked from datacenter IPs; set REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET",
-            extra={"source": self.name},
+            "reddit OAuth credentials not configured: falling back to the public .json endpoints, which Reddit "
+            "shut down on 2026-05-28 (expect HTTP 403 blocks and long cooldowns); set REDDIT_CLIENT_ID / "
+            "REDDIT_CLIENT_SECRET for an approved Data API app",
+            extra={"source": self.name, "cooldown_s": self.block_cooldown},
         )
 
 
@@ -1213,6 +1323,7 @@ __all__ = [
     "parse_location_tag",
     "parse_swap_post",
     "parse_swap_title",
+    "payment_methods",
     "registrable_domain",
     "retailer_for_url",
     "swap_intent",

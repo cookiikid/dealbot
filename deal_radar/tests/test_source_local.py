@@ -90,7 +90,12 @@ def ou_feed(*listings: dict[str, Any], with_ads: bool = True) -> dict[str, Any]:
 
 def ou_page(feed: dict[str, Any] | None, *, page_props: dict[str, Any] | None = None) -> str:
     props = page_props if page_props is not None else {"searchFeedResponse": feed}
-    next_data = {"props": {"pageProps": props, "__N_SSP": True}, "page": "/search", "query": {"q": "rtx 4090"}, "buildId": "2026.22.0-abc"}
+    next_data = {
+        "props": {"pageProps": props, "__N_SSP": True},
+        "page": "/search",
+        "query": {"q": "rtx 4090"},
+        "buildId": "2026.22.0-abc",
+    }
     return (
         "<!DOCTYPE html><html lang=\"en\"><head><meta charSet=\"utf-8\"/><title>rtx 4090 for sale | OfferUp</title>"
         # Real pages load reCAPTCHA for the login modal: must not be mistaken for a challenge.
@@ -99,6 +104,14 @@ def ou_page(feed: dict[str, Any] | None, *, page_props: dict[str, Any] | None = 
         f"<script id=\"__NEXT_DATA__\" type=\"application/json\">{json.dumps(next_data)}</script></body></html>"
     )
 
+
+OU_GEOCODE = {
+    "data": {
+        "geocodeLocation": {
+            "location": {"city": "Brooklyn", "latitude": 40.68, "longitude": -73.94, "state": "NY", "zipCode": "11216"}
+        }
+    }
+}
 
 CLOUDFLARE_PAGE = (
     "<!DOCTYPE html><html lang=\"en-US\"><head><title>Just a moment...</title></head><body>"
@@ -180,8 +193,14 @@ def cl_sapi_payload() -> dict[str, Any]:
                     [10, "$1,400"],
                     "NVIDIA RTX 4090 Founders Edition",
                 ],
-                [123_457, 98_000, 12_345, -1, "1:1:1~40.7549~-73.9840", "d4e5f6", [6, "manhattan-rtx-4090-gaming-pc"], "RTX 4090 Gaming PC - $3200"],
-                [123_458, 50, 7, 0, "2:2~40.7178~-74.0431", "0a0b0c", -2, [4, "3:00c0c_abcdefgh_0t20CI"], [6, "jersey-city-asus-tuf-4090"], [10, "$1,250"], "ASUS TUF 4090 OC"],
+                [
+                    123_457, 98_000, 12_345, -1, "1:1:1~40.7549~-73.9840", "d4e5f6",
+                    [6, "manhattan-rtx-4090-gaming-pc"], "RTX 4090 Gaming PC - $3200",
+                ],
+                [
+                    123_458, 50, 7, 0, "2:2~40.7178~-74.0431", "0a0b0c", -2, [4, "3:00c0c_abcdefgh_0t20CI"],
+                    [6, "jersey-city-asus-tuf-4090"], [10, "$1,250"], "ASUS TUF 4090 OC",
+                ],
                 ["oops"],
                 [123_459, 10, 7, 900, "0~40.7~-74.0", [6, "no-title"], 12_345],
                 [123_456, 99_000, 7, 1400, "0:0:0~40.6710~-73.9814", "a1b2c3", "NVIDIA RTX 4090 Founders Edition (dupe)"],
@@ -218,12 +237,16 @@ CL_HTML = """<!DOCTYPE html>
   </li>
   <li class="cl-static-search-result" title="no link"><div class="title">no link</div></li>
   <li class="cl-static-search-result" title="dupe">
-    <a href="https://newyork.craigslist.org/brk/sop/d/brooklyn-nvidia-rtx-4090-fe/7880123456.html"><div class="title">dupe</div></a>
+    <a href="https://newyork.craigslist.org/brk/sop/d/brooklyn-nvidia-rtx-4090-fe/7880123456.html">
+      <div class="title">dupe</div></a>
   </li>
 </ol>
 </body></html>"""
 
-CL_BLOCK_PAGE = "<html><body><p>This IP has been automatically blocked.</p><p>If you have questions, please email: blocks-b1@craigslist.org</p></body></html>"
+CL_BLOCK_PAGE = (
+    "<html><body><p>This IP has been automatically blocked.</p>"
+    "<p>If you have questions, please email: blocks-b1@craigslist.org</p></body></html>"
+)
 
 
 # --------------------------------------------------------------------------- fixtures: config / server
@@ -356,7 +379,13 @@ async def ctx():
 
 
 def offerup(ctx: IngestorContext, upstream: Upstream, **overrides: Any) -> ou.OfferUpIngestor:
-    params: dict[str, Any] = {"enabled": True, "latitude": 40.6782, "longitude": -73.9442, "radius_miles": 25, "poll_timeout_seconds": 30}
+    params: dict[str, Any] = {
+        "enabled": True,
+        "latitude": 40.6782,
+        "longitude": -73.9442,
+        "radius_miles": 25,
+        "poll_timeout_seconds": 30,
+    }
     clock = overrides.pop("clock", None)
     params.update(overrides)
     kwargs: dict[str, Any] = {"base_url": upstream.url()}
@@ -435,7 +464,10 @@ def test_offerup_parse_search_page_limit_and_empty_feed() -> None:
 def test_offerup_parse_search_page_walks_apollo_state_when_feed_path_moves() -> None:
     apollo = {
         "initialApolloState": {
-            "ROOT_QUERY": {"__typename": "Query", 'modularFeed({"params":[]})': {"looseTiles": [{"__ref": "ModularFeedTileListing:t1"}]}},
+            "ROOT_QUERY": {
+                "__typename": "Query",
+                'modularFeed({"params":[]})': {"looseTiles": [{"__ref": "ModularFeedTileListing:t1"}]},
+            },
             "ModularFeedTileListing:t1": {"__typename": "ModularFeedTileListing", "listing": {"__ref": "ModularFeedListing:555"}},
             "ModularFeedListing:555": {
                 "__typename": "ModularFeedListing",
@@ -445,7 +477,10 @@ def test_offerup_parse_search_page_walks_apollo_state_when_feed_path_moves() -> 
                 "locationName": "Queens, NY",
                 "postDate": "2026-10-05T18:30:00.000Z",
                 "owner": {"profile": {"name": "Sam", "ratingSummary": {"average": 4.8, "count": 37}, "isBusinessAccount": False}},
-                "photos": [{"detailFull": {"url": "https://images.offerup.com/full/1.jpg"}}, {"list": {"url": "https://images.offerup.com/list/2.jpg"}}],
+                "photos": [
+                    {"detailFull": {"url": "https://images.offerup.com/full/1.jpg"}},
+                    {"list": {"url": "https://images.offerup.com/list/2.jpg"}},
+                ],
             },
         }
     }
@@ -479,8 +514,7 @@ def test_offerup_parse_graphql_feed_and_errors() -> None:
 
 
 def test_offerup_parse_geocode() -> None:
-    payload = {"data": {"geocodeLocation": {"location": {"city": "Brooklyn", "latitude": 40.68, "longitude": -73.94, "state": "NY", "zipCode": "11216"}}}}
-    assert ou.parse_geocode(payload) == (40.68, -73.94)
+    assert ou.parse_geocode(OU_GEOCODE) == (40.68, -73.94)
     assert ou.parse_geocode({"data": {"geocodeLocation": None}}) is None
     assert ou.parse_geocode({"data": {"geocodeLocation": {"location": {"latitude": "x", "longitude": 1}}}}) is None
     assert ou.parse_geocode({"data": {"geocodeLocation": {"location": {"latitude": 99.0, "longitude": 1}}}}) is None
@@ -524,6 +558,11 @@ def test_offerup_detect_block() -> None:
     assert ou.detect_block(200, CLOUDFLARE_PAGE) is not None
     assert ou.detect_block(200, "<html><body>Please solve this CAPTCHA</body></html>") is not None
     assert ou.detect_block(200, "<html><body>No results</body></html>") is None
+    # Pages that merely load reCAPTCHA (login modal) are not walls.
+    recaptcha_page = '<script src="https://www.google.com/recaptcha/api.js"></script><div class="g-recaptcha">'
+    assert ou.detect_block(200, recaptcha_page) is None
+    assert ou.block_cooldown("http_429", 300.0) is None
+    assert ou.block_cooldown("http_403", 300.0) == 1800.0 and ou.block_cooldown("challenge:cf-chl", 7200.0) == 7200.0
 
 
 def test_offerup_build_tasks_price_windows() -> None:
@@ -537,7 +576,8 @@ def test_offerup_build_tasks_price_windows() -> None:
 
 def test_offerup_query_params() -> None:
     task = ou.SearchTask("rtx_4090", "rtx 4090", 450, 1950)
-    assert ou.page_params(task, 25) == {"q": "rtx 4090", "sort": "-posted", "radius": "30", "price_min": "450", "price_max": "1950"}
+    expected = {"q": "rtx 4090", "sort": "-posted", "radius": "30", "price_min": "450", "price_max": "1950"}
+    assert ou.page_params(task, 25) == expected
     params = ou.graphql_search_params(task, radius_miles=50, limit=40, coordinates=(40.5, -73.25), session_id="s")
     as_dict = {p["key"]: p["value"] for p in params}
     assert as_dict == {
@@ -617,8 +657,9 @@ async def test_offerup_retries_primary_strategy_after_fallback_window(upstream: 
 async def test_offerup_block_status_raises_source_blocked(upstream: Upstream, ctx: IngestorContext) -> None:
     upstream.route("GET", "/search", text("Forbidden", status=403))
     ing = offerup(ctx, upstream, profiles=["rtx_4090"])
-    with pytest.raises(SourceBlocked, match="http_403"):
+    with pytest.raises(SourceBlocked, match="http_403") as caught:
         await ing.poll()
+    assert caught.value.cooldown_seconds == ou.BLOCK_COOLDOWN_SECONDS
     assert not upstream.calls("POST")  # a block is never "worked around" via the other endpoint
 
 
@@ -643,8 +684,9 @@ async def test_offerup_block_mid_poll_returns_partial_then_raises(upstream: Upst
     listings = await ing.poll()
     assert [r.source_id for r in listings] == [OU_LISTING_FE["listingId"]]
     assert len(upstream.calls()) == 2  # stopped issuing queries after the block
-    with pytest.raises(SourceBlocked):
+    with pytest.raises(SourceBlocked) as caught:
         await ing.poll()
+    assert caught.value.cooldown_seconds is None  # 429 -> the source's configured cooldown
     assert len(upstream.calls()) == 2  # the deferred block is raised without touching upstream
 
 
@@ -671,8 +713,7 @@ async def test_offerup_all_queries_failing_raises_source_error(upstream: Upstrea
 
 
 async def test_offerup_zip_only_config_geocodes_once(upstream: Upstream, ctx: IngestorContext) -> None:
-    geo = {"data": {"geocodeLocation": {"location": {"city": "Brooklyn", "latitude": 40.68, "longitude": -73.94, "state": "NY", "zipCode": "11216"}}}}
-    upstream.route("POST", "/api/graphql", jsonr(geo))
+    upstream.route("POST", "/api/graphql", jsonr(OU_GEOCODE))
     upstream.route("GET", "/search", text(ou_page(ou_feed(OU_LISTING_FE))))
     ing = offerup(ctx, upstream, latitude=None, longitude=None, zip_code="11216", profiles=["rtx_4090"])
     await ing.poll()
@@ -773,7 +814,8 @@ def test_craigslist_decode_compact_items() -> None:
     assert [r.source_id for r in listings] == [str(CL_MIN_POSTING_ID + n) for n in (123_456, 123_457, 123_458)]
     fe, pc, tuf = listings
     assert fe.source == "craigslist" and fe.source_kind is SourceKind.LOCAL
-    assert fe.url == f"https://newyork.craigslist.org/brk/sop/d/brooklyn-nvidia-rtx-4090-founders/{CL_MIN_POSTING_ID + 123_456}.html"
+    fe_id = CL_MIN_POSTING_ID + 123_456
+    assert fe.url == f"https://newyork.craigslist.org/brk/sop/d/brooklyn-nvidia-rtx-4090-founders/{fe_id}.html"
     assert fe.title == "NVIDIA RTX 4090 Founders Edition"
     assert fe.price == 1400.0 and fe.currency == "USD"
     assert fe.posted_at == datetime.fromtimestamp(CL_MIN_POSTED + 99_000, tz=timezone.utc)
@@ -868,17 +910,30 @@ def test_craigslist_helpers() -> None:
     assert cl.coerce_price("$1,250") == 1250.0 and cl.coerce_price("1200 obo") == "1200 obo"
     assert cl.detect_block(200, CL_BLOCK_PAGE) is not None and cl.detect_block(200, CL_HTML) is None
     assert cl.detect_block(403, "") == "http_403"
+    assert cl.detect_block(403, CL_BLOCK_PAGE) == "wall:ip has been automatically blocked"
+    assert cl.block_cooldown("wall:ip has been automatically blocked", 300.0) == cl.IP_BLOCK_COOLDOWN_SECONDS
+    assert cl.block_cooldown("http_403", 300.0) == cl.BLOCK_COOLDOWN_SECONDS and cl.block_cooldown("http_429", 300.0) is None
 
 
 def test_craigslist_query_params() -> None:
     task = cl.SearchTask("rtx_4090", "rtx 4090", 450, 1950)
     area = cl.AreaInfo(3, "newyork", "US", 40.7143, -74.0059)
-    base = {"batch": "3-0-360-0-0", "cc": "US", "lang": "en", "searchPath": "sss", "query": "rtx 4090", "sort": "date", "srchType": "T"}
+    base = {
+        "batch": "3-0-360-0-0",
+        "cc": "US",
+        "lang": "en",
+        "searchPath": "sss",
+        "query": "rtx 4090",
+        "sort": "date",
+        "srchType": "T",
+    }
     with_postal = cl.sapi_params(task, area=area, category="sss", postal_code="11216", distance_miles=40)
     assert with_postal == {**base, "min_price": "450", "max_price": "1950", "postal": "11216", "search_distance": "40"}
     centred = cl.sapi_params(task, area=area, category="sss", postal_code=None, distance_miles=None)
     assert centred["lat"] == "40.71430" and centred["lon"] == "-74.00590" and centred["search_distance"] == "60"
-    unknown_geo = cl.sapi_params(cl.SearchTask("p", "q", 0, None), area=cl.AreaInfo(3, "newyork"), category="sya", postal_code=None, distance_miles=10)
+    unknown_geo = cl.sapi_params(
+        cl.SearchTask("p", "q", 0, None), area=cl.AreaInfo(3, "newyork"), category="sya", postal_code=None, distance_miles=10
+    )
     assert "lat" not in unknown_geo and "min_price" not in unknown_geo and "max_price" not in unknown_geo
     assert cl.html_params(task, postal_code=None, distance_miles=40) == {
         "query": "rtx 4090",
@@ -974,9 +1029,10 @@ async def test_craigslist_block_raises_source_blocked(upstream: Upstream, ctx: I
     upstream.route("GET", cl.SAPI_SEARCH_PATH, text(CL_BLOCK_PAGE, status=403))
     upstream.route("GET", "/site/newyork/search/sss", text(CL_HTML))
     ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
-    with pytest.raises(SourceBlocked, match="http_403"):
+    with pytest.raises(SourceBlocked, match="automatically blocked") as caught:
         await ing.poll()
-    assert not upstream.calls("GET", "/site/newyork/search/sss")
+    assert caught.value.cooldown_seconds == cl.IP_BLOCK_COOLDOWN_SECONDS
+    assert not upstream.calls("GET", "/site/newyork/search/sss")  # never route around a block
 
 
 async def test_craigslist_block_wall_on_html_page(upstream: Upstream, ctx: IngestorContext) -> None:

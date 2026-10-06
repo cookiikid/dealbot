@@ -250,6 +250,16 @@ def test_header_profiles_are_coherent() -> None:
             assert "sec-ch-ua" not in headers  # Firefox/Safari never send client hints
 
 
+def test_fetch_mode_drops_navigation_only_headers() -> None:
+    for profile in build_header_profiles(140):
+        nav = profile.build()
+        api = profile.build(fetch_mode="cors", accept="application/json")
+        assert "Sec-Fetch-User" not in api and "Upgrade-Insecure-Requests" not in api
+        assert api["Accept"] == "application/json" and api["User-Agent"] == nav["User-Agent"]
+        if "Sec-Fetch-Dest" in nav:
+            assert api["Sec-Fetch-Dest"] == "empty" and api["Sec-Fetch-Mode"] == "cors"
+
+
 def test_identity_rotator_sticky_and_burn() -> None:
     clock = FakeClock()
     rot = IdentityRotator(build_header_profiles(140), rotation_seconds=60, rng=random.Random(3), clock=clock)

@@ -68,12 +68,20 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from deal_radar.config_schema import AppConfig, Profile, RuleGroup
 from deal_radar.core.logs import get_logger
 from deal_radar.engine.types import Condition, DealItem, FilterResult, RiskSignal, SourceKind
+
+try:  # CPython 3.11+: the regex parser used to derive literal anchors (optimisation only)
+    from re import _constants as _sre_c
+    from re import _parser as _sre_p
+except ImportError:  # pragma: no cover - other implementations: every pattern set simply runs ungated
+    _sre_c = None
+    _sre_p = None
 
 log = get_logger(__name__)
 
@@ -162,6 +170,170 @@ def _fold_pattern(pattern: str) -> str:
     return "".join(out)
 
 
+# --------------------------------------------------------------------------- literal anchor gate
+#
+# A regex led by ``\b`` or a look-behind cannot use sre's prefix scan, so it pays a
+# fixed ~15 ns per character even on text that contains nothing relevant. Most rule
+# patterns, however, can only match where a specific literal occurs ("box only",
+# "not working", "zelle"...). For every pattern set we derive (from the regex parse
+# tree, conservatively) a set of literal *anchors* such that every match must start
+# with one of them, modulo whitespace runs. All anchors of all pattern sets are
+# merged into one greedy trie regex that is scanned once per listing over the
+# lower-cased, whitespace-normalised text; only pattern sets whose anchors occur are
+# then actually run. Pattern sets for which no anchor can be proven always run.
+
+_MAX_ANCHORS = 64  # per pattern; beyond this the prefix stops being extended
+_WS_RUN = re.compile(r"\s+")
+
+
+def _anchor_constants() -> dict[str, Any] | None:
+    if _sre_c is None or _sre_p is None:
+        return None
+    names = (
+        "LITERAL", "IN", "CATEGORY", "CATEGORY_SPACE", "SUBPATTERN", "BRANCH", "MAX_REPEAT", "MIN_REPEAT",
+        "AT", "ASSERT", "ASSERT_NOT",
+    )
+    try:
+        found = {name: getattr(_sre_c, name) for name in names}
+    except AttributeError:  # pragma: no cover - unexpected interpreter internals
+        return None
+    found["REPEATS"] = tuple(
+        getattr(_sre_c, n) for n in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT") if hasattr(_sre_c, n)
+    )
+    found["ATOMIC_GROUP"] = getattr(_sre_c, "ATOMIC_GROUP", object())
+    found["ZERO_WIDTH"] = (found["AT"], found["ASSERT"], found["ASSERT_NOT"])
+    return found
+
+
+_C = _anchor_constants()
+
+
+def _sub_items(node: Any) -> list[tuple[Any, Any]]:
+    return list(node.data) if hasattr(node, "data") else list(node)
+
+
+def _class_chars(items: Sequence[tuple[Any, Any]]) -> set[str] | None:
+    """Characters of a small positive class made of literals and whitespace (as " ")."""
+    assert _C is not None
+    chars: set[str] = set()
+    for op, av in items:
+        if op is _C["LITERAL"]:
+            chars.add(chr(av))
+        elif op is _C["CATEGORY"] and av is _C["CATEGORY_SPACE"]:
+            chars.add(" ")
+        else:
+            return None
+    return chars if 0 < len(chars) <= 8 else None
+
+
+def _anchor_seq(items: Sequence[tuple[Any, Any]]) -> tuple[set[str], bool]:
+    """Literal prefixes every match of ``items`` starts with, and whether they are complete."""
+    assert _C is not None
+    prefixes = {""}
+    for op, av in items:
+        if op in _C["ZERO_WIDTH"]:
+            continue
+        step = _anchor_node(op, av)
+        if step is None:
+            return prefixes, False
+        strings, complete = step
+        combined = {p + s for p in prefixes for s in strings}
+        if len(combined) > _MAX_ANCHORS:
+            return prefixes, False
+        prefixes = combined
+        if not complete:
+            return prefixes, False
+    return prefixes, True
+
+
+def _anchor_node(op: Any, av: Any) -> tuple[set[str], bool] | None:
+    assert _C is not None
+    if op is _C["LITERAL"]:
+        return {chr(av)}, True
+    if op is _C["IN"]:
+        chars = _class_chars(av)
+        return (chars, True) if chars is not None else None
+    if op is _C["SUBPATTERN"]:
+        _group, add_flags, del_flags, sub = av
+        if add_flags or del_flags:
+            return None
+        return _anchor_seq(_sub_items(sub))
+    if op is _C["ATOMIC_GROUP"]:
+        return _anchor_seq(_sub_items(av))
+    if op is _C["BRANCH"]:
+        out: set[str] = set()
+        complete = True
+        for branch in av[1]:
+            strings, done = _anchor_seq(_sub_items(branch))
+            out |= strings
+            complete = complete and done
+        return (out, complete) if len(out) <= _MAX_ANCHORS else None
+    if op in _C["REPEATS"]:
+        low, high, sub = av
+        items = _sub_items(sub)
+        strings, done = _anchor_seq(items)
+        if done and strings and all(not s.strip() for s in strings):  # \s+, \s*, [\s]? ...
+            # The gate text has single spaces, so any whitespace run is exactly " ".
+            return ({" "} if low >= 1 and "" not in strings else {"", " "}), True
+        if low == 0:
+            return ({""} | strings, True) if high == 1 and done else ({""}, False)
+        if low == 1 and high == 1:
+            return strings, done
+        return strings, False
+    return None
+
+
+def _literal_anchors(pattern: str) -> frozenset[str] | None:
+    """Anchors (lower-case, single-spaced) one of which starts every match, else ``None``."""
+    if _C is None or _sre_p is None:
+        return None
+    try:
+        strings, _complete = _anchor_seq(_sub_items(_sre_p.parse(pattern, 0)))
+    except Exception:  # noqa: BLE001 - optimisation only: anything unexpected disables gating
+        return None
+    anchors: set[str] = set()
+    for s in strings:
+        s = _WS_RUN.sub(" ", s)
+        if not s.strip():
+            return None  # some match can start without a literal
+        anchors.add(s)
+    return frozenset(anchors) if anchors else None
+
+
+def _set_anchors(patterns: Sequence[str]) -> frozenset[str] | None:
+    out: set[str] = set()
+    for pattern in patterns:
+        anchors = _literal_anchors(pattern)
+        if anchors is None:
+            return None
+        out |= anchors
+    return frozenset(out) if out else None
+
+
+def _trie_regex(words: Iterable[str]) -> str:
+    """Greedy trie alternation: at any position it matches the LONGEST word starting there."""
+    trie: dict[str | None, Any] = {}
+    for word in words:
+        node = trie
+        for ch in word:
+            node = node.setdefault(ch, {})
+        node[None] = True
+
+    def render(node: dict[str | None, Any]) -> str:
+        branches = [re.escape(ch) + render(child) for ch, child in sorted((k, v) for k, v in node.items() if k is not None)]
+        if not branches:
+            return ""
+        body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
+        return f"(?:{body})?" if None in node else body
+
+    return render(trie)
+
+
+def _normalise_for_gate(low: str) -> str:
+    """Single-spaced, padded copy of lower-cased text (only presence matters, not offsets)."""
+    return " " + " ".join(low.split()) + " "
+
+
 def _compile_joined(sources: Sequence[str], flags: int) -> list[re.Pattern[str]]:
     joinable = [p for p in sources if not _UNJOINABLE.search(p)]
     regexes: list[re.Pattern[str]] = []
@@ -179,11 +351,13 @@ def _compile_joined(sources: Sequence[str], flags: int) -> list[re.Pattern[str]]
 class _PatternSet:
     """Patterns compiled into as few regexes as possible (normally one).
 
-    ``search``/``finditer`` take the original text and its :func:`_lower` copy; match
-    offsets are valid on both because the two strings have the same length.
+    ``search``/``finditer`` take the original text, its :func:`_lower` copy (match
+    offsets are valid on both because the strings have the same length) and the
+    gate's hit set: a set with literal ``anchors`` that is not in ``hits`` cannot
+    match and is skipped without running any regex.
     """
 
-    __slots__ = ("patterns", "_folded", "_cased", "_single")
+    __slots__ = ("patterns", "anchors", "_folded", "_cased", "_single")
 
     def __init__(self, patterns: Sequence[str]) -> None:
         self.patterns: tuple[str, ...] = tuple(patterns)
@@ -194,9 +368,12 @@ class _PatternSet:
         self._single: re.Pattern[str] | None = (
             self._folded[0] if len(self._folded) == 1 and not self._cased else None
         )
+        self.anchors: frozenset[str] | None = None if unsafe else _set_anchors(safe)
 
-    def search(self, text: str, low: str) -> re.Match[str] | None:
+    def search(self, text: str, low: str, hits: frozenset[_PatternSet] | set[_PatternSet]) -> re.Match[str] | None:
         """Leftmost match of any pattern."""
+        if self.anchors is not None and self not in hits:
+            return None
         if self._single is not None:
             return self._single.search(low)
         best: re.Match[str] | None = None
@@ -206,8 +383,12 @@ class _PatternSet:
                 best = m
         return best
 
-    def finditer(self, text: str, low: str) -> Iterator[re.Match[str]]:
+    def finditer(
+        self, text: str, low: str, hits: frozenset[_PatternSet] | set[_PatternSet]
+    ) -> Iterator[re.Match[str]]:
         """All matches, in text order."""
+        if self.anchors is not None and self not in hits:
+            return iter(())
         if self._single is not None:
             return self._single.finditer(low)
         matches = [m for rx, haystack in self._pairs(text, low) for m in rx.finditer(haystack)]
@@ -221,21 +402,67 @@ class _PatternSet:
             yield rx, text
 
 
+class _AnchorGate:
+    """One literal scan per listing that tells which anchored pattern sets may match.
+
+    Exactness: the trie regex is greedy, so at a position it reports the longest
+    anchor starting there; every other anchor starting at that position is a prefix
+    of it (prefix closure below), and the scan resumes one character after each hit
+    start so anchors overlapping a hit are still found. ``scan`` therefore returns
+    exactly the pattern sets with at least one anchor present in the text.
+    """
+
+    __slots__ = ("_regex", "_sets_for")
+
+    def __init__(self, pattern_sets: Iterable[_PatternSet]) -> None:
+        owners: dict[str, set[_PatternSet]] = {}
+        for ps in pattern_sets:
+            for anchor in ps.anchors or ():
+                owners.setdefault(anchor, set()).add(ps)
+        self._sets_for: dict[str, frozenset[_PatternSet]] = {}
+        for anchor in owners:
+            closure: set[_PatternSet] = set()
+            for i in range(1, len(anchor) + 1):
+                closure |= owners.get(anchor[:i], set())
+            self._sets_for[anchor] = frozenset(closure)
+        self._regex: re.Pattern[str] | None = re.compile(_trie_regex(owners)) if owners else None
+
+    def scan(self, low: str) -> set[_PatternSet]:
+        hits: set[_PatternSet] = set()
+        regex = self._regex
+        if regex is None:
+            return hits
+        text = _normalise_for_gate(low)
+        sets_for = self._sets_for
+        pos = 0
+        while True:
+            m = regex.search(text, pos)
+            if m is None:
+                return hits
+            hits |= sets_for[m.group()]
+            pos = m.start() + 1
+
+
 def _pattern_set(patterns: Sequence[str]) -> _PatternSet | None:
     return _PatternSet(patterns) if patterns else None
 
 
 @dataclass(frozen=True, slots=True)
 class _Haystacks:
-    """The two fields rules can look at, each with its lower-cased twin."""
+    """The two fields rules can look at (each with its lower-cased twin) + gate hits."""
 
     title: str
     title_low: str
     text: str
     text_low: str
+    hits: set[_PatternSet]
 
     def pick(self, on_title: bool) -> tuple[str, str]:
         return (self.title, self.title_low) if on_title else (self.text, self.text_low)
+
+    def search(self, ps: _PatternSet, on_title: bool) -> tuple[str, re.Match[str] | None]:
+        text, low = self.pick(on_title)
+        return text, ps.search(text, low, self.hits)
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,9 +549,22 @@ class TextFilter:
             (category, kind): self._select_groups(category, kind) for category in categories for kind in SourceKind
         }
         self._mismatch_p = config.scoring.risk_probabilities.get("title_price_mismatch", 0.45)
+
+        pattern_sets = [g.patterns for g in self._groups]
+        for cp in self._profiles:
+            pattern_sets.extend(ps for ps in (cp.any, cp.none, *cp.all) if ps is not None)
+            pattern_sets.extend(v.patterns for v in cp.variants)
+        self._gate = _AnchorGate(pattern_sets)
+        gated = sum(1 for ps in pattern_sets if ps.anchors is not None)
         log.debug(
             "text filter compiled",
-            extra={"profiles": len(self._profiles), "rule_groups": len(self._groups), "negation_terms": len(terms)},
+            extra={
+                "profiles": len(self._profiles),
+                "rule_groups": len(self._groups),
+                "negation_terms": len(terms),
+                "pattern_sets": len(pattern_sets),
+                "gated_pattern_sets": gated,
+            },
         )
 
     # ------------------------------------------------------------------ public
@@ -345,9 +585,11 @@ class TextFilter:
 
         title_low = _lower(title)
         if item.description:
-            hay = _Haystacks(title, title_low, f"{title}\n{item.description}", f"{title_low}\n{_lower(item.description)}")
+            text, text_low = f"{title}\n{item.description}", f"{title_low}\n{_lower(item.description)}"
         else:
-            hay = _Haystacks(title, title_low, title, title_low)
+            text, text_low = title, title_low
+        # Title rules only look at a prefix of ``text``, so text-level hits are a safe superset.
+        hay = _Haystacks(title, title_low, text, text_low, self._gate.scan(text_low))
 
         # 2. product identification -------------------------------------------
         ident, unknown = self._identify(hay)
@@ -434,8 +676,7 @@ class TextFilter:
             variant_id: str | None = None
             variant_term: str | None = None
             for variant in cp.variants:
-                text, low = hay.pick(variant.on_title)
-                m = variant.patterns.search(text, low)
+                text, m = hay.search(variant.patterns, variant.on_title)
                 if m is not None:
                     variant_id, variant_term = variant.id, text[m.start() : m.end()]
                     break
@@ -469,11 +710,11 @@ class TextFilter:
 
     def _group_match(self, group: _Group, hay: _Haystacks) -> str | None:
         """Matched (original-case) text of the first non-negated match, else ``None``."""
-        text, low = hay.pick(group.on_title)
         if not group.negatable:
-            m = group.patterns.search(text, low)
+            text, m = hay.search(group.patterns, group.on_title)
             return None if m is None else _detail(text, m)
-        for m in group.patterns.finditer(text, low):
+        text, low = hay.pick(group.on_title)
+        for m in group.patterns.finditer(text, low, hay.hits):
             if not self._negated(low, m.start(), m.end()):
                 return _detail(text, m)
         return None
@@ -526,19 +767,18 @@ def _unique(terms: Sequence[str]) -> tuple[str, ...]:
 
 
 def _match_profile(cp: _Profile, hay: _Haystacks) -> tuple[str, ...] | None:
-    text, low = hay.pick(cp.on_title)
     terms: list[str] = []
     if cp.any is not None:
-        m = cp.any.search(text, low)
+        text, m = hay.search(cp.any, cp.on_title)
         if m is None:
             return None
         terms.append(text[m.start() : m.end()])
     for required in cp.all:
-        m = required.search(text, low)
+        text, m = hay.search(required, cp.on_title)
         if m is None:
             return None
         terms.append(text[m.start() : m.end()])
-    if cp.none is not None and cp.none.search(text, low) is not None:
+    if cp.none is not None and hay.search(cp.none, cp.on_title)[1] is not None:
         return None
     return tuple(terms)
 

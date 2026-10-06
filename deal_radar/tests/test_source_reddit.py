@@ -36,7 +36,9 @@ from deal_radar.sources.reddit_stream import (
     INSTALLED_CLIENT_GRANT,
     OAUTH_BASE,
     PUBLIC_BASE,
+    TOKEN_REFRESH_MARGIN_SECONDS,
     TOKEN_URL,
+    UNAUTH_BLOCK_COOLDOWN_SECONDS,
     PostSkipped,
     RateLimitState,
     RedditEndpoints,
@@ -51,6 +53,7 @@ from deal_radar.sources.reddit_stream import (
     parse_location_tag,
     parse_swap_post,
     parse_swap_title,
+    payment_methods,
     registrable_domain,
     retailer_for_url,
     swap_intent,
@@ -245,6 +248,17 @@ def test_find_money_formats() -> None:
         ("[Prebuilt] Some Gaming PC - $1.2k", "Prebuilt", 1200.0, None),
         ("[Cooler] Thermalright PA120 - $35.90 ($5 off coupon)", "Cooler", 35.9, None),
         ("[Game] Free on Epic - Some Game", "Game", None, None),
+        # Live r/buildapcsales titles (2026-10):
+        ("[PSU] $109.99 - Corsair RM1000e (2025) 1000W ATX 3.1", "PSU", 109.99, None),
+        ("[Prebuilt] Acer Nitro Desktop ($1700), AMD Ryzen 9 9900X, RTX 5070 Ti", "Prebuilt", 1700.0, None),
+        ("[GPU] ASUS Prime Gaming Radeon RX 9070 XT OC Edition - $699.99 (829.99-130) - Central Computers In-store",
+         "GPU", 699.99, 829.99),
+        ("[Laptop] HP ZBook Fury G1i 18 (Ultra 9 285HX, RTX PRO 5000) $8999( $26794-$17795)", "Laptop", 8999.0, 26794.0),
+        ("[PSU] MSI MPG A1000GS | $94.99 (w/ code: FTTF7873) - $10 Rebate = $84.99 AR (Newegg)", "PSU", 84.99, None),
+        ('[TV] LG 48" B6 OLED 4K 120Hz Smart TV - $699.99 @ Best Buy', "TV", 699.99, None),
+        ("[GPU] PNY RTX 5070 - $299 - $30MIR = $269", "GPU", 269.0, None),
+        ("[GPU] Gigabyte RTX 5080 - $1199 ($1599 - $400 = $1199)", "GPU", 1199.0, 1599.0),
+        ("[SSD] WD SN850X 4TB - $249.99 after rebate (reg $329.99)", "SSD", 249.99, 329.99),
         ("No tag RTX 4080 Super - $899", None, 899.0, None),
     ],
 )
@@ -348,6 +362,9 @@ def test_deal_post_serialises_for_the_bus() -> None:
         ({"removed_by_category": "deleted"}, "removed"),
         ({"over_18": True}, "nsfw"),
         ({"link_flair_text": "Expired: Price Increased"}, "expired"),
+        ({"link_flair_text": "Expired :table_flip:", "link_flair_css_class": "expired"}, "expired"),
+        ({"title": "[ Removed by moderator ]"}, "removed"),
+        ({"is_self": True, "selftext": "[removed]"}, "removed"),
         ({"link_flair_text": None, "link_flair_css_class": "expired"}, "expired"),
         ({"link_flair_text": "Out of Stock"}, "flair"),
     ],
@@ -554,6 +571,43 @@ def test_user_agent_follows_reddit_rules() -> None:
     assert build_user_agent(RedditSource(user_agent="linux:my.app:2.0 (by /u/me)")) == "linux:my.app:2.0 (by /u/me)"
 
 
+def test_deal_category_falls_back_to_link_flair() -> None:
+    data = post("buildapcsales_new.json", "1nyk2gq")
+    data.update(title="ASUS TUF RTX 4090 OC - $1199.99", link_flair_text="GPU", link_flair_css_class="gpu")
+    raw = parse_deal_post(data, subreddit="buildapcsales")
+    assert raw.extra["category_tag"] == "GPU" and raw.price == 1199.99
+
+
+def test_swap_sold_markers_are_not_prices() -> None:
+    data = post("hardwareswap_new.json", "1nyk9a2")
+    data["selftext"] = (
+        "Timestamps: https://imgur.com/a/Xk3LmQp\n\n| Item | Price |\n|:-|:-|\n"
+        "| RTX 4090 FE | [$1600 Sold for $1550 to /u/buyer123] |\n"
+        "| G.Skill 32GB DDR5-6000 | $85 shipped |\n"
+    )
+    raw = parse_swap_post(data, subreddit="hardwareswap")
+    assert raw.price == 85.0 and raw.shipping == 0.0
+    assert raw.extra["prices"] == [85.0]
+
+
+def test_swap_payment_methods_and_red_flags() -> None:
+    raw = parse_listing(fixture("hardwareswap_new.json"), subreddit="hardwareswap", mode="swap", skip_flairs=SKIP_FLAIRS)
+    by_id = {r.source_id: r for r in raw.listings}
+    assert by_id["t3_1nyk9a2"].extra["payment_methods"] == ["paypal", "cash"]
+    assert by_id["t3_1nyk9a2"].extra["payment_red_flags"] == []
+    assert by_id["t3_1nyk1e6"].extra["payment_methods"] == ["paypal", "cash", "zelle"]
+    assert by_id["t3_1nyk1e6"].extra["payment_red_flags"] == ["zelle"]
+    assert payment_methods("Venmo, CashApp, PayPal F&F, BTC") == ["paypal", "venmo", "cashapp", "friends_family", "crypto"]
+
+
+def test_multi_state_location_tags() -> None:
+    assert location_allowed("USA-NY, NJ", ["USA-NJ"])
+    assert location_allowed("USA-NY, NJ", ["USA-NY"])
+    assert not location_allowed("USA-NY, NJ", ["USA-CT"])
+    loc = parse_location_tag("USA-NY, NJ")
+    assert (loc.country, loc.region, loc.city) == ("US", "NY", None)
+
+
 # --------------------------------------------------------------------------- polling: unauthenticated
 
 
@@ -595,7 +649,7 @@ async def test_unauthenticated_403_block_page_raises_source_blocked(http: HttpCl
     reddit.on("GET", PUBLIC_HWS, reply(403, body=BLOCK_PAGE, content_type="text/html"))
     with pytest.raises(SourceBlocked) as info:
         await ing.poll()
-    assert info.value.cooldown_seconds is not None and info.value.cooldown_seconds >= BLOCK_COOLDOWN_SECONDS
+    assert info.value.cooldown_seconds is not None and info.value.cooldown_seconds >= UNAUTH_BLOCK_COOLDOWN_SECONDS
     assert "403" in str(info.value)
     assert len(reddit.seen) == 2  # a block wall is not retried
 
@@ -710,7 +764,7 @@ async def test_oauth_token_flow_and_caching(http: HttpClient, reddit: FakeReddit
     req = token_calls[0]
     assert req.headers["Authorization"] == "Basic " + base64.b64encode(b"cid-123:s3cr3t").decode("ascii")
     assert req.headers["User-Agent"] == "python:dealradar:1.0 (by /u/radar_bot)"
-    assert req.form == {"grant_type": "client_credentials"}
+    assert req.form == {"grant_type": "client_credentials", "scope": "read"}
     listing_calls = [s for s in reddit.seen if s.method == "GET"]
     assert len(listing_calls) == 4
     assert all(s.headers["Authorization"] == "bearer tok-1" for s in listing_calls)
@@ -767,7 +821,7 @@ async def test_oauth_token_refreshed_before_expiry(http: HttpClient, reddit: Fak
     reddit.on("POST", TOKEN_PATH, reply(200, token_payload("tok-1", 3600)), reply(200, token_payload("tok-2", 3600)))
     reddit.on("GET", OAUTH_BAPCS, listing_reply("buildapcsales_new.json", headers=RL_OK))
     await ing.poll()
-    clock.now += 3600 - 300 - 1  # still inside the lifetime minus the refresh margin
+    clock.now += 3600 - TOKEN_REFRESH_MARGIN_SECONDS - 1  # still inside the lifetime minus the refresh margin
     await ing.poll()
     assert len(reddit.calls("POST", TOKEN_PATH)) == 1
     clock.now += 2  # inside the refresh margin -> proactively re-request
@@ -802,8 +856,42 @@ async def test_installed_app_grant_when_no_secret(http: HttpClient, reddit: Fake
     assert len(await ing.poll()) == 4
     req = reddit.calls("POST", TOKEN_PATH)[0]
     assert req.form["grant_type"] == INSTALLED_CLIENT_GRANT
+    assert req.form["scope"] == "read"
     assert 20 <= len(req.form["device_id"]) <= 30
     assert req.headers["Authorization"] == "Basic " + base64.b64encode(b"installed-id:").decode("ascii")
+
+
+async def test_oauth_403_block_page_retries_with_fresh_token(http: HttpClient, reddit: FakeReddit) -> None:
+    ing = make_ingestor(http, reddit, env=OAUTH_ENV, subreddits=[{"name": "buildapcsales"}])
+    pardner = "<html><body><h1>whoa there, pardner!</h1>Your request has been blocked due to a network policy.</body></html>"
+
+    def gate(seen: Seen) -> web.StreamResponse:
+        if seen.headers.get("Authorization") == "bearer tok-1":
+            return web.Response(status=403, text=pardner, content_type="text/html")
+        return web.json_response(fixture("buildapcsales_new.json"), headers=RL_OK)
+
+    reddit.on("POST", TOKEN_PATH, reply(200, token_payload("tok-1")), reply(200, token_payload("tok-2")))
+    reddit.on("GET", OAUTH_BAPCS, gate)
+    assert len(await ing.poll()) == 4
+    assert [s.headers["Authorization"] for s in reddit.calls("GET", OAUTH_BAPCS)] == ["bearer tok-1", "bearer tok-2"]
+
+    reddit.reset()
+    blocked = make_ingestor(http, reddit, env=OAUTH_ENV, subreddits=[{"name": "buildapcsales"}])
+    reddit.on("POST", TOKEN_PATH, reply(200, token_payload("tok-3")))
+    reddit.on("GET", OAUTH_BAPCS, reply(403, body=pardner, content_type="text/html"))
+    with pytest.raises(SourceBlocked) as info:
+        await blocked.poll()
+    assert info.value.cooldown_seconds is not None and info.value.cooldown_seconds >= BLOCK_COOLDOWN_SECONDS
+    assert len(reddit.calls("GET", OAUTH_BAPCS)) == 2
+
+
+async def test_oauth_429_without_headers_uses_default_cooldown(http: HttpClient, reddit: FakeReddit) -> None:
+    ing = make_ingestor(http, reddit, env=OAUTH_ENV, subreddits=[{"name": "buildapcsales"}])
+    reddit.on("POST", TOKEN_PATH, reply(200, token_payload()))
+    reddit.on("GET", OAUTH_BAPCS, reply(429, body=b"", content_type="text/plain"))
+    with pytest.raises(SourceBlocked) as info:
+        await ing.poll()
+    assert info.value.cooldown_seconds == 60.0
 
 
 async def test_oauth_429_raises_blocked_with_reset_cooldown(http: HttpClient, reddit: FakeReddit) -> None:

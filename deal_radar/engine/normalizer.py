@@ -171,13 +171,15 @@ _FIELD_RE = _build_money_regex(
 )
 # Free text (titles/descriptions): only explicit dollar/USD amounts.
 _TEXT_RE = _build_money_regex(
-    prefix=rf"{_DOLLAR}|(?<![A-Za-z])(?i:usd)(?![A-Za-z])(?:{_SP}?\$)?",
+    prefix=rf"{_DOLLAR}|(?<![A-Za-z])(?i:usd)(?![A-Za-z])(?:{_SP}?\$)?|(?<![A-Za-z])(?:CAD|AUD|NZD|HKD|SGD|MXN){_SP}?\$",
     suffix=rf"\$(?![\d$])|{_SP}?(?<![A-Za-z])(?i:usd)(?![A-Za-z])(?!{_SP}?\d)",
     number=_NUM_RUN,
     plain=False,
 )
 _TEXT_ANCHOR = re.compile(r"\$|[uU][sS][dD]")
-_ANCHOR_LOOKBACK = 24  # max chars a match may start before its "$"/"USD" anchor
+_PREFIX_LOOKBACK = 6  # "-US $" / "-CAD $": a prefix match starts at most this far before "$"
+_ANCHOR_WINDOW = 48  # chars after an anchor searched for its amount
+_RUN_SEPARATORS = ",.'   "
 
 # Hot path for clean US-style fields: "1299", "1,299.99", "$1,299.99", "US $1,299.99".
 _US_PRICE = re.compile(r"\s*(US ?\$|\$)?[ ]?((?:\d{1,3}(?:,\d{3})+|\d{1,8})(?:\.\d{1,2})?)\s*")
@@ -283,17 +285,39 @@ def _candidate(m: re.Match[str]) -> _Candidate:
     return _Candidate(m.start(), m.end(), _to_number(run, kilo), marker, negative)
 
 
+def _match_floor(text: str, anchor: int, floor: int) -> int:
+    """Earliest index a money match containing the anchor at ``anchor`` can start.
+
+    Suffix forms ("1,299.99$", "1500 USD") start at the digit run right before the
+    anchor (plus an optional sign); prefix forms ("-US $5", "-CAD $5") start at most
+    ``_PREFIX_LOOKBACK`` characters before it.
+    """
+    i = anchor
+    if i > floor and text[i - 1] in "  ":
+        i -= 1
+    j = i
+    while j > floor and (text[j - 1].isdigit() or text[j - 1] in _RUN_SEPARATORS):
+        j -= 1
+    if j == i:
+        return max(floor, anchor - _PREFIX_LOOKBACK)
+    return max(floor, j - 1)
+
+
 def _scan_text(text: str) -> list[_Candidate]:
-    """All $/USD amounts in free text, scanning only near currency anchors."""
+    """All $/USD amounts in free text, running the tokenizer only next to anchors."""
     out: list[_Candidate] = []
     pos = 0
+    n = len(text)
     while True:
         anchor = _TEXT_ANCHOR.search(text, pos)
         if anchor is None:
             return out
-        m = _TEXT_RE.search(text, max(pos, anchor.start() - _ANCHOR_LOOKBACK))
+        # The window end only bounds work for an anchor without an amount ("$$$");
+        # any real amount is far shorter than _ANCHOR_WINDOW characters.
+        m = _TEXT_RE.search(text, _match_floor(text, anchor.start(), pos), min(n, anchor.end() + _ANCHOR_WINDOW))
         if m is None:
-            return out
+            pos = anchor.end()
+            continue
         out.append(_candidate(m))
         pos = m.end()
 
@@ -507,9 +531,13 @@ _RAW_CONDITION_RULES: tuple[tuple[Condition, re.Pattern[str]], ...] = (
 )
 _NON_WORD = re.compile(r"[^0-9a-z]+")
 
-# Free-text hints over *lowercased* text, one pass. Every alternative starts with a
-# literal (fast scanning); word-start, exclusion and negation checks run in Python on
-# the few matches. Specific alternatives precede the plain "new" fallback.
+# Free-text hints over *lowercased* text. A bare literal alternation (which sre scans
+# fast) finds trigger positions; _HINT_RE is then matched *anchored* there, and the
+# word-start, exclusion and negation checks run in Python on those few positions.
+# Specific alternatives precede the plain "new" fallback.
+_HINT_TRIGGER = re.compile(
+    r"for|parts|refurb|renewed|recond|reman|recert|open|box|new|used|pre|second|like|brand|b?nib|nisb|b?nwt|factory|sealed|unopened"
+)
 _HINT_RE = re.compile(
     r"""
       (?P<parts>for[\s-]+parts(?:\s+(?:or|and|/)\s+(?:repair|not\s+working))?|parts(?:[\s-]+only|\s*/\s*repair))\b
@@ -588,10 +616,19 @@ def _negated(low: str, start: int) -> bool:
 
 def _text_hints(low: str, title_end: int) -> set[Condition]:
     hints: set[Condition] = set()
-    for m in _HINT_RE.finditer(low):
-        start = m.start()
+    pos = 0
+    while True:
+        trigger = _HINT_TRIGGER.search(low, pos)
+        if trigger is None:
+            return hints
+        start = trigger.start()
+        pos = start + 1
         if start and (low[start - 1].isalnum() or low[start - 1] == "_"):
             continue  # not at a word start ("renewal", "unused", "anew")
+        m = _HINT_RE.match(low, start)
+        if m is None:
+            continue
+        pos = m.end()
         kind = m.lastgroup or ""
         if kind == "used" and low.startswith("used", start) and _BE_BEFORE.search(low, max(0, start - 4), start):
             continue
@@ -606,7 +643,6 @@ def _text_hints(low: str, title_end: int) -> set[Condition]:
         if _negated(low, start):
             continue
         hints.add(_HINT_CLASSES[kind])
-    return hints
 
 
 def _safest(base: Condition, hints: set[Condition]) -> Condition:

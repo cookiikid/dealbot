@@ -124,8 +124,29 @@ class HeaderProfile:
     user_agent: str
     headers: Mapping[str, str]
 
-    def build(self, *, accept: str | None = None, extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    def build(
+        self,
+        *,
+        accept: str | None = None,
+        extra: Mapping[str, str] | None = None,
+        fetch_mode: str = "navigate",
+    ) -> dict[str, str]:
+        """Headers for one request.
+
+        ``fetch_mode="navigate"`` mirrors a top-level page load. ``"cors"`` mirrors a
+        ``fetch()``/XHR issued by a page: real browsers then send ``Sec-Fetch-Dest: empty``
+        and ``Sec-Fetch-Mode: cors`` and never the navigation-only ``Sec-Fetch-User`` /
+        ``Upgrade-Insecure-Requests`` headers — sending those on a JSON API call is a
+        cheap bot tell.
+        """
         merged = {"User-Agent": self.user_agent, **self.headers, "Accept-Encoding": ACCEPT_ENCODING}
+        if fetch_mode != "navigate":
+            merged.pop("Sec-Fetch-User", None)
+            merged.pop("Upgrade-Insecure-Requests", None)
+            if "Sec-Fetch-Dest" in merged:  # browsers without Fetch Metadata (none here) keep nothing
+                merged["Sec-Fetch-Dest"] = "empty"
+                merged["Sec-Fetch-Mode"] = "cors" if fetch_mode == "cors" else fetch_mode
+                merged["Sec-Fetch-Site"] = "same-origin"
         if accept is not None:
             merged["Accept"] = accept
         if extra:
@@ -409,6 +430,7 @@ class HttpClient:
         json: Any = None,
         data: Any = None,
         browser_identity: bool = False,
+        fetch_mode: str = "navigate",
         accept: str | None = "application/json",
         conditional: bool = False,
         bust_cache: str | None = None,
@@ -440,7 +462,7 @@ class HttpClient:
                 await bucket.acquire()
             req_headers: dict[str, str] = {}
             if browser_identity:
-                req_headers.update(self.identities.for_host(host).build(accept=accept))
+                req_headers.update(self.identities.for_host(host).build(accept=accept, fetch_mode=fetch_mode))
             else:
                 req_headers["Accept-Encoding"] = ACCEPT_ENCODING
                 if accept is not None:

@@ -85,6 +85,8 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 BUDGET_FRACTION = 0.8
 PRIMARY_RETRY_SECONDS = 1800.0
 REFERENCE_RETRY_SECONDS = 3600.0
+BLOCK_COOLDOWN_SECONDS = 1800.0  # minimum pause after a 403 wall (429 uses the configured cooldown)
+IP_BLOCK_COOLDOWN_SECONDS = 3600.0  # "This IP has been automatically blocked" lasts hours
 MODE_SAPI = "sapi"
 MODE_HTML = "html"
 
@@ -101,7 +103,7 @@ _AREA_ID_RE = re.compile(r'"areaId"\s*:\s*(\d+)')
 _PLAIN_PRICE_RE = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?$")
 _BLOCK_RE = re.compile(
     r"ip has been automatically blocked|your request has been blocked|blocks-[a-z0-9.]*@craigslist"
-    r"|<title>\s*access denied\s*</title>|captcha",
+    r"|<title>\s*access denied\s*</title>|\bcaptcha\b",
     re.I,
 )
 _COUNTRY_CURRENCY = {
@@ -230,14 +232,21 @@ def extract_area_id(page: str) -> int | None:
 # --------------------------------------------------------------------------- pure helpers
 
 
+def block_cooldown(reason: str, configured: float) -> float | None:
+    """Cooldown for a block: rate limits use the configured pause, walls 30-60 min at least."""
+    if reason == "http_429":
+        return None
+    floor = IP_BLOCK_COOLDOWN_SECONDS if "blocked" in reason or "blocks-" in reason else BLOCK_COOLDOWN_SECONDS
+    return max(configured, floor)
+
+
 def detect_block(status: int, body: str | None) -> str | None:
     """Short reason when a response is a block wall, else ``None``."""
+    match = _BLOCK_RE.search(body[:200_000]) if body else None
+    if match:
+        return f"wall:{match.group(0).strip().lower()[:40]}"
     if status in (403, 429):
         return f"http_{status}"
-    if body:
-        match = _BLOCK_RE.search(body[:200_000])
-        if match:
-            return f"wall:{match.group(0).strip().lower()[:40]}"
     return None
 
 
@@ -810,7 +819,9 @@ class CraigslistIngestor(BaseIngestor):
             except SourceBlocked as exc:
                 if results:
                     self._deferred_block = exc
-                    self.log.warning("blocked mid-poll; returning partial results", extra={"source": self.name, "error": str(exc)})
+                    self.log.warning(
+                        "blocked mid-poll; returning partial results", extra={"source": self.name, "error": str(exc)}
+                    )
                     break
                 raise
             except asyncio.TimeoutError as exc:
@@ -882,7 +893,9 @@ class CraigslistIngestor(BaseIngestor):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - reference data is an optimisation, never fatal
-            self.log.warning("craigslist reference fetch failed", extra={"source": self.name, "table": name, "error": repr(exc)[:300]})
+            self.log.warning(
+                "craigslist reference fetch failed", extra={"source": self.name, "table": name, "error": repr(exc)[:300]}
+            )
             return {}
 
     # ------------------------------------------------------------------ search modes
@@ -912,7 +925,10 @@ class CraigslistIngestor(BaseIngestor):
             except Exception as exc:  # noqa: BLE001 - try the other mode
                 last_error = exc
                 self._m_queries.inc(mode=mode, outcome="error")
-                self.log.debug("craigslist mode failed", extra={"mode": mode, "query": task.term, "site": site, "error": repr(exc)[:300]})
+                self.log.debug(
+                    "craigslist mode failed",
+                    extra={"mode": mode, "query": task.term, "site": site, "error": repr(exc)[:300]},
+                )
                 continue
             self._m_queries.inc(mode=mode, outcome="ok")
             if len(modes) > 1 and mode != self._preferred:
@@ -967,7 +983,7 @@ class CraigslistIngestor(BaseIngestor):
         except ValueError:
             reason = detect_block(resp.status, body)
             if reason is not None:
-                raise SourceBlocked(f"craigslist search API blocked ({reason})") from None
+                raise self._blocked(f"craigslist search API blocked ({reason})", reason) from None
             raise CraigslistParseError(f"non-JSON search API response ({len(body)} bytes)") from None
         stats: dict[str, int] = {}
         listings = await asyncio.to_thread(decode_search_response, payload, self._context(site, task), stats=stats)
@@ -987,14 +1003,18 @@ class CraigslistIngestor(BaseIngestor):
             area_id = extract_area_id(body)
             if area_id is not None:
                 self._areas[site] = AreaInfo(area_id=area_id, hostname=site)
-                self.log.info("craigslist area id learned from page", extra={"source": self.name, "site": site, "area_id": area_id})
+                self.log.info(
+                    "craigslist area id learned from page", extra={"source": self.name, "site": site, "area_id": area_id}
+                )
         stats: dict[str, int] = {}
         try:
-            listings = await asyncio.to_thread(parse_search_html, body, self._context(site, task), base_url=site_base, stats=stats)
+            listings = await asyncio.to_thread(
+                parse_search_html, body, self._context(site, task), base_url=site_base, stats=stats
+            )
         except CraigslistParseError:
             reason = detect_block(resp.status, body)
             if reason is not None:
-                raise SourceBlocked(f"craigslist search page blocked ({reason})") from None
+                raise self._blocked(f"craigslist search page blocked ({reason})", reason) from None
             raise
         self._record_skips(stats)
         return listings
@@ -1022,8 +1042,11 @@ class CraigslistIngestor(BaseIngestor):
         except HttpStatusError as exc:
             reason = detect_block(exc.status, exc.body if exc.status in (401, 403, 429) else None)
             if reason is not None:
-                raise SourceBlocked(f"craigslist {urlsplit(url).hostname} blocked ({reason})") from exc
+                raise self._blocked(f"craigslist {urlsplit(url).hostname} blocked ({reason})", reason) from exc
             raise
+
+    def _blocked(self, message: str, reason: str) -> SourceBlocked:
+        return SourceBlocked(message, cooldown_seconds=block_cooldown(reason, self.cfg.cooldown_seconds))
 
     def _record_skips(self, stats: Mapping[str, int]) -> None:
         for reason, count in stats.items():
@@ -1040,6 +1063,7 @@ __all__ = [
     "SAPI_ORIGIN",
     "SAPI_SEARCH_PATH",
     "SearchTask",
+    "block_cooldown",
     "build_tasks",
     "coerce_price",
     "decode_compact_item",
