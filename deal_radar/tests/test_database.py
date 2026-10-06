@@ -976,6 +976,73 @@ async def test_recorder_stop_timeout_drops_inflight_and_queued() -> None:
     assert recorder.pending == 0
 
 
+async def test_recorder_stop_timeout_counts_inflight_alerts_of_a_mixed_batch() -> None:
+    fake, metrics = FakeDB(block=True), Metrics()
+    recorder = Recorder(fake, batch_size=3, flush_seconds=60.0, metrics=metrics)  # type: ignore[arg-type]
+    await recorder.start()
+    alert = make_alert(make_item("mix"))
+    recorder.record(snap(1))
+    recorder.record(snap(2))
+    recorder.record_alert(alert, make_report(alert))  # fills the batch: 2 snapshots + 1 alert in flight
+    await wait_until(lambda: fake.calls == 1)
+    await recorder.stop(timeout=0.1)
+    dropped = metrics.counter("db_records_dropped_total", labelnames=("kind", "reason"))
+    assert dropped.value(kind="snapshot", reason="cancelled") == 2
+    assert dropped.value(kind="alert", reason="cancelled") == 1  # used to vanish uncounted
+
+
+class PoisonDB(FakeDB):
+    """Rejects every batch that contains a poison record, like a constraint/encoding error would."""
+
+    def __init__(self, poison: set[str], error: Exception, *, outage_after: int | None = None) -> None:
+        super().__init__()
+        self.poison = poison
+        self.error = error
+        self.outage_after = outage_after  # calls after which the database "goes away"
+
+    async def write_snapshots(self, records: Sequence[SnapshotRecord]) -> None:
+        self.calls += 1
+        if self.outage_after is not None and self.calls > self.outage_after:
+            raise ConnectionRefusedError("database went away")
+        if any(r.item.source_id in self.poison for r in records):
+            raise self.error
+        self.snapshot_batches.append(list(records))
+
+
+async def test_recorder_isolates_poison_records_instead_of_dropping_the_batch(caplog: pytest.LogCaptureFixture) -> None:
+    error = sa_exc.IntegrityError("INSERT INTO listings ...", {}, Exception("NOT NULL constraint failed"))
+    fake, metrics = PoisonDB({"r3", "r6"}, error), Metrics()
+    recorder = Recorder(fake, batch_size=8, flush_seconds=60.0, metrics=metrics, retry_delay=0.0)  # type: ignore[arg-type]
+    await recorder.start()
+    with caplog.at_level(logging.WARNING, logger="deal_radar.db"):
+        for i in range(8):
+            recorder.record(snap(i))
+        await recorder.stop()
+    written = sorted(r.item.source_id for b in fake.snapshot_batches for r in b)
+    assert written == ["r0", "r1", "r2", "r4", "r5", "r7"]
+    dropped = metrics.counter("db_records_dropped_total", labelnames=("kind", "reason"))
+    assert dropped.value(kind="snapshot", reason="write_error") == 2
+    assert metrics.counter("db_records_written_total", labelnames=("kind",)).value(kind="snapshot") == 6
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "isolated" in errors[0].getMessage()
+    assert errors[0].__dict__["dropped"] == 2 and errors[0].__dict__["written"] == 6
+    assert fake.calls <= 2 + 2 * 8  # retry + bounded bisection
+
+
+async def test_recorder_stops_isolating_when_the_database_goes_away() -> None:
+    error = sa_exc.DataError("INSERT ...", {}, Exception("invalid byte sequence"))
+    fake, metrics = PoisonDB({"r1"}, error, outage_after=2), Metrics()
+    recorder = Recorder(fake, batch_size=8, flush_seconds=60.0, metrics=metrics, retry_delay=0.0)  # type: ignore[arg-type]
+    await recorder.start()
+    for i in range(8):
+        recorder.record(snap(i))
+    await recorder.stop()
+    assert fake.calls == 3  # attempt, retry, first half hits the outage -> stop bisecting
+    assert fake.snapshot_batches == []
+    dropped = metrics.counter("db_records_dropped_total", labelnames=("kind", "reason"))
+    assert dropped.value(kind="snapshot", reason="write_error") == 8
+
+
 async def test_recorder_with_real_database(db: Database) -> None:
     recorder = Recorder(db, batch_size=2, flush_seconds=0.05)
     await recorder.start()

@@ -425,6 +425,9 @@ class BrowserSection(Strict):
 
 class FbMarketplaceSource(SourceCommon):
     poll_interval_seconds: float = Field(default=240.0, gt=0)
+    # Searches are deliberately slow and sequential (≈10-15 s each plus human pauses);
+    # the ingestor rotates a cursor across polls when a sweep does not fit.
+    poll_timeout_seconds: float = Field(default=600.0, gt=0)
     reliability: float = Field(default=0.7, ge=0, le=1)
     cooldown_seconds: float = Field(default=1800.0, gt=0)
     max_item_age_minutes: OptFloat = 1440.0
@@ -444,6 +447,7 @@ class FbMarketplaceSource(SourceCommon):
 
 class OfferUpSource(SourceCommon):
     poll_interval_seconds: float = Field(default=180.0, gt=0)
+    poll_timeout_seconds: float = Field(default=120.0, gt=0)  # ~20 terms at the 0.3 rps host budget
     reliability: float = Field(default=0.7, ge=0, le=1)
     max_item_age_minutes: OptFloat = 1440.0
     latitude: OptFloat = None
@@ -461,6 +465,7 @@ class OfferUpSource(SourceCommon):
 
 class CraigslistSource(SourceCommon):
     poll_interval_seconds: float = Field(default=300.0, gt=0)
+    poll_timeout_seconds: float = Field(default=120.0, gt=0)
     reliability: float = Field(default=0.65, ge=0, le=1)
     max_item_age_minutes: OptFloat = 1440.0
     sites: list[str] = Field(default_factory=list)  # e.g. ["sfbay", "losangeles"]

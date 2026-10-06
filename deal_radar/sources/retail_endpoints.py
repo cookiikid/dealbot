@@ -396,6 +396,11 @@ def _dedupe(urls: Iterable[str | None], limit: int = MAX_IMAGES) -> list[str]:
     return out
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    """``value`` when it is a JSON object, else an empty mapping (shape drift tolerance)."""
+    return value if isinstance(value, Mapping) else {}
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -834,12 +839,12 @@ def parse_redsky_summaries(payload: Any, endpoint: TargetEndpoint, on_skip: Skip
             on_skip("not_an_object", "")
             continue
         tcin = _item_id(summary.get("tcin"))
-        item = summary.get("item") if isinstance(summary.get("item"), Mapping) else {}
+        item = _mapping(summary.get("item"))
         title = _text(resolve_path(item, "product_description.title"))
         if not tcin or not title:
             on_skip("missing_id_or_title", tcin)
             continue
-        price_block = summary.get("price") if isinstance(summary.get("price"), Mapping) else {}
+        price_block = _mapping(summary.get("price"))
         price: float | str | None = to_float(price_block.get("current_retail"))
         if price is None:
             price = to_float(price_block.get("current_retail_min"))
@@ -897,7 +902,7 @@ def newegg_product_url(item: str) -> str:
 
 
 def _newegg_images(main: Mapping[str, Any]) -> list[str]:
-    image = main.get("Image") if isinstance(main.get("Image"), Mapping) else {}
+    image = _mapping(main.get("Image"))
     pattern = NEWEGG_IMAGE_PATTERN
     patterns = image.get("ImagePathPattern")
     if isinstance(patterns, list):
@@ -957,7 +962,7 @@ def parse_newegg_realtime(payload: Any, endpoint: NeweggEndpoint, on_skip: SkipF
         in_stock = None
     if payload.get("IsForceDeactiveItem") is True:
         in_stock = False
-    feature = main.get("Feature") if isinstance(main.get("Feature"), Mapping) else {}
+    feature = _mapping(main.get("Feature"))
     if feature.get("IsOpenBoxed") is True:
         condition = "Open Box"
     elif feature.get("IsRefurbished") is True:
