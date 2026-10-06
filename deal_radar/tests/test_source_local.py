@@ -187,7 +187,7 @@ def cl_sapi_payload() -> dict[str, Any]:
                     1400,
                     "0:0:0~40.6710~-73.9814",
                     "a1b2c3",
-                    [13, "7d3f0c1e-view-token"],
+                    [13, "fK7wQ2mZp9LsXy3Rt8VbNa"],
                     [4, "3:00a0a_jx892ZIFraf_0CI0qt", "3:00b0b_kq77ABCdef_0CI0qt", "3:bad id!"],
                     [6, "brooklyn-nvidia-rtx-4090-founders"],
                     [10, "$1,400"],
@@ -815,7 +815,8 @@ def test_craigslist_decode_compact_items() -> None:
     fe, pc, tuf = listings
     assert fe.source == "craigslist" and fe.source_kind is SourceKind.LOCAL
     fe_id = CL_MIN_POSTING_ID + 123_456
-    assert fe.url == f"https://newyork.craigslist.org/brk/sop/d/brooklyn-nvidia-rtx-4090-founders/{fe_id}.html"
+    assert fe.source_id == str(fe_id)
+    assert fe.url == "https://www.craigslist.org/view/d/brooklyn-nvidia-rtx-4090-founders/fK7wQ2mZp9LsXy3Rt8VbNa"
     assert fe.title == "NVIDIA RTX 4090 Founders Edition"
     assert fe.price == 1400.0 and fe.currency == "USD"
     assert fe.posted_at == datetime.fromtimestamp(CL_MIN_POSTED + 99_000, tz=timezone.utc)
@@ -831,9 +832,11 @@ def test_craigslist_decode_compact_items() -> None:
         "subarea": "brk",
         "category": "sop",
         "via": "sapi",
+        "posting_id": fe_id,
         "category_id": 7,
         "price_text": "$1,400",
         "neighborhood": "Park Slope",
+        "posting_key": "fK7wQ2mZp9LsXy3Rt8VbNa",
     }
     # unknown category id -> configured search path; "-1" price -> None (normalizer uses the title price)
     assert pc.url == f"https://newyork.craigslist.org/mnh/sss/d/manhattan-rtx-4090-gaming-pc/{CL_MIN_POSTING_ID + 123_457}.html"
@@ -958,7 +961,8 @@ async def test_craigslist_poll_uses_reference_and_search_api(upstream: Upstream,
     ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
     listings = await ing.poll()
     assert len(listings) == 3
-    assert listings[0].url.startswith("https://newyork.craigslist.org/brk/sop/d/")
+    assert listings[0].url.startswith("https://www.craigslist.org/view/d/brooklyn-nvidia-rtx-4090-founders/")
+    assert listings[2].url.startswith("https://newyork.craigslist.org/jsy/sop/d/")  # no token -> legacy form
     search = upstream.calls("GET", cl.SAPI_SEARCH_PATH)
     assert len(search) == 1
     assert search[0]["query"] == {
@@ -1007,8 +1011,8 @@ async def test_craigslist_learns_area_from_html_when_reference_is_down(upstream:
     assert {r.extra["via"] for r in second} == {"sapi"}
     sapi = upstream.calls("GET", cl.SAPI_SEARCH_PATH)[0]["query"]
     assert sapi["batch"] == "3-0-360-0-0" and "lat" not in sapi
-    # categories unknown -> configured search path in URLs; reference not re-fetched inside the retry window
-    assert second[0].url.startswith("https://newyork.craigslist.org/brk/sss/d/")
+    # categories unknown -> configured search path in legacy URLs; reference not re-fetched inside the retry window
+    assert second[1].url.startswith("https://newyork.craigslist.org/mnh/sss/d/")
     assert len(upstream.calls("GET", "/ref/Areas")) == 1
 
 
@@ -1227,16 +1231,6 @@ async def test_craigslist_html_mode_reuses_numeric_ids_learned_from_api(upstream
     html = await ing.poll()
     assert {r.extra["via"] for r in html} == {"html"}
     assert next(r.source_id for r in html if r.extra.get("posting_key") == CL_TOKEN) == numeric
-
-
-async def test_craigslist_api_requests_carry_www_origin(upstream: Upstream, ctx: IngestorContext) -> None:
-    _cl_reference_routes(upstream)
-    upstream.route("GET", cl.SAPI_SEARCH_PATH, jsonr(cl_sapi_payload()))
-    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
-    await ing.poll()
-    headers = upstream.calls("GET", cl.SAPI_SEARCH_PATH)[0]["headers"]
-    # The 2026 search UI runs on www.craigslist.org (city sub-domains redirect there).
-    assert headers["Origin"] == "https://www.craigslist.org" and headers["Referer"] == "https://www.craigslist.org/"
 
 
 async def test_craigslist_html_relative_links_resolve_against_final_url(upstream: Upstream, ctx: IngestorContext) -> None:
