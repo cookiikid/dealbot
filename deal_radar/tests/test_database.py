@@ -14,6 +14,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from datetime import datetime, timedelta, timezone
@@ -1119,6 +1120,40 @@ async def test_connect_redis_returns_pooled_bytes_client(redis_server_url: str) 
         assert kwargs.get("decode_responses", False) is False
     finally:
         await client.aclose()
+
+
+async def test_connect_redis_over_unix_socket() -> None:
+    """``unix://`` URLs are allowed by the config; TCP-only options must not be passed for them."""
+    if not os.path.exists(REDIS_SERVER):
+        pytest.skip("redis-server binary not available")
+    sock_dir = tempfile.mkdtemp(prefix="drrs")  # short path: AF_UNIX paths are limited to ~100 bytes
+    sock = os.path.join(sock_dir, "redis.sock")
+    proc = subprocess.Popen(
+        [REDIS_SERVER, "--port", "0", "--unixsocket", sock, "--save", "", "--appendonly", "no", "--dir", sock_dir],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not os.path.exists(sock):
+            if proc.poll() is not None or time.monotonic() > deadline:
+                pytest.skip("redis-server failed to start")
+            await asyncio.sleep(0.02)
+        client = await connect_redis(f"unix://{sock}?db=0", max_connections=4, socket_timeout=1.0)
+        try:
+            await client.set("dr:unix", "1")
+            assert await client.get("dr:unix") == b"1"
+            assert client.connection_pool.max_connections == 4
+        finally:
+            await client.aclose()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(sock_dir, ignore_errors=True)
 
 
 async def test_connect_redis_raises_when_unreachable() -> None:

@@ -71,6 +71,7 @@ Performance design
 
 from __future__ import annotations
 
+import functools
 import re
 import time
 from collections.abc import Iterable, Iterator, Sequence
@@ -467,6 +468,7 @@ def _required(items: Sequence[tuple[Any, Any]], aligned: bool = False) -> set[st
     return best
 
 
+@functools.lru_cache(maxsize=4096)
 def _literal_anchors(pattern: str) -> frozenset[str] | None:
     """Gate-form anchors one of which occurs in every match of ``pattern``, else ``None``."""
     if _C is None or _sre_p is None:
@@ -705,9 +707,13 @@ class _Identification:
 
 
 class TextFilter:
-    """Deterministic, precompiled text classifier (see the module docstring for semantics)."""
+    """Deterministic, precompiled text classifier (see the module docstring for semantics).
 
-    def __init__(self, config: AppConfig) -> None:
+    ``literal_gate=False`` disables the anchor gate (every pattern set always runs).
+    Results are identical either way; the switch exists for verification and debugging.
+    """
+
+    def __init__(self, config: AppConfig, *, literal_gate: bool = True) -> None:
         self.config = config
         filters = config.filters
         self._min_title = filters.min_title_length
@@ -744,6 +750,9 @@ class TextFilter:
         pattern_sets = [(g.patterns, g.on_title) for g in self._groups]
         for cp in self._profiles:
             pattern_sets.extend(cp.pattern_sets())
+        if not literal_gate:
+            for ps, _ in pattern_sets:
+                ps.anchors = None
         self._title_gate = _AnchorGate(ps for ps, on_title in pattern_sets if on_title)
         self._text_gate = _AnchorGate(ps for ps, on_title in pattern_sets if not on_title)
         log.debug(
