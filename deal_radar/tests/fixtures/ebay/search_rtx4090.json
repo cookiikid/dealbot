@@ -1,0 +1,153 @@
+{
+  "href": "https://api.ebay.com/buy/browse/v1/item_summary/search?q=rtx+4090&category_ids=27386&filter=price%3A%5B450..1950%5D%2CpriceCurrency%3AUSD%2CbuyingOptions%3A%7BFIXED_PRICE%7CBEST_OFFER%7D&sort=newlyListed&limit=8&offset=0&fieldgroups=MATCHING_ITEMS%2CEXTENDED",
+  "total": 1187,
+  "next": "https://api.ebay.com/buy/browse/v1/item_summary/search?q=rtx+4090&category_ids=27386&filter=price%3A%5B450..1950%5D%2CpriceCurrency%3AUSD%2CbuyingOptions%3A%7BFIXED_PRICE%7CBEST_OFFER%7D&sort=newlyListed&limit=8&offset=8&fieldgroups=MATCHING_ITEMS%2CEXTENDED",
+  "limit": 8,
+  "offset": 0,
+  "itemSummaries": [
+    {
+      "itemId": "v1|226512345678|0",
+      "title": "NVIDIA GeForce RTX 4090 Founders Edition 24GB GDDR6X - Excellent, never mined",
+      "leafCategoryIds": ["27386"],
+      "categories": [
+        {"categoryId": "27386", "categoryName": "Graphics/Video Cards"},
+        {"categoryId": "175673", "categoryName": "Computer Components & Parts"}
+      ],
+      "image": {"imageUrl": "https://i.ebayimg.com/thumbs/images/g/7pIAAOSwJk1lRj1v/s-l225.jpg"},
+      "price": {"value": "1349.99", "currency": "USD"},
+      "itemHref": "https://api.ebay.com/buy/browse/v1/item/v1%7C226512345678%7C0",
+      "seller": {"username": "gpu_flipper_tx", "feedbackPercentage": "99.6", "feedbackScore": 1532},
+      "condition": "Used",
+      "conditionId": "3000",
+      "thumbnailImages": [{"imageUrl": "https://i.ebayimg.com/images/g/7pIAAOSwJk1lRj1v/s-l1600.jpg"}],
+      "additionalImages": [
+        {"imageUrl": "https://i.ebayimg.com/thumbs/images/g/Qa8AAOSwbXNlRj1x/s-l225.jpg"},
+        {"imageUrl": "https://i.ebayimg.com/thumbs/images/g/zZ0AAOSw3vRlRj1z/s-l225.jpg"}
+      ],
+      "shippingOptions": [
+        {"shippingCostType": "FIXED", "shippingCost": {"value": "0.00", "currency": "USD"},
+         "minEstimatedDeliveryDate": "2026-10-09T07:00:00.000Z", "maxEstimatedDeliveryDate": "2026-10-13T07:00:00.000Z"}
+      ],
+      "buyingOptions": ["FIXED_PRICE", "BEST_OFFER"],
+      "itemWebUrl": "https://www.ebay.com/itm/226512345678?_skw=rtx+4090&hash=item34bd2f5a4e:g:7pIAAOSwJk1lRj1v&amdata=enc%3AAQAJAAAA4A",
+      "itemLocation": {"city": "Austin", "stateOrProvince": "Texas", "postalCode": "787**", "country": "US"},
+      "shortDescription": "Card works perfectly, original box included. Never used for mining.",
+      "adultOnly": false,
+      "legacyItemId": "226512345678",
+      "availableCoupons": false,
+      "itemOriginDate": "2026-10-06T14:02:11.000Z",
+      "itemCreationDate": "2026-10-06T14:02:11.000Z",
+      "topRatedBuyingExperience": false,
+      "priorityListing": false,
+      "listingMarketplaceId": "EBAY_US"
+    },
+    {
+      "itemId": "v1|388765432101|0",
+      "title": "ASUS ROG Strix GeForce RTX 4090 OC 24GB Graphics Card NEW SEALED",
+      "leafCategoryIds": ["27386"],
+      "categories": [{"categoryId": "27386", "categoryName": "Graphics/Video Cards"}],
+      "image": {"imageUrl": "https://i.ebayimg.com/thumbs/images/g/kLMAAOSwq1dlRk2a/s-l225.jpg"},
+      "price": {"value": "1799.00", "currency": "USD"},
+      "seller": {"username": "techdeals_outlet", "feedbackPercentage": "100.0", "feedbackScore": 48211},
+      "marketingPrice": {
+        "originalPrice": {"value": "1999.99", "currency": "USD"},
+        "discountPercentage": "10",
+        "discountAmount": {"value": "200.99", "currency": "USD"},
+        "priceTreatment": "LIST_PRICE"
+      },
+      "condition": "New",
+      "conditionId": "1000",
+      "thumbnailImages": [{"imageUrl": "https://i.ebayimg.com/images/g/kLMAAOSwq1dlRk2a/s-l1600.jpg"}],
+      "shippingOptions": [
+        {"shippingCostType": "FIXED", "shippingCost": {"value": "39.99", "currency": "USD"}},
+        {"shippingCostType": "CALCULATED", "shippingCost": {"value": "24.35", "currency": "USD"}}
+      ],
+      "buyingOptions": ["FIXED_PRICE"],
+      "itemAffiliateWebUrl": "https://www.ebay.com/itm/388765432101?mkevt=1&mkcid=1&mkrid=711-53200-19255-0&campid=5338123456&toolid=10049&customid=",
+      "itemWebUrl": "https://www.ebay.com/itm/388765432101?hash=item5a8b1c2d3e:g:kLMAAOSwq1dlRk2a",
+      "itemLocation": {"city": "Edison", "stateOrProvince": "New Jersey", "postalCode": "088**", "country": "US"},
+      "legacyItemId": "388765432101",
+      "itemOriginDate": "2026-10-06T13:58:40.000Z",
+      "itemCreationDate": "2026-10-06T13:58:40.000Z",
+      "topRatedBuyingExperience": true,
+      "priorityListing": false,
+      "epid": "18064393842",
+      "listingMarketplaceId": "EBAY_US"
+    },
+    {
+      "itemId": "v1|134998877665|0",
+      "title": "MSI GeForce RTX 4090 Suprim X 24GB - NO RESERVE",
+      "leafCategoryIds": ["27386"],
+      "image": {"imageUrl": "https://i.ebayimg.com/thumbs/images/g/uVwAAOSwXyZlRk9c/s-l225.jpg"},
+      "price": {"value": "610.00", "currency": "USD"},
+      "currentBidPrice": {"value": "610.00", "currency": "USD"},
+      "bidCount": 7,
+      "seller": {"username": "weekend_auctions", "feedbackPercentage": "98.9", "feedbackScore": 312},
+      "condition": "Used",
+      "conditionId": "3000",
+      "shippingOptions": [{"shippingCostType": "FIXED", "shippingCost": {"value": "15.00", "currency": "USD"}}],
+      "buyingOptions": ["AUCTION"],
+      "itemEndDate": "2026-10-11T02:15:00.000Z",
+      "itemWebUrl": "https://www.ebay.com/itm/134998877665",
+      "itemLocation": {"postalCode": "606**", "country": "US"},
+      "legacyItemId": "134998877665",
+      "itemOriginDate": "2026-10-06T13:55:02.000Z",
+      "itemCreationDate": "2026-10-06T13:55:02.000Z"
+    },
+    {
+      "itemId": "v1|405566778899|0",
+      "title": "Gigabyte RTX 4090 Gaming OC 24G - Auction with Buy It Now",
+      "leafCategoryIds": ["27386"],
+      "image": {"imageUrl": "https://i.ebayimg.com/thumbs/images/g/aBcAAOSwHqRlRkAb/s-l225.jpg"},
+      "price": {"value": "1450.00", "currency": "USD"},
+      "currentBidPrice": {"value": "900.00", "currency": "USD"},
+      "bidCount": 0,
+      "seller": {"username": "pc_parts_depot", "feedbackPercentage": "99.1", "feedbackScore": 2210},
+      "condition": "Used",
+      "conditionId": "3000",
+      "shippingOptions": [{"shippingCostType": "FIXED", "shippingCost": {"value": "12.50", "currency": "USD"}}],
+      "buyingOptions": ["AUCTION", "FIXED_PRICE"],
+      "itemEndDate": "2026-10-13T18:00:00.000Z",
+      "itemWebUrl": "https://www.ebay.com/itm/405566778899",
+      "itemLocation": {"postalCode": "300**", "country": "US"},
+      "legacyItemId": "405566778899",
+      "itemOriginDate": "2026-10-06T13:50:44.000Z",
+      "itemCreationDate": "2026-10-06T13:50:44.000Z"
+    },
+    {
+      "itemId": "v1|296677889900|0",
+      "title": "Zotac Gaming GeForce RTX 4090 Trinity OC 24GB",
+      "leafCategoryIds": ["27386"],
+      "price": {"value": "1525.00", "currency": "USD"},
+      "seller": {"username": "zz_relister", "feedbackPercentage": "97.5", "feedbackScore": "3"},
+      "condition": "Used",
+      "shippingOptions": [{"shippingCostType": "CALCULATED"}],
+      "buyingOptions": ["FIXED_PRICE", "BEST_OFFER"],
+      "itemWebUrl": "https://www.ebay.com/itm/296677889900",
+      "itemLocation": {"postalCode": "981**", "country": "US"},
+      "legacyItemId": "296677889900",
+      "itemOriginDate": "2026-09-28T09:12:00.000Z",
+      "itemCreationDate": "2026-10-06T13:47:30.000Z"
+    },
+    {
+      "itemId": "v1|177788990011|0",
+      "title": "RTX 4090 graphics card - contact for price",
+      "leafCategoryIds": ["27386"],
+      "condition": "Used",
+      "conditionId": "3000",
+      "buyingOptions": ["FIXED_PRICE"],
+      "itemWebUrl": "https://www.ebay.com/itm/177788990011",
+      "legacyItemId": "177788990011",
+      "itemOriginDate": "2026-10-06T13:45:00.000Z",
+      "itemCreationDate": "2026-10-06T13:45:00.000Z"
+    },
+    {
+      "title": "Broken summary without an itemId",
+      "price": {"value": "999.00", "currency": "USD"},
+      "buyingOptions": ["FIXED_PRICE"],
+      "itemOriginDate": "2026-10-06T13:44:00.000Z",
+      "itemCreationDate": "2026-10-06T13:44:00.000Z"
+    },
+    "not-an-object"
+  ]
+}
