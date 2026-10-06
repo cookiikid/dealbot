@@ -302,7 +302,8 @@ filters:
       patterns:
         - '\brent(?:al|als|ing)\b'
         - '^\W*rent\b'
-        - '\brent\s+(?:my|our|a|an|this|these|it|out|by|per|one|your|gpus?|cards?|rigs?|servers?|compute)\b'
+        # "rent my 4090" - not "money for rent this month", "pay rent", "my rent"
+        - '\brent(?<!\bfor\srent)(?<!\bpay\srent)(?<!\bpaying\srent)(?<!\bmy\srent)(?<!\bthe\srent)\s+(?:my|our|a|an|it|out|by|per|one|your|gpus?|cards?|rigs?|servers?|compute)\b'
         # "for rent" - not "money for rent", "pay for rent"
         - '\bfor(?<!\bmoney\sfor)(?<!\bcash\sfor)(?<!\bpay\sfor)(?<!\bpaying\sfor)\s+rent\b'
         - '\bfor\s+lease\b|\bleasing\b|\blease\s+(?:my|a|an|this|it|out|per)\b'
@@ -324,6 +325,8 @@ filters:
         - '^\W*(?:wtb|wtt|iso|lf|lfm|looking\s+(?:for|to\s+buy)|in\s+search\s+of|searching\s+for|seeking|want(?:ed|ing)?\s+to\s+buy|wanted\b(?!\s+gone)|want\b(?!\s+(?:to\s+sell|gone|it\s+gone))|buying\b|need\b(?!\s+(?:gone|it\s+gone|cash|money|to\s+sell|sold)))'
         - '\b(?:wtb|iso)\b(?!\s*:?\s*\d)'
         - '\blooking\s+to\s+buy\b|\bpaying\s+(?:top|cash|good|fair)\b'
+        # trade requests ("4090 trade for 5090"); "open to trades" on a sale listing is fine
+        - '\b(?:trade|trading|swap|swapping)\s+(?:for|towards?)\b'
         # r/hardwareswap: [H] money [W] item, or [W] a GPU
         - '\[\s*h\s*\]\s*(?:pay\s*pal|paypal|cash|local\s+cash|venmo|zelle|money|\$)'
         - '\[\s*w\s*\]\s*(?:an?\s+)?(?:nvidia\s+)?(?:rtx|gtx|geforce|rx|radeon|lg|oled|sony|steam\s+deck)\b'
@@ -338,6 +341,9 @@ filters:
         - '\b(?:replica|dummy|mock[\s-]?up|prop|toy|keychain|key\s+chain|figurine|t-?shirt|mug|miniature|scale\s+model)\b'
         # a title that ENDS with a part name and lists nothing else ("RTX 4090 FE shroud")
         - '^(?!.*(?:\bwith\b|\bw/|\bincl|\band\b|\bplus\b|\binstalled\b|[+&,]))[^\n]*\b(?:shroud|backplate|back\s*plate|heat\s*sink|t-?con(?:\s+board)?|main\s*board|power\s+board)\W*$'
+        # accessory-only nouns anywhere in a title that bundles nothing ("RTX 4090 anti-sag bracket",
+        # "12VHPWR cable RTX 4090", "LG C4 65 remote control"); "with"/"+"/"incl"/"new" titles are bundles
+        - '^(?!.*(?:\bwith\b|\bw/|\bincl|\band\b|\bplus\b|\binstalled\b|\breplaced\b|\bnew\b|[+&]))[^\n]*\b(?:anti[\s-]?sag|gpu\s+(?:support|holder|brace)|support\s+bracket|sag\s+bracket|(?:12vhpwr|12v-2x6|16[\s-]?pin|pcie)\s+(?:power\s+)?(?:cable|adapter|connector|extension)s?|thermal\s+(?:pads?|paste|putty)|power\s+supply\s+board|psu\s+board|t-?con\s+board|main\s*board|mainboard|logic\s+board|led\s+(?:strip|bar)s?|backlight\s+strips?|screen\s+protectors?|carrying\s+case|protective\s+case|silicone\s+case|magic\s+remote|remote\s+control|tv\s+stand|wall\s+mount|stand\s+legs)\b'
     sold_marker:
       action: reject
       field: title
@@ -603,7 +609,7 @@ profiles:
       any:
         - '\brtx\s*-?\s*5090\b'
         - '\bgeforce\s+(?:rtx\s*)?5090\b'
-        - '(?<![\w.$/#,-])5090(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
+        - '(?<![\w.$/#,-])5090s?(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
         - '(?<![\w.$/#,-])5090\s*(?:fe|founders|32\s*gb|gaming|oc|astral|tuf|suprim|vanguard|ventus|gaming\s*trio|aorus|master|windforce|solid|amp|gamerock|phantom|ichill|x3|liquid|prime|inspire)\b'
       none:
         - '\b5090\s*-?\s*d(?:d|\s*v2)?\b'
@@ -611,6 +617,7 @@ profiles:
         - '\b(?:optiplex|precision|latitude|vostro|inspiron|thinkcentre|thinkpad|elitedesk|prodesk|elitebook|probook)\b'
         # a different GPU model named in the same title -> ambiguous (comparisons, trades, upgrades)
         - '\b(?:rtx|gtx|geforce|rx|radeon|arc)\s*-?\s*(?!5090\b)[a-z]?\d{3,4}\b'
+        - '(?<![\w.$/#,-])(?:3090|4090)s?(?!\w)'
     price:
       reference_new: 2399
       reference_used: 2150
@@ -632,7 +639,7 @@ profiles:
       any:
         - '\brtx\s*-?\s*4090\b'
         - '\bgeforce\s+(?:rtx\s*)?4090\b'
-        - '(?<![\w.$/#,-])4090(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
+        - '(?<![\w.$/#,-])4090s?(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
         - '(?<![\w.$/#,-])4090\s*(?:fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|gamerock|phantom|windforce|aero|master|ichill|x3|ventus|amp|xlr8|verto)\b'
       none:
         - '\b4090\s*-?\s*d(?:d|\s*v2)?\b'
@@ -640,6 +647,7 @@ profiles:
         - '\b(?:optiplex|precision|latitude|vostro|inspiron|thinkcentre|thinkpad|elitedesk|prodesk|elitebook|probook)\b'
         # a different GPU model named in the same title -> ambiguous (comparisons, trades, upgrades)
         - '\b(?:rtx|gtx|geforce|rx|radeon|arc)\s*-?\s*(?!4090\b)[a-z]?\d{3,4}\b'
+        - '(?<![\w.$/#,-])(?:3090|5090)s?(?!\w)'
     price:
       reference_new: 2199
       reference_used: 1750
@@ -661,7 +669,7 @@ profiles:
       any:
         - '\brtx\s*-?\s*3090\b'
         - '\bgeforce\s+(?:rtx\s*)?3090\b'
-        - '(?<![\w.$/#,-])3090(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
+        - '(?<![\w.$/#,-])3090s?(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
         - '(?<![\w.$/#,-])3090\s*(?:ti|fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|ftw3|xc3|ventus|eagle|vision|master|zotac|kingpin|hydro)\b'
         - '\b(?:rtx\s*-?\s*)?3090\s*-?\s*ti\b'
       none:
@@ -670,6 +678,7 @@ profiles:
         - '\b(?:optiplex|precision|latitude|vostro|inspiron|thinkcentre|thinkpad|elitedesk|prodesk|elitebook|probook)\b'
         # a different GPU model named in the same title -> ambiguous (comparisons, trades, upgrades)
         - '\b(?:rtx|gtx|geforce|rx|radeon|arc)\s*-?\s*(?!3090\b)[a-z]?\d{3,4}\b'
+        - '(?<![\w.$/#,-])(?:4090|5090)s?(?!\w)'
     variants:
       - id: ti
         match: ['\b3090\s*-?\s*ti\b']

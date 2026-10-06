@@ -115,6 +115,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import math
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -128,13 +129,13 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from pydantic import SecretStr, ValidationError
 
-from deal_radar.config_schema import EbaySource, Profile
+from deal_radar.config_schema import EbayQuery, EbaySource, Profile
 from deal_radar.core.backoff import BackoffPolicy, RetryExhausted
 from deal_radar.core.http import RETRYABLE_STATUSES, HttpClient, HttpResponse, HttpStatusError, json_dumps, json_loads
 from deal_radar.core.logs import get_logger
 from deal_radar.core.metrics import Metrics
 from deal_radar.engine.types import Location, RawListing, SellerInfo, SourceKind, utcnow
-from deal_radar.sources.base import BaseIngestor, IngestorContext, SourceAuthError, SourceError
+from deal_radar.sources.base import BaseIngestor, IngestorContext, SourceAuthError, SourceBlocked, SourceError
 
 if TYPE_CHECKING:  # pragma: no cover
     from redis.asyncio import Redis
@@ -159,9 +160,18 @@ SECONDS_PER_DAY = 86_400.0
 QUOTA_TIMEZONE = ZoneInfo("America/Los_Angeles")  # Browse quota resets at Pacific midnight
 THROTTLE_BASE_SECONDS = 30.0  # first stretch after a burst throttle; doubles per strike
 LEDGER_KEY_TTL_SECONDS = 2 * 86_400
+POLL_BUDGET_FRACTION = 0.85  # queries still running after this share of poll_timeout_seconds are abandoned
+COALESCED_LABEL = "coalesced"  # metrics label of a configured query without a profile_hint
 
 _AUTH_ERRORS = frozenset({"invalid_client", "invalid_grant", "invalid_scope", "unauthorized_client", "invalid_request"})
 _BUY_NOW_OPTIONS = frozenset({"FIXED_PRICE", "BEST_OFFER", "CLASSIFIED_AD"})
+# Edge/WAF walls (Akamai "Access Denied", eBay's "Pardon Our Interruption", captchas) are HTML,
+# never the JSON ``errors[]`` envelope the API itself returns.
+_BLOCK_WALL = re.compile(
+    r"pardon our interruption|access denied|you don't have permission to access|captcha|cf-chl"
+    r"|challenge-platform|request unsuccessful|incapsula|verify you are (?:a )?human",
+    re.IGNORECASE,
+)
 _ACCEPT_LANGUAGE = {
     "EBAY_US": "en-US",
     "EBAY_MOTORS_US": "en-US",
@@ -190,6 +200,26 @@ class EbayRateLimited(SourceError):
 
 class EbayRequestError(SourceError):
     """eBay rejected the request itself (HTTP 400/404/409: bad filter, category, ...)."""
+
+
+class EbayResponseError(SourceError):
+    """A 200 response whose body is not a search result object (non-JSON, ``null``, a list...)."""
+
+
+class EbayTokenUnavailable(SourceError):
+    """The token endpoint is down or answered nonsense; no search can run until it recovers."""
+
+
+def looks_blocked(body: str | bytes | None, headers: Mapping[str, str] | None = None) -> bool:
+    """True for an HTML block wall (edge WAF / bot challenge) rather than an eBay API answer."""
+    if not body:
+        return False
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else body
+    head = text[:4096]
+    content_type = str((headers or {}).get("Content-Type", "")).lower()
+    if _BLOCK_WALL.search(head):
+        return True
+    return "html" in content_type or head.lstrip()[:1] == "<"
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -397,15 +427,20 @@ class EbayTokenManager:
                 detail = f"{error}: {description}" if error else f"HTTP {exc.status}"
                 raise SourceAuthError(f"eBay rejected the client credentials ({detail})") from exc
             self._m_requests.inc(outcome="error")
-            raise SourceError(f"eBay token endpoint returned HTTP {exc.status}") from exc
+            if exc.status in (403, 429) and error is None and looks_blocked(exc.body, exc.headers):
+                raise SourceBlocked(f"eBay token endpoint is behind a block wall (HTTP {exc.status})") from exc
+            raise EbayTokenUnavailable(f"eBay token endpoint returned HTTP {exc.status}") from exc
         except (RetryExhausted, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             self._m_requests.inc(outcome="error")
-            raise SourceError(f"eBay token endpoint unreachable: {exc!r}") from exc
+            raise EbayTokenUnavailable(f"eBay token endpoint unreachable: {exc!r}") from exc
+        except ValueError as exc:  # 200 with a body that is not JSON (proxy page, truncated reply)
+            self._m_requests.inc(outcome="error")
+            raise EbayTokenUnavailable("eBay token endpoint returned a non-JSON response") from exc
         data = resp.data if isinstance(resp.data, Mapping) else {}
         value = data.get("access_token")
         if not isinstance(value, str) or not value:
             self._m_requests.inc(outcome="error")
-            raise SourceError("eBay token response has no access_token")
+            raise EbayTokenUnavailable("eBay token response has no access_token")
         lifetime = _positive_float(data.get("expires_in")) or float(DEFAULT_TOKEN_TTL_SECONDS)
         self._m_requests.inc(outcome="ok")
         log.info("minted eBay application token", extra={"expires_in_s": lifetime})
@@ -517,6 +552,19 @@ class QuotaLedger:
         reset = datetime.combine(local.date() + timedelta(days=1), dtime(0), tzinfo=self.tz)
         return max(0.0, (reset - now).total_seconds())
 
+    async def sync(self) -> int:
+        """Refresh the fleet-wide count from Redis without spending anything; returns calls used today."""
+        now = self._clock()
+        day = self._roll(now)
+        if self.redis is not None:
+            try:
+                raw = await self.redis.get(f"{self.key_prefix}{day.isoformat()}")
+                if raw is not None:
+                    self._shared = max(self._shared, int(raw))
+            except Exception as exc:  # noqa: BLE001 - fall back to the local count
+                log.debug("eBay quota ledger: Redis unavailable", extra={"error": repr(exc)})
+        return self.used(now)
+
     async def record(self, calls: int) -> int:
         """Add ``calls`` (may be 0 to just sync with Redis); returns calls used today."""
         now = self._clock()
@@ -539,16 +587,24 @@ class QuotaLedger:
 
 
 @dataclass(frozen=True, slots=True)
-class EbayQuery:
-    profile_id: str
+class SearchQuery:
+    """One planned Browse search; a poll issues one call per ``SearchQuery``.
+
+    ``profile_hint`` is copied onto every listing the search returns (``None`` for a
+    coalesced query that covers several profiles). ``label`` is the metrics label: the
+    profile id, or ``"coalesced"``.
+    """
+
     term: str
     url: str
     filter: str
     category_ids: tuple[str, ...] = ()
+    profile_hint: str | None = None
+    label: str = COALESCED_LABEL
 
     @property
     def key(self) -> str:
-        return f"{self.profile_id}:{self.term}"
+        return f"{self.label}:{self.term}"
 
 
 def _fmt_amount(value: float) -> str:
@@ -626,7 +682,11 @@ def build_search_url(
     sort: str = SORT,
     fieldgroups: str | None = FIELDGROUPS,
 ) -> str:
-    """Fully percent-encoded search URL (every value encoded with ``safe=""``)."""
+    """Fully percent-encoded search URL (every value encoded with ``safe=""``).
+
+    eBay rejects ``fieldgroups`` combined with more than one category id (HTTP 409,
+    errorId 12020), so it is dropped in that case.
+    """
     params: list[tuple[str, str]] = [("q", q)]
     if category_ids:
         params.append(("category_ids", ",".join(category_ids)))
@@ -634,7 +694,7 @@ def build_search_url(
         params.append(("filter", filter_expr))
     params.append(("sort", sort))
     params.append(("limit", str(int(limit))))
-    if fieldgroups:
+    if fieldgroups and len(category_ids) <= 1:
         params.append(("fieldgroups", fieldgroups))
     return search_url + "?" + "&".join(f"{k}={quote(v, safe='')}" for k, v in params)
 
@@ -670,9 +730,80 @@ def build_headers(cfg: EbaySource, token: str) -> dict[str, str]:
     return headers
 
 
-def build_queries(cfg: EbaySource, profiles: Sequence[Profile], search_url: str) -> list[EbayQuery]:
-    """One query per (profile, distinct term)."""
-    queries: list[EbayQuery] = []
+def _profile_categories(profile: Profile) -> tuple[str, ...]:
+    categories = tuple(_dedupe([c.strip() for c in profile.search.ebay_category_ids if c and c.strip()]))
+    if len(categories) > 1:
+        log.warning(
+            "eBay documents only one category id per search request; extra ids may be ignored",
+            extra={"profile": profile.id, "category_ids": list(categories)},
+        )
+    return categories
+
+
+def _clip_term(term: str, label: str) -> str:
+    if len(term) > MAX_QUERY_CHARS:
+        log.warning("eBay query truncated to 100 characters", extra={"profile": label, "term": term})
+        term = term[:MAX_QUERY_CHARS].rstrip()
+    return term
+
+
+def build_configured_query(
+    cfg: EbaySource, spec: EbayQuery, profile: Profile | None, search_url: str
+) -> SearchQuery:
+    """A ``sources.ebay.queries`` entry; unset fields inherit from the hinted profile, if any.
+
+    A coalesced query (``q=rtx (4090, 5090)``) normally sets its own price range and
+    category. A query that only names a ``profile_hint`` behaves like one more search
+    term of that profile.
+    """
+    if spec.price_min is not None or spec.price_max is not None:
+        lo, hi = spec.price_min, spec.price_max
+        if lo is not None and hi is not None and lo > hi:
+            lo, hi = hi, lo
+    elif profile is not None:
+        lo, hi = price_bounds(profile)
+    else:
+        lo = hi = None
+    conditions: Sequence[int] = spec.condition_ids or (profile.search.ebay_condition_ids if profile is not None else [])
+    category = (spec.category_id or "").strip()
+    if category:
+        categories: tuple[str, ...] = (category,)
+    elif profile is not None:
+        categories = _profile_categories(profile)
+    else:
+        categories = ()
+    filter_expr = build_filter(
+        price_min=lo,
+        price_max=hi,
+        currency=profile.price.currency if profile is not None else "USD",
+        buying_options=cfg.buying_options,
+        condition_ids=conditions,
+        item_location_country=cfg.item_location_country,
+        delivery_country=cfg.delivery_country,
+    )
+    label = spec.profile_hint or COALESCED_LABEL
+    term = _clip_term(spec.q.strip(), label)
+    url = build_search_url(search_url, q=term, category_ids=categories, filter_expr=filter_expr, limit=cfg.limit)
+    return SearchQuery(term, url, filter_expr, categories, profile_hint=spec.profile_hint, label=label)
+
+
+def build_queries(
+    cfg: EbaySource,
+    profiles: Sequence[Profile],
+    search_url: str,
+    *,
+    known_profiles: Mapping[str, Profile] | None = None,
+) -> list[SearchQuery]:
+    """The searches of one poll.
+
+    A non-empty ``cfg.queries`` (coalesced searches) replaces the per-profile terms;
+    their ``profile_hint`` is resolved against ``known_profiles`` (default: ``profiles``).
+    Otherwise there is one search per (profile, distinct term).
+    """
+    if cfg.queries:
+        lookup = known_profiles if known_profiles is not None else {p.id: p for p in profiles}
+        return [build_configured_query(cfg, spec, lookup.get(spec.profile_hint or ""), search_url) for spec in cfg.queries]
+    queries: list[SearchQuery] = []
     for profile in profiles:
         lo, hi = price_bounds(profile)
         filter_expr = build_filter(
@@ -684,19 +815,11 @@ def build_queries(cfg: EbaySource, profiles: Sequence[Profile], search_url: str)
             item_location_country=cfg.item_location_country,
             delivery_country=cfg.delivery_country,
         )
-        categories = tuple(_dedupe([c.strip() for c in profile.search.ebay_category_ids if c and c.strip()]))
-        if len(categories) > 1:
-            log.warning(
-                "eBay documents only one category id per search request; extra ids may be ignored",
-                extra={"profile": profile.id, "category_ids": list(categories)},
-            )
+        categories = _profile_categories(profile)
         for raw_term in _dedupe([t.strip() for t in profile.search.terms if t and t.strip()]):
-            term = raw_term
-            if len(term) > MAX_QUERY_CHARS:
-                log.warning("eBay query truncated to 100 characters", extra={"profile": profile.id, "term": term})
-                term = term[:MAX_QUERY_CHARS].rstrip()
+            term = _clip_term(raw_term, profile.id)
             url = build_search_url(search_url, q=term, category_ids=categories, filter_expr=filter_expr, limit=cfg.limit)
-            queries.append(EbayQuery(profile.id, term, url, filter_expr, categories))
+            queries.append(SearchQuery(term, url, filter_expr, categories, profile_hint=profile.id, label=profile.id))
     return queries
 
 
@@ -721,7 +844,9 @@ def _number(value: Any) -> float | None:
         return None
     if not dec.is_finite():
         return None
-    return float(dec)
+    number = float(dec)
+    # "1e400" is a finite Decimal but overflows to inf, which JSON (the Redis stream) turns into null.
+    return number if math.isfinite(number) else None
 
 
 def _positive_float(value: Any) -> float | None:
@@ -849,7 +974,7 @@ def _location(d: Mapping[str, Any]) -> Location | None:
 def _parse_item(
     d: Any, *, query: str | None, profile_hint: str | None, prefer_affiliate: bool
 ) -> RawListing | str:
-    """RawListing, or the skip reason (``malformed``/``auction_only``/``no_price``/``no_url``)."""
+    """RawListing, or the skip reason (``malformed``/``auction_only``/``auction_bid_price``/``no_price``/``no_url``)."""
     if not isinstance(d, Mapping):
         return "malformed"
     item_id = _text(d.get("itemId"))
@@ -867,6 +992,11 @@ def _parse_item(
     if price is None:
         return "no_price"
     currency = currency or "USD"
+    bid, bid_currency = _amount(d.get("currentBidPrice"))
+    if "AUCTION" in options and bid is not None and bid_currency in (None, currency) and abs(bid - price) < 0.005:
+        # eBay requires a Buy It Now price above the starting bid, so a price equal to the
+        # current bid is the bid itself, not a buy price.
+        return "auction_bid_price"
 
     affiliate_url = _text(d.get("itemAffiliateWebUrl"))
     web_url = _text(d.get("itemWebUrl"))
@@ -887,7 +1017,7 @@ def _parse_item(
 
     marketing = d.get("marketingPrice")
     list_price: float | None = None
-    extra: dict[str, Any] = {"buying_options": options or ["FIXED_PRICE"]}
+    extra: dict[str, Any] = {"buying_options": options} if options else {}
     if isinstance(marketing, Mapping):
         original, original_currency = _amount(marketing.get("originalPrice"))
         if original is not None and original > 0 and (original_currency in (None, currency)):
@@ -910,7 +1040,6 @@ def _parse_item(
     if end is not None:
         extra["item_end_date"] = end.isoformat()
     if "AUCTION" in options:
-        bid, _ = _amount(d.get("currentBidPrice"))
         if bid is not None:
             extra["current_bid"] = bid
         bids = _int(d.get("bidCount"))

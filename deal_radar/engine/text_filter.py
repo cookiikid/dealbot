@@ -41,6 +41,9 @@ Negation (``negatable`` groups only) is evaluated per match, not by masking:
   attached to that word and does not negate the match.
 * Form-style answers after the match (optionally after up to two more label
   words) are negations too: "Dead pixels: none", "Burn-in: no", "Mining: never".
+* A negation distributes over a list of matches of the same group: in "no dead
+  pixels, burn-in or scratches" every item is negated. A bare comma only counts
+  when the list goes on ("no dead pixels, cracked screen" still rejects).
 
 Performance design
 ------------------
@@ -115,6 +118,13 @@ _WORD = re.compile(r"[^\W_]+(?:[.,'’][^\W_]+)*")
 # Clause boundaries for the negation window (run on lower-cased text).
 _CLAUSE = re.compile(r"[!?;\n]|[.,](?!\d)|\bbut\b|\bhowever\b")
 
+# A defect list continuing a negated match: "no dead pixels, burn-in or scratches".
+# The gap after the previous (negated) match may hold up to two more words of that
+# item, then a list separator; a bare comma also needs the list to go on after the
+# current match, so "no dead pixels, cracked screen" is NOT treated as a list.
+_LIST_GAP = re.compile(r"(?:[ \t]+[^\W\d_]+){0,2}[ \t]*(?:[,/][ \t]*(?:(?P<c1>and|or|nor|&)[ \t]+)?|(?P<c2>and|or|nor|&)[ \t]+)")
+_LIST_NEXT = re.compile(r"[ \t]*(?:[,/&]|(?:and|or|nor)\b)")
+
 # Words that close the scope of a preceding negation term: in "no box cracked
 # screen" the "no" governs "box", not "cracked".
 _NEGATION_SCOPE_ENDERS = frozenset(
@@ -151,6 +161,10 @@ def _fold_pattern(pattern: str) -> str:
         if ch == "\\" and i + 1 < n:
             out.append(pattern[i : i + 2])
             i += 2
+            continue
+        if pattern.startswith("(?P", i):  # named-group syntax is case-sensitive
+            out.append("(?P")
+            i += 3
             continue
         out.append(ch.lower())
         i += 1
@@ -897,9 +911,14 @@ class TextFilter:
             text, m = hay.search(group.patterns, group.on_title)
             return None if m is None else _detail(text, m)
         text, low = hay.pick(group.on_title)
+        negated_end: int | None = None  # end of the previous match if it was negated
         for m in group.patterns.finditer(text, low, hay.hits):
-            if not self._negated(low, m.start(), m.end()):
-                return _detail(text, m)
+            if self._negated(low, m.start(), m.end()) or (
+                negated_end is not None and _continues_list(low, negated_end, m.start(), m.end())
+            ):
+                negated_end = m.end()
+                continue
+            return _detail(text, m)
         return None
 
     def _negated(self, low: str, start: int, end: int) -> bool:
@@ -930,6 +949,14 @@ class TextFilter:
 
 def _detail(text: str, m: re.Match[str]) -> str:
     return text[m.start() : m.end()].strip()
+
+
+def _continues_list(low: str, previous_end: int, start: int, end: int) -> bool:
+    """Whether ``low[start:end]`` continues a list whose previous item was negated."""
+    gap = _LIST_GAP.fullmatch(low, previous_end, start)
+    if gap is None:
+        return False
+    return bool(gap.group("c1") or gap.group("c2")) or _LIST_NEXT.match(low, end) is not None
 
 
 def _scope_closed(words: Sequence[str], term_end: int) -> bool:

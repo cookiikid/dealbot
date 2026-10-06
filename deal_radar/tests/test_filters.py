@@ -127,6 +127,11 @@ OUTCOME_CASES: list[tuple[str, str, str]] = [
     ("Alienware AW3225QF", "No issues except dead pixels in the corner", "reject:damaged"),
     ("Alienware AW3225QF", "Works perfectly, no box. However it has some burn-in", "reject:damaged"),
     ("Alienware AW3225QF", "Works great, not a single dead pixel, but there is a crack on the screen", "reject:damaged"),
+    ("Alienware AW3225QF", "No dead pixels, burn-in or scratches", "oled_4k_monitor/aw3225qf"),
+    ("Alienware AW3225QF", "No dead pixels, cracked screen", "reject:damaged"),
+    ("Alienware AW3225QF", "Has 2 dead pixels near the top edge, barely noticeable", "reject:damaged"),
+    ("RTX 3090 FE", "Card powers on but no display, sold as is for parts", "reject:damaged"),
+    ("RTX 3090 FE", "Repasted and repadded last month, runs cool", "rtx_3090"),
     ("RTX 3090 FE", "Fans are not spinning, sold for repair", "reject:damaged"),
     ("RTX 3090 FE", "Selling as non-working, artifacting in games", "reject:damaged"),
     ("RTX 4090 FE", "Card won't post after a BIOS update", "reject:damaged"),
@@ -158,6 +163,9 @@ OUTCOME_CASES: list[tuple[str, str, str]] = [
     ("[USA-TX] [H] PayPal, Local Cash [W] RTX 4090 FE", "", "reject:wanted"),
     ("ISO: LG C4 65", "", "reject:wanted"),
     ("Buying RTX 3090s, paying cash", "", "reject:wanted"),
+    ("RTX 3090 FE - trade for a PS5", "", "reject:wanted"),
+    ("RTX 3090 FE trade for RX 7900 XTX", "", "reject:no_profile_match"),  # second GPU named: ambiguous
+    ("RTX 4090 FE", "Open to trades, no lowballs", "rtx_4090"),
     ("[USA-CA] [H] RTX 4090 FE [W] PayPal, Local Cash", "", "rtx_4090"),
     ("RTX 4090 FE", "WTB a 5090, so this one has to go", "rtx_4090"),  # wanted is a title-only rule
     ("Sony a7 IV body, ISO 100-51200 tested", "", "sony_a7iv"),
@@ -175,6 +183,18 @@ OUTCOME_CASES: list[tuple[str, str, str]] = [
     ("Steam Deck OLED carrying case", "", "reject:no_profile_match"),
     ("Sony a7 IV body + 2 batteries + charger", "", "sony_a7iv"),
     ("NP-FZ100 battery for Sony a7 IV", "", "reject:no_profile_match"),
+    ("RTX 4090 GPU Support Bracket Anti Sag Holder", "", "reject:accessory"),
+    ("12VHPWR Cable RTX 4090 16 Pin", "", "reject:accessory"),
+    ("RTX 4090 Thermal Pads Replacement Kit", "", "reject:accessory"),
+    ("RTX 3090 FE repasted, new thermal pads", "", "rtx_3090"),
+    ("LG OLED65C4PUA Power Supply Board EAY65170001", "", "reject:accessory"),
+    ("LG C4 65 remote control", "", "reject:accessory"),
+    ("LG C4 65 OLED with magic remote", "", "lg_oled_tv/c4_65"),
+    ("Steam Deck OLED Screen Protector 2 pack", "", "reject:accessory"),
+    ("Steam Deck OLED 1TB + case + screen protector", "", "steam_deck_oled/tb1"),
+    ("Corsair 1000W PSU for RTX 4090 build", "", "reject:accessory"),
+    ("Monitor stand for AW3225QF", "", "reject:accessory"),
+    ("Gaming PC i9-13900K RTX 4090 64GB DDR5 tempered glass case", "", "prebuilt_flagship/gpu_4090"),
     # ---- sold / pending
     ("SOLD - RTX 4090 Suprim", "", "reject:sold_marker"),
     ("RTX 4090 FE [SOLD]", "", "reject:sold_marker"),
@@ -206,6 +226,12 @@ OUTCOME_CASES: list[tuple[str, str, str]] = [
     ("Dell OptiPlex 5090 i5-10500 16GB RAM desktop", "", "reject:no_profile_match"),
     ("Brother HL-4090 laser printer", "", "reject:no_profile_match"),
     ("Anker 5090mAh power bank", "", "reject:no_profile_match"),
+    ("Two RTX 3090s for an AI build", "", "rtx_3090"),
+    ("RTX 4090 FE (faster than 3090)", "", "reject:no_profile_match"),  # two tracked models: ambiguous
+    ("Nvidia 4090", "", "rtx_4090"),
+    ("3090 24gb", "", "rtx_3090"),
+    ("RTX 3090 for AI / LLM / deep learning", "", "rtx_3090"),
+    ("RTX 3090 FE - for sale", "", "rtx_3090"),
     # ---- prebuilt resolution
     ("Gaming PC i9-13900K RTX 4090 64GB DDR5 2TB", "", "prebuilt_flagship/gpu_4090"),
     ("Custom build Ryzen 7 9800X3D RTX 5090 32GB DDR5", "", "prebuilt_flagship/gpu_5090"),
@@ -312,6 +338,7 @@ def test_variant_unknown_reports_profile(tf: TextFilter) -> None:
         ("RTX 4090 FE", "Must sell today, moving!", SourceKind.LOCAL, {"urgency"}, set()),
         ("RTX 4090 FE", "Card was repaired (replaced power connector) by a pro", SourceKind.LOCAL, {"repaired_modified"}, set()),
         ("RTX 4090 FE", "Never repaired, reflowed or modified", SourceKind.LOCAL, set(), {"repaired_modified"}),
+        ("RTX 4090 FE", "Never repaired. Reflowed once by me", SourceKind.LOCAL, {"repaired_modified"}, set()),
         ("RTX 4090 FE", "Clean card from a smoke-free home", SourceKind.LOCAL, set(), {"untested_as_is", "mining_history", "scam_story"}),
     ],
 )
@@ -572,6 +599,11 @@ def _negation_filter(window: int = 3, terms: list[str] | None = None) -> TextFil
         ("isn't scratched", False),
         ("isn’t scratched", False),  # typographic apostrophe
         ("w/o scratches", False),
+        ("no scratches, dent or chips", False),  # negation distributes over a list
+        ("no scratches or dent", False),
+        ("no scratches, dent, chips", False),  # the list goes on after 'dent'
+        ("no scratches, dent on top", True),  # a bare comma without a continuing list
+        ("no scratches. dent or two", True),  # sentence boundary ends the list
     ],
 )
 def test_negation_mechanics(description: str, rejected: bool) -> None:

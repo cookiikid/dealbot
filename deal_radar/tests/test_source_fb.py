@@ -9,6 +9,7 @@ can be launched. No test talks to facebook.com.
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import os
@@ -1168,3 +1169,296 @@ async def test_run_check_reports_session_state(
         assert code == 0 and out.startswith("Logged in")
     else:
         assert code == 1 and "NOT logged in (login_required)" in out
+
+
+# --------------------------------------------------------------------------- adversarial-review regressions
+
+
+def test_iter_json_documents_survives_pathological_nesting() -> None:
+    # orjson refuses >1024 levels and the stdlib fallback raises RecursionError (not
+    # ValueError) on deep input: a hostile/corrupt chunk must be skipped, not kill the poll.
+    deep = "[" * 100_000 + "]" * 100_000
+    body = '{"a":1}' + deep + '{"b":2}\n' + deep + "\n" + '{"c":3}'
+    assert list(fb.iter_json_documents(body)) == [{"a": 1}, {"c": 3}]
+    listings, stats = fb.parse_payloads([("graphql", body), ("graphql", deep)])
+    assert listings == [] and stats["documents"] == 2
+    cursor = '{"c2c":' + "[" * 100_000 + "]" * 100_000 + "}"
+    feed = {"feed_units": {"edges": [], "page_info": {"end_cursor": cursor}}}
+    assert fb.count_withheld_feeds(feed) == 0
+
+
+def test_hidden_listings_are_skipped() -> None:
+    node = {"id": "77", "marketplace_listing_title": "RTX 4090", "listing_price": {"amount": "900"}, "is_hidden": True}
+    listings, stats = fb.parse_payloads([("graphql", json.dumps({"data": {"n": node}}))])
+    assert listings == [] and stats["hidden"] == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "code"),
+    [("PHP6,500", "PHP"), ("1 200 PLN", "PLN"), ("CHF 120", "CHF"), ("CAD $500", "CAD"), ("RTX 3090", None), ("500 OBO", None)],
+)
+def test_currency_from_iso_codes(text: str, code: str | None) -> None:
+    assert fb.currency_from_text(text) == code
+
+
+def test_iso_formatted_price_is_not_mislabelled_usd() -> None:
+    node = {"id": "88", "marketplace_listing_title": "RTX 3090", "listing_price": {"formatted_amount": "PHP6,500", "amount": "6500.00"}}
+    (listing,) = fb.parse_graphql_payload(json.dumps({"data": node}))
+    assert listing.price == 6500.0 and listing.currency == "PHP"
+
+
+def test_search_feed_is_preferred_over_other_rails() -> None:
+    def listing(lid: str) -> dict[str, Any]:
+        return {"id": lid, "marketplace_listing_title": f"RTX 3090 #{lid}", "listing_price": {"amount": "500"}}
+
+    page = {
+        "data": {
+            "marketplace_search": {"feed_units": {"edges": [{"node": {"listing": listing("101")}}]}},
+            "viewer": {"marketplace_feed_stories": {"edges": [{"node": {"listing": listing("999")}}]}},  # "Today's picks"
+        }
+    }
+    deferred = {"label": "x$defer$y", "path": ["marketplace_search", "feed_units", "edges", 1, "node", "listing"],
+                "data": listing("102")}
+    body = json.dumps(page) + "\n" + json.dumps(deferred)
+    listings, stats = fb.parse_payloads([("graphql", body)])
+    assert [item.source_id for item in listings] == ["101", "102"]
+    assert stats["other_rail"] == 1
+    # Without any marketplace_search root the generic walk still finds listings (path drift).
+    assert [item.source_id for item in fb.parse_graphql_payload(json.dumps({"data": {"renamed": [listing("5")]}}))] == ["5"]
+
+
+def test_parse_dom_cards_splits_concatenated_prices() -> None:
+    cards = [{"id": "4949494949494949", "lines": ["$350$400", "RTX 3080", "Queens, NY"], "img": None, "alt": None},
+             {"id": "5050505050505050", "lines": ["CA$1,200CA$1,500", "RTX 4090", "Toronto, ON"], "img": None, "alt": None}]
+    first, second = fb.parse_dom_cards(cards)
+    assert (first.price, first.list_price, first.title) == ("$350", "$400", "RTX 3080")
+    assert first.location is not None and first.location.text == "Queens, NY"
+    assert (second.price, second.list_price, second.currency, second.title) == ("CA$1,200", "CA$1,500", "CAD", "RTX 4090")
+
+
+class _StateContext:
+    def __init__(self, state: dict[str, Any]) -> None:
+        self.state = state
+
+    async def storage_state(self) -> dict[str, Any]:
+        return self.state
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_save_state_never_overwrites_a_session_with_a_logged_out_jar(tmp_path: Path, http: HttpClient) -> None:
+    cfg = _fb_cfg(tmp_path, None)
+    state_path = Path(cfg.browser.storage_state_path)
+    _write_state(state_path)
+    original = state_path.read_text()
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()))
+    ingestor._context = _StateContext({"cookies": [{"name": "datr", "value": "x", "domain": ".facebook.com"}], "origins": []})  # type: ignore[assignment]
+    ingestor._session_ok = True
+    await ingestor._save_state()
+    assert state_path.read_text() == original
+    fresh = json.loads(original)
+    fresh["cookies"][0]["value"] = "100099999999999"
+    ingestor._context = _StateContext(fresh)  # type: ignore[assignment]
+    await ingestor._save_state()
+    assert json.loads(state_path.read_text()) == fresh
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    ingestor._context = None
+
+
+class _Resp:
+    def __init__(self, text: str) -> None:
+        self.url = "https://www.facebook.com/api/graphql/"
+        self.status = 200
+        self._text = text
+
+    async def body(self) -> bytes:
+        return self._text.encode()
+
+
+async def test_late_graphql_body_does_not_wake_the_next_search(http: HttpClient, tmp_path: Path) -> None:
+    ingestor = fb.FbMarketplaceIngestor(_fb_cfg(tmp_path, None), _ctx(http, _app_config()))
+    old_sink: list[str] = []
+    ingestor._capture = []  # a newer search is running
+    await ingestor._read_payload(_Resp(GRAPHQL_PAGE2), old_sink)  # type: ignore[arg-type]
+    assert not ingestor._captured.is_set()
+    assert ingestor._capture == []
+
+
+async def test_poll_respects_hourly_search_budget(tmp_path: Path, http: HttpClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_pause(*args: Any, **kwargs: Any) -> float:
+        return 0.0
+
+    monkeypatch.setattr(fb, "human_pause", no_pause)
+    cfg = _fb_cfg(tmp_path, None, profiles=["multi"], poll_timeout_seconds=600)
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()))
+    ingestor.max_searches_per_hour = 2
+    now = [10_000.0]
+    ingestor._clock = lambda: now[0]
+    searched: list[str] = []
+    ensured = [0]
+
+    class _Page:
+        def is_closed(self) -> bool:
+            return False
+
+    async def fake_ensure() -> Any:
+        ensured[0] += 1
+        return _Page()
+
+    async def fake_search(page: Any, profile: Any, term: str) -> list[Any]:
+        searched.append(term)
+        return []
+
+    monkeypatch.setattr(ingestor, "_ensure_page", fake_ensure)
+    monkeypatch.setattr(ingestor, "_search", fake_search)
+    assert await ingestor.poll() == []
+    assert searched == ["alpha", "beta"]
+    assert ingestor.next_interval() >= 3600 - 1  # wait for the window instead of waking up for nothing
+    now[0] += 600
+    assert await ingestor.poll() == []
+    assert searched == ["alpha", "beta"] and ensured[0] == 1  # budget exhausted: the browser is not touched
+    now[0] += 3001
+    await ingestor.poll()
+    assert searched == ["alpha", "beta", "gamma", "alpha"]
+    assert ingestor.next_interval() >= 3600 - 1
+    now[0] += 3601
+    assert ingestor.next_interval() <= cfg.poll_interval_seconds * (1 + cfg.jitter_pct) + 1e-6
+
+
+def _add_local_marker(path: Path, value: str) -> None:
+    state = json.loads(path.read_text())
+    state["cookies"].append({"name": "marker", "value": value, "domain": "127.0.0.1", "path": "/", "expires": -1,
+                             "httpOnly": False, "secure": False, "sameSite": "Lax"})
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+class _CookieMarketplace(FakeMarketplace):
+    def __init__(self, mode: str) -> None:
+        super().__init__(mode)
+        self.markers: list[str | None] = []
+
+    async def search(self, request: web.Request) -> web.Response:
+        self.markers.append(request.cookies.get("marker"))
+        return await super().search(request)
+
+
+async def test_session_wall_reloads_refreshed_session_file(tmp_path: Path, http: HttpClient) -> None:
+    # After a login wall the operator re-runs --login, which rewrites the storage-state
+    # file. The running collector must pick the new cookies up on its next poll instead
+    # of presenting the dead session forever.
+    exe = await _require_chromium("full")
+    market = _CookieMarketplace("login")
+    server = TestServer(market.app(), host="127.0.0.1")
+    await server.start_server()
+    cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0)
+    state_path = Path(cfg.browser.storage_state_path)
+    _write_state(state_path)
+    _add_local_marker(state_path, "old")
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()), base_url=str(server.make_url("/")))
+    ingestor.results_timeout_seconds = 2.0
+    try:
+        with pytest.raises(SourceBlocked):
+            await ingestor.poll()
+        _write_state(state_path)  # what `--login` leaves behind
+        _add_local_marker(state_path, "new")
+        market.mode = "dom"
+        listings = await ingestor.poll()
+    finally:
+        await ingestor.teardown()
+        await server.close()
+    assert market.markers == ["old", "new"]
+    assert len(listings) == 3
+
+
+async def test_poll_recovers_after_renderer_crash(tmp_path: Path, http: HttpClient) -> None:
+    exe = await _require_chromium("full")
+    server = TestServer(FakeMarketplace("dom").app(), host="127.0.0.1")
+    await server.start_server()
+    cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0)
+    _write_state(Path(cfg.browser.storage_state_path))
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()), base_url=str(server.make_url("/")))
+    ingestor.results_timeout_seconds = 2.0
+    try:
+        first = await ingestor.poll()
+        assert ingestor._context is not None and ingestor._page is not None
+        cdp = await ingestor._context.new_cdp_session(ingestor._page)
+        with pytest.raises(Exception):  # noqa: B017 - the renderer dies before it can answer
+            await asyncio.wait_for(cdp.send("Page.crash"), timeout=2.0)
+        await asyncio.sleep(0.3)
+        second = await ingestor.poll()
+        third = await ingestor.poll()
+    finally:
+        await ingestor.teardown()
+        await server.close()
+    assert [i.source_id for i in second] == [i.source_id for i in first] == [i.source_id for i in third]
+
+
+async def test_poll_recovers_persistent_profile_after_browser_death(tmp_path: Path, http: HttpClient) -> None:
+    exe = await _require_chromium("full")
+    server = TestServer(FakeMarketplace("dom").app(), host="127.0.0.1")
+    await server.start_server()
+    browser_cfg = BrowserSection(
+        headless=True,
+        executable_path=exe,
+        storage_state_path=str(tmp_path / "fb_state.json"),
+        user_data_dir=str(tmp_path / "profile"),
+        min_action_delay_seconds=0.0,
+        max_action_delay_seconds=0.02,
+        navigation_timeout_seconds=20,
+    )
+    cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0, browser=browser_cfg)
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()), base_url=str(server.make_url("/")))
+    ingestor.results_timeout_seconds = 2.0
+    try:
+        first = await ingestor.poll()
+        assert ingestor._browser is None and ingestor._context is not None  # persistent context
+        await ingestor._context.close()  # the profile's browser goes away between polls
+        second = await ingestor.poll()
+    finally:
+        await ingestor.teardown()
+        await server.close()
+    assert first and [i.source_id for i in second] == [i.source_id for i in first]
+    assert ingestor._context is None and ingestor._playwright is None
+
+
+async def test_run_login_ignores_stale_cookies_while_a_login_form_is_shown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The saved (server-side invalidated) session still carries c_user/xs, and Facebook
+    # shows its login form on a page whose path is not /login: that is not a login.
+    exe = await _require_chromium("full")
+    monkeypatch.setattr(fb, "LOGIN_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(fb, "CHECK_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(fb, "LOGIN_POLL_SECONDS", 0.1)
+    config = _cli_config(tmp_path, exe)
+    state_path = Path(config.sources.fb_marketplace.browser.storage_state_path)
+    _write_state(state_path)
+    original = state_path.read_text()
+
+    async def login(request: web.Request) -> web.Response:
+        raise web.HTTPFound("/")
+
+    async def home(request: web.Request) -> web.Response:
+        form = "<form id='login_form' action='/login/'><input name='email'><input type='password' name='pass'></form>"
+        return web.Response(text=_HTML_HEAD + form + _HTML_TAIL, content_type="text/html")
+
+    app = web.Application()
+    app.router.add_get("/login/", login)
+    app.router.add_get("/", home)
+    server = TestServer(app, host="127.0.0.1")
+    await server.start_server()
+    try:
+        code = await fb.run_login(config, timeout_seconds=1.0, base_url=str(server.make_url("/")).rstrip("/"), headless=True)
+    finally:
+        await server.close()
+    assert code == 1 and "Timed out" in capsys.readouterr().out
+    assert state_path.read_text() == original
+
+
+async def test_run_check_reports_a_browser_that_cannot_start(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pytest.importorskip("playwright.async_api")
+    config = _cli_config(tmp_path, str(tmp_path / "no-such-chrome"))
+    _write_state(Path(config.sources.fb_marketplace.browser.storage_state_path))
+    assert await fb.run_check(config, base_url="http://127.0.0.1:9") == 1
+    assert "Could not start the browser" in capsys.readouterr().out

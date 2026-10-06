@@ -35,6 +35,7 @@ from deal_radar.db.database import (
     LISTINGS,
     SNAPSHOTS,
     Database,
+    DatabaseNotConnected,
     Recorder,
     SnapshotRecord,
     _sqlite_file_path,
@@ -857,6 +858,7 @@ def test_is_transient_error() -> None:
     assert is_transient_error(sa_exc.InterfaceError("INSERT ...", {}, Exception("connection is closed")))
     assert is_transient_error(dbapi_error("40P01"))  # deadlock_detected
     assert is_transient_error(dbapi_error("08006"))  # connection_failure
+    assert is_transient_error(DatabaseNotConnected("closed"))  # Database.close() raced the Recorder
     assert not is_transient_error(dbapi_error("22021"))  # NUL byte / bad encoding: poison record
     assert not is_transient_error(sa_exc.IntegrityError("INSERT ...", {}, Exception("NOT NULL constraint failed")))
     assert not is_transient_error(UnicodeEncodeError("utf-8", "\ud83d", 0, 1, "surrogates not allowed"))

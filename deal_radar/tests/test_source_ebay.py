@@ -36,7 +36,7 @@ from deal_radar.core.backoff import BackoffPolicy
 from deal_radar.core.http import HttpClient, HttpStatusError, NetworkSettings
 from deal_radar.core.metrics import Metrics
 from deal_radar.engine.types import RawListing, SourceKind
-from deal_radar.sources.base import IngestorContext, SourceAuthError, SourceError
+from deal_radar.sources.base import IngestorContext, SourceAuthError, SourceBlocked, SourceError
 from deal_radar.sources.ebay_api import (
     APP_SCOPE,
     SEARCH_PATH,
@@ -893,3 +893,169 @@ async def test_run_once_emits_only_new_or_changed_listings(http: HttpClient) -> 
     assert [(raw.source_id, raw.price) for raw in third] == [("v1|226512345678|0", 1299.99)]
     assert len(requests_for(m, "POST")) == 1  # token reused across polls
     await ingestor.teardown()
+
+
+# --------------------------------------------------------------------------- adversarial regressions
+
+AKAMAI_403 = (
+    "<HTML><HEAD>\n<TITLE>Access Denied</TITLE>\n</HEAD><BODY>\n<H1>Access Denied</H1>\n \n"
+    "You don't have permission to access \"http&#58;&#47;&#47;api&#46;ebay&#46;com&#47;buy&#47;browse&#47;v1&#47;"
+    "item&#95;summary&#47;search&#63;\" on this server.<P>\n"
+    "Reference&#32;&#35;18&#46;5c3e1002&#46;1759730000&#46;1a2b3c4d\n</BODY>\n</HTML>\n"
+)
+
+
+async def test_configured_coalesced_queries_replace_profile_terms(http: HttpClient) -> None:
+    profiles = [
+        gpu_profile("rtx_4090", ["rtx 4090", "4090 founders"]),
+        gpu_profile("rtx_5090", ["rtx 5090"], floor=600, target=1900, ceiling=2600),
+    ]
+    queries = [
+        {"q": "rtx (4090, 5090)", "category_id": "27386", "price_min": 450, "price_max": 2600, "condition_ids": [1000, 3000]},
+        {"q": "rtx 4090 founders edition", "profile_hint": "rtx_4090"},  # unset fields inherit the hinted profile
+        {"q": "geforce rtx"},  # nothing to inherit: no price/condition/category filter
+    ]
+    ingestor = make_ingestor(make_config(profiles, limit=8, queries=queries), http)
+    assert ingestor.calls_per_poll() == 3  # the 3 profile terms are replaced, not added
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("tok"))
+        m.get(SEARCH_RE, payload=fixture(), repeat=True)
+        listings = await ingestor.poll()
+    by_q = {url.query["q"]: url for url, _ in requests_for(m, "GET")}
+    assert set(by_q) == {"rtx (4090, 5090)", "rtx 4090 founders edition", "geforce rtx"}
+    tail = "buyingOptions:{FIXED_PRICE|BEST_OFFER},conditionIds:{1000|3000},itemLocationCountry:US,deliveryCountry:US"
+    assert by_q["rtx (4090, 5090)"].query["filter"] == "price:[450..2600],priceCurrency:USD," + tail
+    assert by_q["rtx (4090, 5090)"].query["category_ids"] == "27386"
+    assert by_q["rtx 4090 founders edition"].query["filter"] == RTX4090_FILTER
+    assert by_q["rtx 4090 founders edition"].query["category_ids"] == "27386"
+    assert by_q["geforce rtx"].query["filter"] == "buyingOptions:{FIXED_PRICE|BEST_OFFER},itemLocationCountry:US,deliveryCountry:US"
+    assert "category_ids" not in by_q["geforce rtx"].query
+    assert len(listings) == 4  # same items from every query, emitted once
+    assert all(raw.query == "rtx (4090, 5090)" and raw.profile_hint is None for raw in listings)
+    queries_metric = ingestor.ctx.metrics.counter("ebay_queries_total", "", ("profile", "outcome"))
+    assert queries_metric.value(profile="coalesced", outcome="ok") == 2
+    assert queries_metric.value(profile="rtx_4090", outcome="ok") == 1
+
+
+async def test_multiple_category_ids_never_combine_with_fieldgroups(http: HttpClient) -> None:
+    # eBay answers 409 errorId 12020 when fieldgroups is sent with more than one category id.
+    url = URL(build_search_url(API + SEARCH_PATH, q="rtx 4090", category_ids=["27386", "175673"], limit=50))
+    assert url.query["category_ids"] == "27386,175673"
+    assert "fieldgroups" not in url.query
+    profile = gpu_profile("rtx_4090", ["rtx 4090"])
+    profile["search"]["ebay_category_ids"] = ["27386", "175673"]
+    ingestor = make_ingestor(make_config([profile]), http)
+    assert "fieldgroups" not in URL(ingestor.queries[0].url).query
+    single = make_ingestor(make_config(), http)
+    assert URL(single.queries[0].url).query["fieldgroups"] == "MATCHING_ITEMS,EXTENDED"
+
+
+async def test_token_outage_costs_one_mint_per_poll_not_one_per_wave(http: HttpClient) -> None:
+    profiles = [gpu_profile(f"gpu_{i}", [f"gpu {i}"]) for i in range(8)]
+    ingestor = make_ingestor(make_config(profiles, max_concurrency=2), http)
+    with aioresponses() as m:
+        m.post(TOKEN_URL, status=503, body="Service Unavailable", repeat=True)
+        with pytest.raises(SourceError) as excinfo:
+            await ingestor.poll()
+    assert not isinstance(excinfo.value, SourceAuthError)
+    assert len(requests_for(m, "POST")) == 2  # one mint (+ its single retry) for the whole poll
+    assert not requests_for(m, "GET")
+    queries = ingestor.ctx.metrics.counter("ebay_queries_total", "", ("profile", "outcome"))
+    assert sum(queries.value(profile=f"gpu_{i}", outcome="skipped") for i in range(8)) == 6
+
+
+async def test_edge_block_page_raises_source_blocked(http: HttpClient) -> None:
+    url = API + SEARCH_PATH
+    blocked = classify_error(HttpStatusError(403, url, AKAMAI_403, {"Content-Type": "text/html"}))
+    assert isinstance(blocked, SourceBlocked)
+    denied = classify_error(HttpStatusError(403, url, json.dumps(ebay_error(1100, "Access denied", domain="ACCESS"))))
+    assert isinstance(denied, SourceAuthError) and not isinstance(denied, SourceBlocked)
+
+    profiles = [gpu_profile("rtx_4090", ["rtx 4090"]), gpu_profile("rtx_3090", ["rtx 3090"])]
+    ingestor = make_ingestor(make_config(profiles, max_concurrency=1), http)
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("tok"))
+        m.get(SEARCH_RE, status=403, body=AKAMAI_403, content_type="text/html", repeat=True)
+        with pytest.raises(SourceBlocked):
+            await ingestor.poll()
+    assert len(requests_for(m, "GET")) == 1  # the wall stops the remaining queries
+
+
+async def test_unexpected_success_body_is_a_query_failure_not_an_empty_success(http: HttpClient) -> None:
+    profiles = [gpu_profile("rtx_4090", ["rtx 4090"]), gpu_profile("rtx_3090", ["rtx 3090"])]
+    ingestor = make_ingestor(make_config(profiles, max_concurrency=1), http)
+    responses = {"rtx 4090": None, "rtx 3090": CallbackResult(body="[]", content_type="application/json")}
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("tok"))
+        m.get(SEARCH_RE, callback=_route_by_query(responses), repeat=True)
+        assert len(await ingestor.poll()) == 4
+    queries = ingestor.ctx.metrics.counter("ebay_queries_total", "", ("profile", "outcome"))
+    assert queries.value(profile="rtx_3090", outcome="error") == 1
+
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("tok"))
+        m.get(SEARCH_RE, body="", content_type="application/json", repeat=True)  # empty 200 body
+        with pytest.raises(SourceError, match="all 2 eBay queries failed"):
+            await ingestor.poll()
+
+
+async def test_slow_query_does_not_discard_finished_results(http: HttpClient) -> None:
+    profiles = [gpu_profile("rtx_4090", ["rtx 4090"]), gpu_profile("rtx_3090", ["rtx 3090"])]
+    ingestor = make_ingestor(make_config(profiles, max_concurrency=2, poll_timeout_seconds=0.6), http)
+
+    async def search(url: URL, **kwargs: Any) -> CallbackResult:
+        if url.query["q"] == "rtx 3090":
+            await asyncio.sleep(30)  # hung upstream: must be cut by the poll's own deadline
+        return CallbackResult(payload=fixture())
+
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("tok"))
+        m.get(SEARCH_RE, callback=search, repeat=True)
+        fresh = await ingestor.run_once()
+    assert len(fresh) == 4
+    queries = ingestor.ctx.metrics.counter("ebay_queries_total", "", ("profile", "outcome"))
+    assert queries.value(profile="rtx_3090", outcome="timeout") == 1
+    assert ingestor.ledger.used() == 2  # the abandoned in-flight request still counts against the quota
+
+
+def test_non_finite_amounts_are_rejected() -> None:
+    base = {"itemId": "v1|1|0", "title": "RTX 4090", "itemWebUrl": "https://www.ebay.com/itm/1"}
+    assert parse_item_summary({**base, "price": {"value": "1e400", "currency": "USD"}}) is None
+    assert parse_item_summary({**base, "price": {"value": "NaN", "currency": "USD"}}) is None
+    shipping = [{"shippingCostType": "FIXED", "shippingCost": {"value": "1e999", "currency": "USD"}}]
+    raw = parse_item_summary({**base, "price": {"value": "100.00", "currency": "USD"}, "shippingOptions": shipping})
+    assert raw is not None and raw.shipping is None
+    assert RawListing.model_validate_json(raw.model_dump_json()) == raw
+
+
+def test_buying_options_are_not_invented_when_absent() -> None:
+    raw = parse_item_summary(
+        {"itemId": "v1|1|0", "title": "RTX 4090", "itemWebUrl": "https://www.ebay.com/itm/1", "price": {"value": "1000.00"}}
+    )
+    assert raw is not None and "buying_options" not in raw.extra
+
+
+def test_auction_with_bin_whose_price_is_only_the_current_bid_is_skipped() -> None:
+    item = {
+        "itemId": "v1|7|0",
+        "title": "RTX 4090 auction",
+        "itemWebUrl": "https://www.ebay.com/itm/7",
+        "buyingOptions": ["AUCTION", "FIXED_PRICE"],
+        "price": {"value": "900.00", "currency": "USD"},
+        "currentBidPrice": {"value": "900.00", "currency": "USD"},
+        "bidCount": 0,
+    }
+    assert parse_item_summary(item) is None  # eBay requires BIN > start price, so this price is the bid
+    page = parse_search_page({"itemSummaries": [item]})
+    assert page.skipped == {"auction_bid_price": 1}
+
+
+async def test_budget_guard_sees_fleet_usage_in_redis_before_the_first_poll(http: HttpClient) -> None:
+    redis = fakeredis.FakeAsyncRedis()
+    config = make_config(_profiles_with_terms(3), daily_call_budget=5000)
+    ingestor = make_ingestor(config, http, redis=redis)
+    ingestor.ledger = QuotaLedger(5000, redis=redis, key_prefix="dr:ebay:calls:k:", clock=lambda: NOON_PDT)
+    await redis.set("dr:ebay:calls:k:2026-10-06", 4998)  # other nodes spent the day's budget
+    with aioresponses() as m:
+        assert await ingestor.poll() == []
+    assert not m.requests

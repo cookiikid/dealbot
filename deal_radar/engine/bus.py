@@ -378,6 +378,24 @@ def _json_fallback(value: Any) -> Any:
     return str(value)
 
 
+def _is_group_loss(exc: BaseException) -> bool:
+    """Did the stream or the consumer group disappear (FLUSHALL, eviction, DEL, DESTROY)?
+
+    A consumer parked in ``XREADGROUP ... BLOCK`` (the normal idle state) is woken by
+    Redis 7 with ``-UNBLOCKED the stream key no longer exists`` on DEL/FLUSHALL/eviction
+    and with ``-NOGROUP ... no longer exists`` on XGROUP DESTROY; later reads get
+    ``-NOGROUP No such key ...``; XGROUP CREATE without MKSTREAM says "requires the key
+    to exist".
+    """
+    text = str(exc)
+    return (
+        "NOGROUP" in text
+        or text.startswith("UNBLOCKED")
+        or "no longer exists" in text
+        or "requires the key to exist" in text
+    )
+
+
 _SCRUB_MAX_DEPTH = 24  # deeper (or cyclic) ``extra`` structures collapse to their repr
 
 
@@ -596,11 +614,12 @@ class RedisStreamBus(ListingBus):
                 self._m_errors.inc(op="consume")
                 transient = isinstance(exc, TRANSIENT_ERRORS)
                 if isinstance(exc, redis_exc.ResponseError) and not transient:
-                    # NOGROUP (stream/group vanished) and friends: recreate before the next read.
-                    # Sticky until the group is recreated: a different error in between (e.g. an
-                    # OOM-denied XGROUP CREATE) must not downgrade the recreation to "$".
+                    # NOGROUP / UNBLOCKED (stream or group vanished) and friends: recreate the
+                    # group before the next read. Sticky until the group is recreated: a
+                    # different error in between (e.g. an OOM-denied XGROUP CREATE) must not
+                    # downgrade the recreation to "$".
                     self._group_ready = False
-                    self._group_lost = self._group_lost or "NOGROUP" in str(exc) or "requires the key to exist" in str(exc)
+                    self._group_lost = self._group_lost or _is_group_loss(exc)
                     self._claim_cursor = "0-0"
                 log.warning(
                     "bus read failed; backing off",

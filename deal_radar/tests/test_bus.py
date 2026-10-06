@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import shutil
 import socket
 import subprocess
@@ -29,6 +30,7 @@ from deal_radar.engine.bus import (
     RedisStreamBus,
     build_bus,
     decode_payload,
+    encode_listing,
     parse_autoclaim,
     stream_entries,
 )
@@ -243,6 +245,41 @@ async def test_memory_multiple_consumers_share_work_without_duplicates() -> None
     assert seen["a"] and seen["b"]
 
 
+async def test_memory_cancelled_backpressured_publish_leaves_bus_consistent() -> None:
+    metrics = Metrics()
+    bus = MemoryBus(maxsize=1, metrics=metrics)
+    await bus.publish(make_listing(1))
+    blocked = asyncio.create_task(bus.publish(make_listing(2)))
+    await asyncio.sleep(0.02)
+    blocked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked
+    await asyncio.sleep(0)  # let the cancelled inner put settle
+    assert bus.backlog() == 1  # the cancelled listing was not enqueued
+    got = await collect(bus, 1)
+    assert got[0].raw.source_id == make_listing(1).source_id
+    await bus.publish(make_listing(3))  # a slot is free again: fast path, no waiting
+    assert bus.backlog() == 1
+    assert metric(metrics, "counter", "bus_published_total") == 2
+    await bus.close()
+
+
+async def test_memory_close_with_single_slot_queue_and_many_waiters() -> None:
+    bus = MemoryBus(maxsize=1)
+    ended: list[int] = []
+
+    async def consumer(i: int) -> None:
+        async for _ in bus.consume():
+            pass
+        ended.append(i)
+
+    tasks = [asyncio.create_task(consumer(i)) for i in range(5)]
+    await asyncio.sleep(0.01)
+    await bus.close()  # the sentinel is passed along through a 1-slot queue
+    await asyncio.wait_for(asyncio.gather(*tasks), 1.0)
+    assert sorted(ended) == list(range(5))
+
+
 def test_memory_rejects_bad_maxsize() -> None:
     with pytest.raises(ValueError):
         MemoryBus(maxsize=0)
@@ -337,6 +374,55 @@ def test_decode_payload_variants() -> None:
     assert bad_json is None and why is not None and why.startswith("invalid")
     bad_schema, why = decode_payload({b"d": b'{"source": "ebay", "unknown_field": 1}'})
     assert bad_schema is None and why is not None and why.startswith("invalid")
+
+
+class _Hostile:
+    def __str__(self) -> str:
+        raise RuntimeError("no str")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("no repr")
+
+
+def test_encode_listing_fast_path_is_plain_model_dump_json() -> None:
+    raw = make_listing(1)
+    payload, sanitized = encode_listing(raw)
+    assert not sanitized
+    assert payload == raw.model_dump_json()
+
+
+def test_encode_listing_scrubs_content_that_json_cannot_hold() -> None:
+    # Truncated emoji in upstream JSON decode to lone surrogates; pydantic refuses to
+    # encode them (and so would orjson), which used to raise out of publish().
+    title = json.loads('"RTX 4090 FE \\ud83d deal"')
+    cyclic: dict[str, Any] = {"a": 1}
+    cyclic["self"] = cyclic
+    raw = make_listing(
+        2,
+        title=title,
+        description="split pair 😀 ok",
+        seller=SellerInfo(name="Bob \udcff"),
+        extra={"body": b"\xff\xfe raw", "cyclic": cyclic, b"key": [b"\x00ok", {"\ud800": 1}]},
+    )
+    with pytest.raises(ValueError):
+        raw.model_dump_json()  # the failure encode_listing exists for
+    payload, sanitized = encode_listing(raw)
+    assert sanitized
+    back = RawListing.model_validate_json(payload)
+    assert back.title == "RTX 4090 FE � deal"
+    assert back.description == "split pair \U0001f600 ok"  # a valid pair is re-joined, not mangled
+    assert back.seller is not None and back.seller.name == "Bob �"
+    assert back.extra["body"] == "�� raw"
+    assert back.extra["cyclic"]["a"] == 1 and isinstance(back.extra["cyclic"]["self"], dict)
+    assert back.extra["key"] == ["\x00ok", {"�": 1}]
+    assert back.location == raw.location and back.posted_at == raw.posted_at
+    assert back.source_kind is raw.source_kind and back.listing_key == raw.listing_key
+
+    hostile, sanitized = encode_listing(make_listing(3, title=title, extra={"obj": _Hostile()}))
+    assert sanitized
+    back = RawListing.model_validate_json(hostile)
+    assert back.extra == {"bus_unserializable_extra": True}
+    assert back.title == "RTX 4090 FE � deal"
 
 
 # --------------------------------------------------------------------------- real redis-server
@@ -452,6 +538,30 @@ async def test_redis_round_trip_full_listing(rclient: aioredis.Redis) -> None:
     assert len(entries) == 1 and set(entries[0][1]) == {PAYLOAD_FIELD.encode()}
     await producer.close()
     await consumer.close()
+
+
+async def test_redis_publish_scrubs_unencodable_listing(rclient: aioredis.Redis) -> None:
+    metrics = Metrics()
+    bus = RedisStreamBus(rclient, make_config(), "gcp-1", metrics=metrics)
+    await bus.start()
+    title = json.loads('"Steam Deck OLED \\ud83d"')
+    await bus.publish(make_listing(1, title=title, extra={"html": b"\xff<div>"}))
+    got = await collect(bus, 1)
+    assert got[0].raw.title == "Steam Deck OLED �"
+    assert got[0].raw.extra == {"html": "�<div>"}
+    assert metric(metrics, "counter", "bus_sanitized_total") == 1
+    assert metric(metrics, "counter", "bus_published_total") == 1
+    await bus.close()
+
+
+async def test_redis_ack_after_close_still_acknowledges(rclient: aioredis.Redis) -> None:
+    # main.py closes the bus first and then drains in-flight workers, which ack in `finally`.
+    bus = RedisStreamBus(rclient, make_config(), "gcp-1")
+    await bus.publish(make_listing(1))
+    got = await collect(bus, 1, ack=False)
+    await bus.close()
+    await bus.ack(got[0])
+    assert await pending_count(rclient, bus) == 0
 
 
 async def test_redis_entries_published_before_first_consumer_are_delivered(rclient: aioredis.Redis) -> None:
@@ -585,6 +695,7 @@ async def test_redis_inflight_entry_is_not_redelivered_locally(rclient: aioredis
     cfg = make_config(claim_idle_ms=150, block_ms=30)
     producer = RedisStreamBus(rclient, cfg, "collector")
     bus = RedisStreamBus(rclient, cfg, "gcp-1")
+    bus.reclaim_grace = 30.0  # isolate the in-flight guard from scheduler jitter
     await producer.start()
     await producer.publish(make_listing(1))
     received: list[BusMessage] = []
@@ -596,9 +707,39 @@ async def test_redis_inflight_entry_is_not_redelivered_locally(rclient: aioredis
     task = asyncio.create_task(run())
     await asyncio.sleep(0.45)  # > claim_idle + scan interval: the scan reclaims it from ourselves
     assert len(received) == 1, "a slow local worker's entry must not be handed out twice"
+    # ...but the scan did claim it, which keeps other nodes from stealing a live entry.
+    detail = await rclient.xpending_range(producer.stream, producer.group, "-", "+", 10)
+    assert detail[0]["times_delivered"] >= 2
     await bus.ack(received[0])
     await bus.close()
     await asyncio.wait_for(task, 1.0)
+    assert await pending_count(rclient, producer) == 0
+
+
+async def test_redis_entry_lost_by_local_worker_is_redelivered_after_grace(rclient: aioredis.Redis) -> None:
+    cfg = make_config(claim_idle_ms=100, block_ms=30)
+    producer = RedisStreamBus(rclient, cfg, "collector")
+    metrics = Metrics()
+    bus = RedisStreamBus(rclient, cfg, "gcp-1", metrics=metrics)
+    bus.reclaim_grace = 0.25  # production: 4 x claim_idle
+    await producer.start()
+    await producer.publish(make_listing(1))
+    received: list[BusMessage] = []
+
+    async def run() -> None:
+        async for msg in bus.consume():
+            received.append(msg)  # first delivery is "lost" by its worker (never acked)
+            if len(received) == 2:
+                await bus.ack(msg)
+
+    task = asyncio.create_task(run())
+    deadline = time.monotonic() + 3.0
+    while len(received) < 2 and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    await bus.close()
+    await asyncio.wait_for(task, 1.0)
+    assert len(received) == 2 and received[0].id == received[1].id
+    assert metric(metrics, "counter", "bus_recovered_total", via="autoclaim") == 1
     assert await pending_count(rclient, producer) == 0
 
 
@@ -749,7 +890,11 @@ async def test_redis_maxlen_trims_stream_approximately(rclient: aioredis.Redis) 
     assert 1000 <= length < 1600
 
 
-async def test_redis_consumer_recovers_after_stream_and_group_vanish(rclient: aioredis.Redis) -> None:
+@pytest.mark.parametrize("gap", [0.0, 0.1], ids=["publish-immediately", "publish-later"])
+async def test_redis_consumer_recovers_after_stream_and_group_vanish(rclient: aioredis.Redis, gap: float) -> None:
+    # The idle consumer is parked in XREADGROUP BLOCK; Redis 7 wakes it with
+    # "-UNBLOCKED the stream key no longer exists". An entry XADDed right after the
+    # loss (gap 0, before the group is recreated) must not be skipped by a "$" group.
     cfg = make_config()
     producer = RedisStreamBus(rclient, cfg, "collector")
     metrics = Metrics()
@@ -770,7 +915,7 @@ async def test_redis_consumer_recovers_after_stream_and_group_vanish(rclient: ai
     assert len(received) == 1
 
     await rclient.delete(producer.stream)  # FLUSHALL / eviction: stream and group are gone
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(gap)
     await producer.publish(make_listing(2))  # XADD recreates the stream without the group
     deadline = time.monotonic() + 5.0
     while len(received) < 2 and time.monotonic() < deadline:
@@ -805,6 +950,41 @@ class FlakyRedis:
         return wrapper
 
 
+async def test_redis_group_recreation_after_loss_survives_an_intermediate_error(rclient: aioredis.Redis) -> None:
+    cfg = make_config()
+    producer = RedisStreamBus(rclient, cfg, "collector")
+    await producer.start()
+    flaky = FlakyRedis(rclient, {"xgroup_create": 0}, exc=redis_exc.OutOfMemoryError("command not allowed when used memory > 'maxmemory'"))
+    metrics = Metrics()
+    consumer = RedisStreamBus(flaky, cfg, "gcp-1", metrics=metrics)  # type: ignore[arg-type]
+    received: list[str] = []
+
+    async def run() -> None:
+        async for msg in consumer.consume():
+            received.append(msg.raw.source_id)
+            await consumer.ack(msg)
+
+    task = asyncio.create_task(run())
+    await producer.publish(make_listing(1))
+    deadline = time.monotonic() + 3.0
+    while not received and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert received == [make_listing(1).source_id]
+
+    flaky.failures["xgroup_create"] = 1  # the first recreation attempt hits OOM
+    await rclient.delete(producer.stream)  # stream + group gone (eviction / FLUSHALL)
+    await producer.publish(make_listing(2))  # recreates the stream, without the group
+    deadline = time.monotonic() + 5.0
+    while len(received) < 2 and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    await consumer.close()
+    await asyncio.wait_for(task, 2.0)
+    # The recreation must still start from "0" after the OOM, or listing 2 is skipped.
+    assert received == [make_listing(1).source_id, make_listing(2).source_id]
+    assert flaky.calls["xgroup_create"] >= 3  # initial create, OOM, successful recreate
+    assert metric(metrics, "counter", "bus_errors_total", op="consume") >= 2
+
+
 async def test_redis_consumer_survives_transient_errors(rclient: aioredis.Redis) -> None:
     cfg = make_config()
     producer = RedisStreamBus(rclient, cfg, "collector")
@@ -820,27 +1000,121 @@ async def test_redis_consumer_survives_transient_errors(rclient: aioredis.Redis)
     await bus.close()
 
 
-async def test_redis_publish_retries_then_raises_bus_error(rclient: aioredis.Redis) -> None:
-    cfg = make_config()
-    recovering = FlakyRedis(rclient, {"xadd": 2})
-    bus = RedisStreamBus(recovering, cfg, "collector")  # type: ignore[arg-type]
-    await bus.publish(make_listing(1))  # two transient failures are absorbed
-    assert recovering.calls["xadd"] == 3
-    assert await rclient.xlen(bus.stream) == 1
+@pytest.fixture
+def fast_publish_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    import deal_radar.engine.bus as bus_module
 
+    monkeypatch.setattr(bus_module, "_PUBLISH_BACKOFF_BASE", 0.005)
+    monkeypatch.setattr(bus_module, "_PUBLISH_BACKOFF_CAP", 0.02)
+
+
+async def test_redis_publish_waits_out_a_long_outage(rclient: aioredis.Redis, fast_publish_backoff: None) -> None:
+    # The source loop (BaseIngestor) does not guard emit(): a publish that raised after a
+    # few seconds of outage would kill the collector's sources for good. It must wait.
+    cfg = make_config()
+    flaky = FlakyRedis(rclient, {"xadd": 25})
+    metrics = Metrics()
+    bus = RedisStreamBus(flaky, cfg, "collector", metrics=metrics)  # type: ignore[arg-type]
+    await bus.publish(make_listing(1))
+    assert flaky.calls["xadd"] == 26
+    assert await rclient.xlen(bus.stream) == 1
+    assert metric(metrics, "counter", "bus_published_total") == 1
+    assert metric(metrics, "counter", "bus_errors_total", op="publish") == 25
+
+
+async def test_redis_publish_waits_out_oom(rclient: aioredis.Redis, fast_publish_backoff: None) -> None:
+    oom = FlakyRedis(rclient, {"xadd": 3}, exc=redis_exc.OutOfMemoryError("command not allowed when used memory > 'maxmemory'"))
+    bus = RedisStreamBus(oom, make_config(), "collector")  # type: ignore[arg-type]
+    await bus.publish(make_listing(1))
+    assert oom.calls["xadd"] == 4
+
+
+async def test_redis_publish_blocked_by_outage_is_released_by_close(rclient: aioredis.Redis) -> None:
     dead = FlakyRedis(rclient, {"xadd": -1})  # fails forever
     metrics = Metrics()
-    bus_dead = RedisStreamBus(dead, cfg, "collector", metrics=metrics)  # type: ignore[arg-type]
-    with pytest.raises(BusError):
-        await bus_dead.publish(make_listing(2))
+    bus = RedisStreamBus(dead, make_config(), "collector", metrics=metrics)  # type: ignore[arg-type]
+    blocked = asyncio.create_task(bus.publish(make_listing(2)))
+    await asyncio.sleep(0.3)
+    assert not blocked.done(), "publish must keep waiting while Redis is unreachable"
+    started = time.monotonic()
+    await bus.close()
+    with pytest.raises(BusClosedError):
+        await asyncio.wait_for(blocked, 1.0)
+    assert time.monotonic() - started < 0.2  # the backoff sleep is interrupted by close()
     assert metric(metrics, "counter", "bus_published_total") == 0
     assert metric(metrics, "counter", "bus_errors_total", op="publish") >= 1
 
-    oom = FlakyRedis(rclient, {"xadd": -1}, exc=redis_exc.ResponseError("OOM command not allowed"))
-    bus_oom = RedisStreamBus(oom, cfg, "collector")  # type: ignore[arg-type]
+
+async def test_redis_publish_blocked_by_outage_can_be_cancelled(rclient: aioredis.Redis) -> None:
+    dead = FlakyRedis(rclient, {"xadd": -1})
+    bus = RedisStreamBus(dead, make_config(), "collector")  # type: ignore[arg-type]
+    blocked = asyncio.create_task(bus.publish(make_listing(2)))
+    await asyncio.sleep(0.1)
+    blocked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked
+
+
+async def test_redis_publish_non_transient_error_raises_bus_error(rclient: aioredis.Redis) -> None:
+    noperm = FlakyRedis(rclient, {"xadd": -1}, exc=redis_exc.NoPermissionError("NOPERM no permissions to run xadd"))
+    metrics = Metrics()
+    bus = RedisStreamBus(noperm, make_config(), "collector", metrics=metrics)  # type: ignore[arg-type]
     with pytest.raises(BusError):
-        await bus_oom.publish(make_listing(3))
-    assert oom.calls["xadd"] == 1  # non-transient: no retries
+        await bus.publish(make_listing(3))
+    assert noperm.calls["xadd"] == 1  # non-transient: no retries
+    assert metric(metrics, "counter", "bus_errors_total", op="publish") == 1
+
+    wrongtype = RedisStreamBus(rclient, make_config(), "collector")
+    await rclient.set(wrongtype.stream, "not a stream")  # real WRONGTYPE from the server
+    with pytest.raises(BusError):
+        await wrongtype.publish(make_listing(4))
+
+
+async def test_redis_publish_survives_real_server_restart() -> None:
+    """Kill redis-server under a running collector + processor, restart it empty."""
+    binary = _redis_binary()
+    if not binary:
+        pytest.skip("redis-server binary not available")
+    port = _free_port()
+    proc = _spawn_redis(binary, port)
+    if proc is None:
+        pytest.skip("could not start redis-server")
+    client = aioredis.Redis(host="127.0.0.1", port=port, socket_timeout=2.0, socket_connect_timeout=0.5)
+    cfg = make_config(block_ms=100)
+    bus = RedisStreamBus(client, cfg, "gcp-1")  # one object publishes and consumes, as in main.py
+    received: list[str] = []
+    task: asyncio.Task[None] | None = None
+    try:
+        await bus.start()
+
+        async def run() -> None:
+            async for msg in bus.consume():
+                received.append(msg.raw.source_id)
+                await bus.ack(msg)
+
+        task = asyncio.create_task(run())
+        await bus.publish(make_listing(1))
+        _stop_redis(proc)
+        blocked = asyncio.create_task(bus.publish(make_listing(2)))
+        await asyncio.sleep(0.5)
+        assert not blocked.done(), "publish must wait for Redis to come back"
+        proc = _spawn_redis(binary, port)
+        if proc is None:
+            pytest.skip("could not restart redis-server on the same port")
+        await asyncio.wait_for(blocked, 10.0)
+        deadline = time.monotonic() + 10.0
+        while len(received) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        # The restarted server has no group: the consumer recreates it from "0", so the
+        # entry published right after the restart is not skipped.
+        assert received == [make_listing(1).source_id, make_listing(2).source_id]
+    finally:
+        await bus.close()
+        if task is not None:
+            await asyncio.wait_for(task, 5.0)
+        await client.aclose()
+        if proc is not None:
+            _stop_redis(proc)
 
 
 async def test_redis_ack_failure_is_swallowed_and_counted(rclient: aioredis.Redis) -> None:

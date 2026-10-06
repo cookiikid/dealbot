@@ -151,6 +151,10 @@ _TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "57", "58"})
 _SECRET_QUERY_KEYS = frozenset({"password", "pass", "passwd", "pwd", "secret", "token", "auth"})
 
 
+class DatabaseNotConnected(RuntimeError):
+    """A query was attempted before :meth:`Database.connect` or after :meth:`Database.close`."""
+
+
 def json_safe(value: Any) -> Any:
     """Coerce a JSON document into the subset every backend and orjson accept.
 
@@ -224,7 +228,7 @@ def is_transient_error(exc: BaseException) -> bool:
     unavailable: retrying record by record would only hammer it) and bisecting it to
     isolate a poison record (constraint/encoding/serialisation errors are per-row).
     """
-    if isinstance(exc, (OSError, TimeoutError, sa_exc.TimeoutError, sa_exc.DisconnectionError)):
+    if isinstance(exc, (OSError, TimeoutError, sa_exc.TimeoutError, sa_exc.DisconnectionError, DatabaseNotConnected)):
         return True  # OSError covers ConnectionError/ConnectionRefusedError
     if isinstance(exc, sa_exc.DBAPIError):
         if exc.connection_invalidated or isinstance(exc, (sa_exc.OperationalError, sa_exc.InterfaceError)):
@@ -531,7 +535,7 @@ class Database:
     @property
     def engine(self) -> AsyncEngine:
         if self._engine is None:
-            raise RuntimeError("Database.connect() has not been called")
+            raise DatabaseNotConnected("Database.connect() has not been called (or close() was)")
         return self._engine
 
     async def connect(self) -> None:
@@ -1019,6 +1023,7 @@ async def connect_redis(url: str, *, max_connections: int, socket_timeout: float
 
 __all__ = [
     "Database",
+    "DatabaseNotConnected",
     "HISTORY_COMPATIBLE_GATES",
     "Recorder",
     "STATUS_ACCEPTED",
