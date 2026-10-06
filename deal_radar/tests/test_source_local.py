@@ -1094,3 +1094,275 @@ def test_registry_resolves_local_sources() -> None:
     assert load_ingestor_class("offerup") is ou.OfferUpIngestor
     assert load_ingestor_class("craigslist") is cl.CraigslistIngestor
     assert ou.OfferUpIngestor.kind is SourceKind.LOCAL and cl.CraigslistIngestor.kind is SourceKind.LOCAL
+
+
+# =========================================================================== adversarial-review regressions
+#
+# Shapes below come from 2026 recordings of craigslist.org (static result list with
+# ``www.craigslist.org/view/d/<slug>/<token>`` links, ``[13, token]`` sapi tag) and from
+# OfferUp web-app GraphQL clients (``x-ou-operation-name`` / ``x-ou-d-token`` headers,
+# ``isRemoved``/``state`` on listing objects).
+
+CL_TOKEN = "sznH9vDet1Yzc5uUyjGWXA"
+
+CL_HTML_2026 = """<!DOCTYPE html>
+<html><head><title>for sale "rtx 4090" near Brooklyn, NY 11216 - craigslist</title>
+<script>window.cl.init('https://www.craigslist.org/static/www/', '', 'www', 'search',
+{'initialCategoryAbbr': "sss",
+'location': {"radius":40,"region":"NY","type":"postal","lat":40.68,"lon":-73.94,"postal":"11216","city":"Brooklyn","country":"US","areaId":3,"v":1}}, 0);</script>
+</head><body>
+<ol class="cl-static-search-results">
+    <li class="cl-static-hub-links"><div>see also</div>
+        <p><a href="https://www.craigslist.org/search/city/brooklyn-ny?hub=computers&amp;postal=11216">computers</a></p>
+    </li>
+    <li class="cl-static-search-result" title="NVIDIA RTX 4090 FE">
+        <a href="https://www.craigslist.org/view/d/brooklyn-nvidia-rtx-4090-fe/sznH9vDet1Yzc5uUyjGWXA">
+            <div class="title">NVIDIA RTX 4090 FE</div>
+            <div class="details">
+                <div class="price">$1,400</div>
+                <div class="location">Brooklyn</div>
+            </div>
+        </a>
+    </li>
+    <li class="cl-static-search-result" title="RTX 4090 gaming PC">
+        <a href="/view/d/manhattan-rtx-4090-gaming-pc/11QDBnUSTTgQuQ5AXSoAWa">
+            <div class="title">RTX 4090 gaming PC</div>
+            <div class="details"><div class="price">$3,200</div></div>
+        </a>
+    </li>
+</ol>
+</body></html>"""
+
+
+def cl_sapi_payload_2026() -> dict[str, Any]:
+    payload = cl_sapi_payload()
+    items = payload["data"]["items"]
+    items[0] = [
+        123_456, 99_000, 7, 1400, "0:0:0~40.6710~-73.9814", "a1b2c3",
+        [13, CL_TOKEN], [4, "3:00a0a_jx892ZIFraf_0CI0qt"], [6, "brooklyn-nvidia-rtx-4090-fe"], [10, "$1,400"],
+        "NVIDIA RTX 4090 FE",
+    ]
+    return payload
+
+
+def test_craigslist_compact_item_uses_view_url_when_posting_key_present() -> None:
+    listings = cl.decode_search_response(cl_sapi_payload_2026(), _cl_ctx())
+    fe = listings[0]
+    assert fe.source_id == str(CL_MIN_POSTING_ID + 123_456)  # numeric posting id stays the identity
+    assert fe.url == f"https://www.craigslist.org/view/d/brooklyn-nvidia-rtx-4090-fe/{CL_TOKEN}"
+    assert fe.extra["posting_key"] == CL_TOKEN
+    # Items without a usable [13, key] keep the classic host/subarea/category URL.
+    assert listings[1].url.startswith("https://newyork.craigslist.org/mnh/sss/d/manhattan-rtx-4090-gaming-pc/")
+    assert "posting_key" not in listings[1].extra
+
+
+def test_craigslist_compact_item_reads_tags_after_the_title() -> None:
+    item = [
+        123_460, 5, 7, 900, "0:0~40.7~-74.0", "x9y8z7", [6, "brooklyn-rtx-4090"], "RTX 4090 blower",
+        [4, "3:00e0e_abcdefgh12_0CI0qt"], [10, "$900"],
+    ]
+    decode = cl._Decode.from_payload(cl_sapi_payload()["data"]["decode"])
+    raw = cl.decode_compact_item(item, decode, _cl_ctx())
+    assert raw is not None and raw.title == "RTX 4090 blower"
+    assert raw.image_urls == ["https://images.craigslist.org/00e0e_abcdefgh12_0CI0qt_600x450.jpg"]
+    assert raw.extra["price_text"] == "$900"
+
+
+def test_craigslist_parse_search_html_2026_view_links() -> None:
+    stats: dict[str, int] = {}
+    listings = cl.parse_search_html(CL_HTML_2026, _cl_ctx(), base_url="https://www.craigslist.org/search/sss", stats=stats)
+    assert [r.source_id for r in listings] == [CL_TOKEN, "11QDBnUSTTgQuQ5AXSoAWa"]
+    fe, pc = listings
+    assert fe.url == f"https://www.craigslist.org/view/d/brooklyn-nvidia-rtx-4090-fe/{CL_TOKEN}"
+    assert fe.title == "NVIDIA RTX 4090 FE" and fe.price == 1400.0
+    assert fe.extra["posting_key"] == CL_TOKEN and fe.extra["site"] == "newyork"  # never "www"
+    assert pc.url == "https://www.craigslist.org/view/d/manhattan-rtx-4090-gaming-pc/11QDBnUSTTgQuQ5AXSoAWa"
+    assert stats == {}
+    assert cl.extract_area_id(CL_HTML_2026) == 3
+
+
+def test_craigslist_parse_search_html_raises_when_every_row_is_unparseable() -> None:
+    # Result rows exist but none can be mapped (link scheme drifted): that is a parse
+    # failure, not an empty result, so the mode logic must not mark HTML as "working".
+    drifted = CL_HTML_2026.replace("/view/d/", "/posting/")
+    with pytest.raises(cl.CraigslistParseError):
+        cl.parse_search_html(drifted, _cl_ctx())
+
+
+async def test_craigslist_listing_identity_is_stable_across_modes(upstream: Upstream, ctx: IngestorContext) -> None:
+    # Reference data down: first poll runs on the static page (token links), learns the
+    # area id, and the next poll uses the JSON API (numeric ids). The same posting must
+    # keep one listing key, otherwise every listing would be re-alerted after the switch.
+    upstream.route("GET", "/ref/Areas", text("unavailable", status=500))
+    upstream.route("GET", "/ref/Categories", text("unavailable", status=500))
+    upstream.route("GET", "/site/newyork/search/sss", text(CL_HTML_2026))
+    upstream.route("GET", cl.SAPI_SEARCH_PATH, jsonr(cl_sapi_payload_2026()))
+    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
+    first = await ing.run_once()
+    assert {r.extra["via"] for r in first} == {"html"}
+    assert CL_TOKEN in {r.source_id for r in first}
+    second = await ing.poll()
+    assert {r.extra["via"] for r in second} == {"sapi"}
+    by_key = {r.extra.get("posting_key"): r for r in second}
+    assert by_key[CL_TOKEN].source_id == CL_TOKEN  # first identity wins
+    fresh = ing.select_changed(second)
+    assert CL_TOKEN not in {r.source_id for r in fresh}  # unchanged listing not re-emitted
+
+
+async def test_craigslist_html_mode_reuses_numeric_ids_learned_from_api(upstream: Upstream, ctx: IngestorContext) -> None:
+    _cl_reference_routes(upstream)
+    state = {"api_up": True}
+
+    async def sapi(request: web.Request) -> web.Response:
+        if state["api_up"]:
+            return web.json_response(cl_sapi_payload_2026())
+        return web.Response(text="<html>maintenance</html>", content_type="text/html")
+
+    upstream.route("GET", cl.SAPI_SEARCH_PATH, sapi)
+    upstream.route("GET", "/site/newyork/search/sss", text(CL_HTML_2026))
+    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
+    api = await ing.poll()
+    numeric = next(r.source_id for r in api if r.extra.get("posting_key") == CL_TOKEN)
+    state["api_up"] = False
+    html = await ing.poll()
+    assert {r.extra["via"] for r in html} == {"html"}
+    assert next(r.source_id for r in html if r.extra.get("posting_key") == CL_TOKEN) == numeric
+
+
+async def test_craigslist_api_requests_carry_www_origin(upstream: Upstream, ctx: IngestorContext) -> None:
+    _cl_reference_routes(upstream)
+    upstream.route("GET", cl.SAPI_SEARCH_PATH, jsonr(cl_sapi_payload()))
+    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
+    await ing.poll()
+    headers = upstream.calls("GET", cl.SAPI_SEARCH_PATH)[0]["headers"]
+    # The 2026 search UI runs on www.craigslist.org (city sub-domains redirect there).
+    assert headers["Origin"] == "https://www.craigslist.org" and headers["Referer"] == "https://www.craigslist.org/"
+
+
+async def test_craigslist_html_relative_links_resolve_against_final_url(upstream: Upstream, ctx: IngestorContext) -> None:
+    upstream.route("GET", "/ref/Areas", text("unavailable", status=500))
+    upstream.route("GET", "/ref/Categories", text("unavailable", status=500))
+
+    async def redirect(request: web.Request) -> web.StreamResponse:
+        raise web.HTTPFound(location=f"/www/search/city/brooklyn-ny?{request.query_string}")
+
+    upstream.route("GET", "/site/newyork/search/sss", redirect)
+    upstream.route("GET", "/www/search/city/brooklyn-ny", text(CL_HTML_2026))
+    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
+    listings = await ing.poll()
+    pc = next(r for r in listings if r.source_id == "11QDBnUSTTgQuQ5AXSoAWa")
+    assert pc.url == upstream.url("/view/d/manhattan-rtx-4090-gaming-pc/11QDBnUSTTgQuQ5AXSoAWa")
+
+
+async def test_craigslist_cancellation_mid_request_propagates_and_next_poll_recovers(
+    upstream: Upstream, ctx: IngestorContext
+) -> None:
+    import asyncio
+
+    _cl_reference_routes(upstream)
+    gate = {"slow": True}
+
+    async def sapi(request: web.Request) -> web.Response:
+        if gate["slow"]:
+            await asyncio.sleep(5)
+        return web.json_response(cl_sapi_payload())
+
+    upstream.route("GET", cl.SAPI_SEARCH_PATH, sapi)
+    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
+    task = asyncio.create_task(ing.poll())
+    while not upstream.calls("GET", cl.SAPI_SEARCH_PATH):
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate["slow"] = False
+    assert len(await ing.poll()) == 3
+
+
+async def test_offerup_graphql_403_on_geocode_does_not_block_the_source(upstream: Upstream, ctx: IngestorContext) -> None:
+    # OfferUp's GraphQL is token-gated for anonymous clients; a bare 403 there is not an
+    # IP block. The ZIP cookie still scopes the SSR search page, which works.
+    upstream.route("POST", "/api/graphql", jsonr({"errors": [{"message": "Forbidden"}]}, status=403))
+    upstream.route("GET", "/search", text(ou_page(ou_feed(OU_LISTING_FE))))
+    ing = offerup(ctx, upstream, latitude=None, longitude=None, zip_code="11216", profiles=["rtx_4090"])
+    listings = await ing.poll()
+    assert [r.source_id for r in listings] == [OU_LISTING_FE["listingId"]]
+    await ing.poll()
+    assert len(upstream.calls("POST", "/api/graphql")) == 1  # geocoding backs off instead of retrying every poll
+
+
+async def test_offerup_gated_graphql_fallback_is_not_reported_as_block(upstream: Upstream, ctx: IngestorContext) -> None:
+    upstream.route("GET", "/search", text("<html><body><div id='__next'></div></body></html>"))  # degraded SSR
+    upstream.route("POST", "/api/graphql", jsonr({"errors": [{"message": "Forbidden"}]}, status=403))
+    ing = offerup(ctx, upstream, profiles=["rtx_4090"])
+    with pytest.raises(SourceError) as caught:
+        await ing.poll()
+    assert not isinstance(caught.value, SourceBlocked)
+    # The gated endpoint is parked: the next poll does not hit it again.
+    with pytest.raises(SourceError):
+        await ing.poll()
+    assert len(upstream.calls("POST", "/api/graphql")) == 1
+    assert len(upstream.calls("GET", "/search")) == 2
+
+
+async def test_offerup_graphql_challenge_wall_is_still_a_block(upstream: Upstream, ctx: IngestorContext) -> None:
+    upstream.route("GET", "/search", text("<html><body><div id='__next'></div></body></html>"))
+    upstream.route("POST", "/api/graphql", text(CLOUDFLARE_PAGE, status=403))
+    ing = offerup(ctx, upstream, profiles=["rtx_4090"])
+    with pytest.raises(SourceBlocked):
+        await ing.poll()
+
+
+async def test_offerup_graphql_sends_web_app_headers(upstream: Upstream, ctx: IngestorContext) -> None:
+    upstream.route("GET", "/search", text("<html></html>"))
+    upstream.route("POST", "/api/graphql", jsonr({"data": {"modularFeed": ou_feed(OU_LISTING_TUF)}}))
+    ing = offerup(ctx, upstream, profiles=["rtx_4090"])
+    await ing.poll()
+    await ing.poll()
+    first, second = upstream.calls("POST", "/api/graphql")
+    for call in (first, second):
+        headers = call["headers"]
+        assert headers["x-ou-operation-name"] == "GetModularFeed"
+        assert headers["x-ou-d-token"].startswith("web-")
+        assert headers["ou-session-id"].startswith(headers["x-ou-d-token"] + "@")
+        assert len(headers["x-request-id"]) == 36
+    # Device token is sticky per ingestor (like a browser profile); request ids are not.
+    assert first["headers"]["x-ou-d-token"] == second["headers"]["x-ou-d-token"]
+    assert first["headers"]["x-request-id"] != second["headers"]["x-request-id"]
+
+
+def test_offerup_removed_listing_is_marked_unavailable() -> None:
+    removed = dict(OU_LISTING_TUF, isRemoved=True, state="SOLD")
+    raw = ou.parse_listing(removed)
+    assert raw is not None and raw.in_stock is False and raw.extra["state"] == "SOLD"
+    live = ou.parse_listing(dict(OU_LISTING_TUF, isRemoved=False))
+    assert live is not None and live.in_stock is None
+
+
+def test_offerup_protocol_relative_image_urls_are_kept() -> None:
+    raw = ou.parse_listing(dict(OU_LISTING_TUF, image={"url": "//images.offerup.com/XyZ=/250x250/a1b2.jpg"}))
+    assert raw is not None and raw.image_urls == ["https://images.offerup.com/XyZ=/250x250/a1b2.jpg"]
+
+
+async def test_offerup_cancellation_mid_request_propagates_and_next_poll_recovers(
+    upstream: Upstream, ctx: IngestorContext
+) -> None:
+    import asyncio
+
+    gate = {"slow": True}
+
+    async def search(request: web.Request) -> web.Response:
+        if gate["slow"]:
+            await asyncio.sleep(5)
+        return web.Response(text=ou_page(ou_feed(OU_LISTING_FE)), content_type="text/html")
+
+    upstream.route("GET", "/search", search)
+    ing = offerup(ctx, upstream, profiles=["rtx_4090"])
+    task = asyncio.create_task(ing.poll())
+    while not upstream.calls("GET", "/search"):
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate["slow"] = False
+    assert len(await ing.poll()) == 1
