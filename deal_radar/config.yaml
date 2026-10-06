@@ -391,9 +391,9 @@ filters:
       probability: 0.15
       description: Phone number in the listing text (off-platform contact)
       patterns:
-        - '\(\d{3}\)\s?\d{3}[\s.-]\d{4}(?!\d)'
-        # first digit, then a look-behind asserting it is not preceded by another digit
-        - '\d(?<!\d\d)\d{2}[\s.-]\d{3}[\s.-]\d{4}(?!\d)'
+        # 555-123-4567 / (555) 123-4567 / 555.123.4567. Digit-led on purpose (fast scan): the
+        # look-behind after the first digit asserts the number is not part of a longer digit run.
+        - '\d(?<!\d\d)\d{2}\)?[\s.-]?\d{3}[\s.-]\d{4}(?!\d)'
     scam_story:
       action: risk
       probability: 0.35

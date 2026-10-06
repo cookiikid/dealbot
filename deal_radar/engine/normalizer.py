@@ -17,8 +17,11 @@ Design decisions
 * **One numeric grammar.** Prices are tokenised by one regex family (sign,
   currency prefix/suffix, digit run, ``k`` multiplier) and interpreted by
   :func:`_to_number`, which resolves US (``1,299.99``), European (``1.299,99``),
-  Swiss (``1'299.50``) and space-grouped (``1 299,99``) notations: a separator
-  followed by exactly three digits is a thousands separator, otherwise decimal.
+  Swiss (``1'299.50``) and space-grouped (``1 299,99``) notations. A lone ``,``
+  followed by exactly three digits groups thousands, otherwise it is a decimal
+  comma; a lone ``.`` + three digits groups thousands only for currencies written
+  that way (``"€1.299"``) and is ambiguous, hence rejected, for dollars or
+  unmarked numbers (``"$1.299"``).
 * **Currency markers beat bare numbers.** In a price field ``"2 for $50"`` means
   $50, so the first currency-marked amount wins over unmarked numbers. A bare
   ``$`` is USD unless the listing itself says it is priced in another dollar
@@ -125,6 +128,8 @@ _SYMBOL_CODES: dict[str, str] = {
     "\u20aa": "ILS",
     "\u20b1": "PHP",
 }
+# Currencies conventionally written with "." as the thousands separator.
+_DOT_GROUPING_CODES = frozenset({"EUR", "BRL", "TRY", "DKK", "NOK", "SEK", "PLN", "CZK", "HUF", "RUB"})
 _ISO_CODES = frozenset(
     {
         "USD", "CAD", "AUD", "NZD", "HKD", "SGD", "MXN", "TWD", "BRL", "EUR", "GBP", "JPY", "CNY",
@@ -235,8 +240,12 @@ def _valid_groups(groups: list[str]) -> bool:
     return all(len(g) == 3 for g in groups[1:])
 
 
-def _to_number(run: str, kilo: bool) -> float | None:
-    """Interpret one digit run ("1.299,99", "1,299.99", "1'299", "1,2" + k)."""
+def _to_number(run: str, kilo: bool, dot_grouping: bool = False) -> float | None:
+    """Interpret one digit run ("1.299,99", "1,299.99", "1'299", "1,2" + k).
+
+    ``dot_grouping``: the currency groups thousands with dots (EUR...), so a lone
+    "1.299" means 1299; otherwise it is ambiguous (1.299 or 1,299?) and rejected.
+    """
     s = run
     for ch in "'\u00a0\u202f\u2009 ":
         if ch in s:
@@ -263,6 +272,8 @@ def _to_number(run: str, kilo: bool) -> float | None:
             if len(tail) == 3 and head != "0" and len(head) <= 3:
                 if kilo:
                     return None  # "1,250k": 1.25k or 1,250k? refuse to guess
+                if dots and not dot_grouping:
+                    return None  # "$1.299": $1.299 or $1,299? refuse to guess
                 num = head + tail
             else:
                 num = head + "." + tail
@@ -285,7 +296,8 @@ def _candidate(m: re.Match[str]) -> _Candidate:
     else:
         run, kilo, marker = m.group("n2"), m.group("k2") is not None, m.group("post")
     negative = m.group("neg") is not None or m.group("neg2") is not None
-    return _Candidate(m.start(), m.end(), _to_number(run, kilo), marker, negative)
+    dot_grouping = marker is not None and _currency_from_marker(marker)[0] in _DOT_GROUPING_CODES
+    return _Candidate(m.start(), m.end(), _to_number(run, kilo, dot_grouping), marker, negative)
 
 
 def _match_floor(text: str, anchor: int, floor: int) -> int:
@@ -562,7 +574,8 @@ _HINT_RE = re.compile(
     | (?P<refurb>refurb(?:ished)?|renewed|reconditioned|remanufactured|recertified)\b
     | (?P<open>open[\s-]?box(?:ed)?|opened|box\s+(?:was\s+|has\s+been\s+)?opened|new\s+other|new\s+with\s+defects)\b
     | (?P<used>used|pre[\s-]?owned|second[\s-]?hand|like[\s-]new)\b
-    | (?P<new>brand[\s-]new|b?nib|nisb|b?nwt|new\s+in\s+(?:the\s+)?(?:sealed\s+)?box|factory[\s-]sealed|new\s+sealed|sealed|unopened)\b
+    | (?P<new>brand[\s-]new|b?nib|nisb|b?nwt|new\s+in\s+(?:the\s+)?(?:sealed\s+)?box
+        |factory[\s-]sealed|new\s+sealed|sealed|unopened)\b
     | (?P<plain_new>new)\b
     """,
     re.VERBOSE,
@@ -750,12 +763,19 @@ _TRACKING_PREFIXES = (
 _HOST_TRACKING_PARAMS: tuple[tuple[str, frozenset[str]], ...] = (
     (
         "ebay.",
-        frozenset({"_trkparms", "_trksid", "hash", "amdata", "itmmeta", "itmprp", "sspagename", "_from", "nordt", "_ul", "ul_noapp"}),
+        frozenset(
+            {"_trkparms", "_trksid", "hash", "amdata", "itmmeta", "itmprp", "sspagename", "_from", "nordt", "_ul", "ul_noapp"}
+        ),
     ),
     ("bestbuy.", frozenset({"loc", "acampid", "mpid", "cmp", "lid"})),
     (
         "facebook.",
-        frozenset({"referral_code", "referral_story_type", "tracking", "rdid", "share_url", "notif_id", "notif_t", "acontext", "aref", "sfnsn"}),
+        frozenset(
+            {
+                "referral_code", "referral_story_type", "tracking", "rdid", "share_url", "notif_id", "notif_t",
+                "acontext", "aref", "sfnsn",
+            }
+        ),
     ),
     ("slickdeals.", frozenset({"src", "attrsrc"})),
     (

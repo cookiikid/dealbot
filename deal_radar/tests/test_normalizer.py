@@ -142,7 +142,13 @@ MONEY_CASES: list[tuple[object, float | None, str | None]] = [
     ("\U0001f4b01299\U0001f4b0", 1299.0, None),
     ("$12,99", 12.99, "USD"),
     ("0,99", 0.99, None),
-    ("$1.299", 1299.0, "USD"),
+    ("$1.299", None, None),  # $1.299 or $1,299: ambiguous for dollars
+    ("1.299", None, None),
+    ("1.299 EUR", 1299.0, "EUR"),
+    ("R$1.299", 1299.0, "BRL"),
+    ("1.299.999", 1299999.0, None),  # several dots can only be grouping
+    ("$0.999", 0.999, "USD"),
+    ("1299.999", 1299.999, None),
     # free / zero
     ("Free", 0.0, None),
     ("FREE", 0.0, None),
@@ -238,6 +244,8 @@ def test_money_detail_flags_negative_and_bare_dollar() -> None:
         ("1.299,99", False, 1299.99),
         ("1,299,999", False, 1299999.0),
         ("1.299.999", False, 1299999.0),
+        ("1.299", False, None),
+        ("1.299", True, None),
         ("1,299", False, 1299.0),
         ("0,999", False, 0.999),
         ("1299,999", False, 1299.999),
@@ -255,6 +263,15 @@ def test_money_detail_flags_negative_and_bare_dollar() -> None:
 )
 def test_to_number(run: str, kilo: bool, expected: float | None) -> None:
     got = nm._to_number(run, kilo)
+    assert (got is None) if expected is None else got == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("run", "expected"),
+    [("1.299", 1299.0), ("12.999", 12999.0), ("0.999", 0.999), ("1.2", 1.2), ("1299.999", 1299.999)],
+)
+def test_to_number_dot_grouping(run: str, expected: float | None) -> None:
+    got = nm._to_number(run, False, dot_grouping=True)
     assert (got is None) if expected is None else got == pytest.approx(expected)
 
 
@@ -488,9 +505,15 @@ URL_CASES = [
         "https://www.facebook.com/marketplace/item/123456/",
     ),
     ("https://slickdeals.net/f/1700-rtx?src=frontpage&utm_source=rss&page=2", "https://slickdeals.net/f/1700-rtx?page=2"),
-    ("https://www.newegg.com/p/N82E16814500572?cm_sp=x&Item=N82E16814500572", "https://www.newegg.com/p/N82E16814500572?Item=N82E16814500572"),
+    (
+        "https://www.newegg.com/p/N82E16814500572?cm_sp=x&Item=N82E16814500572",
+        "https://www.newegg.com/p/N82E16814500572?Item=N82E16814500572",
+    ),
     ("https://www.walmart.com/ip/123?athbdg=L1600&wmlspartner=x&selected=true", "https://www.walmart.com/ip/123?selected=true"),
-    ("https://example.com/p?fbclid=1&gclid=2&mc_cid=3&mc_eid=4&_ga=5&spm=6&igshid=7&q=rtx%204090", "https://example.com/p?q=rtx%204090"),
+    (
+        "https://example.com/p?fbclid=1&gclid=2&mc_cid=3&mc_eid=4&_ga=5&spm=6&igshid=7&q=rtx%204090",
+        "https://example.com/p?q=rtx%204090",
+    ),
     ("https://example.com/p?UTM_Source=x&utm_medium=y&id=5&", "https://example.com/p?id=5"),
     # host / scheme / port / credentials normalisation
     ("https://user:pw@Example.COM:443/path", "https://example.com/path"),
@@ -693,7 +716,8 @@ def test_normalize_copies_passthrough_fields(normalizer: Normalizer) -> None:
     [
         ("$1,299.99", "$25.50", 1299.99, 25.5, 1325.49),
         (1299.999, 0.004, 1300.0, 0.0, 1300.0),
-        (100.105, "4.995", 100.1, 5.0, 105.1),
+        (100.104, "4.996", 100.1, None, 100.1),  # "4.996" is ambiguous -> unknown shipping
+        (100.104, 4.996, 100.1, 5.0, 105.1),
         ("$0.10", "$0.20", 0.1, 0.2, 0.3),
         ("$800 OBO", "Free shipping", 800.0, 0.0, 800.0),
         ("$800", "FREE Standard Shipping", 800.0, 0.0, 800.0),

@@ -180,7 +180,9 @@ def _fold_pattern(pattern: str) -> str:
 # with one of them, modulo whitespace runs. All anchors of all pattern sets are
 # merged into one greedy trie regex that is scanned once per listing over the
 # lower-cased, whitespace-normalised text; only pattern sets whose anchors occur are
-# then actually run. Pattern sets for which no anchor can be proven always run.
+# then actually run. Anchors need not be prefixes: any literal run that every match
+# must contain qualifies ("rent" in "^\W*rent\b", "x3d" in "\d{4}x3d"). Pattern
+# sets for which no anchor can be proven simply always run.
 
 _MAX_ANCHORS = 256  # per pattern; beyond this the prefix stops being extended
 _WS_RUN = re.compile(r"\s+")
@@ -285,21 +287,96 @@ def _anchor_node(op: Any, av: Any) -> tuple[set[str], bool] | None:
     return None
 
 
+def _nested_required(op: Any, av: Any) -> set[str] | None:
+    """Required literals of a compound node that could not be used as a plain prefix."""
+    assert _C is not None
+    if op is _C["SUBPATTERN"]:
+        _group, add_flags, del_flags, sub = av
+        return None if add_flags or del_flags else _required(_sub_items(sub))
+    if op is _C["ATOMIC_GROUP"]:
+        return _required(_sub_items(av))
+    if op is _C["BRANCH"]:
+        out: set[str] = set()
+        for branch in av[1]:
+            found = _required(_sub_items(branch))
+            if found is None:
+                return None  # one alternative needs no literal at all
+            out |= found
+        return out if len(out) <= _MAX_ANCHORS else None
+    if op in _C["REPEATS"] and av[0] >= 1:
+        return _required(_sub_items(av[2]))
+    return None
+
+
+def _required(items: Sequence[tuple[Any, Any]]) -> set[str] | None:
+    """Most selective literal set R such that every match contains some member of R.
+
+    Consecutive literal items form *runs* (prefix sets built by :func:`_anchor_node`);
+    a non-literal item (``\\d``, ``\\W*``, ``.*``...) closes the current run. Every run,
+    the required literals of positive look-arounds and of compound nodes are
+    candidates; the one whose shortest member is longest wins. Strings are
+    whitespace-squashed because the gate scans single-spaced text.
+    """
+    assert _C is not None
+    candidates: list[set[str]] = []
+    run: set[str] = {""}
+
+    def close() -> None:
+        nonlocal run
+        if run != {""}:
+            candidates.append(run)
+        run = {""}
+
+    for op, av in items:
+        if op is _C["ASSERT"]:  # positive look-ahead/behind: its content must be in the text too
+            inner = _required(_sub_items(av[1]))
+            if inner:
+                candidates.append(inner)
+            continue
+        if op in _C["ZERO_WIDTH"]:
+            continue
+        node = _anchor_node(op, av)
+        if node is None:
+            close()
+            nested = _nested_required(op, av)
+            if nested:
+                candidates.append(nested)
+            continue
+        strings, complete = node
+        combined = {p + s for p in run for s in strings}
+        if len(combined) > _MAX_ANCHORS:
+            close()
+            combined = set(strings)
+        run = combined
+        if not complete:
+            close()
+            nested = _nested_required(op, av)
+            if nested:
+                candidates.append(nested)
+    close()
+
+    best: set[str] | None = None
+    best_key = (0, 0)
+    for candidate in candidates:
+        squashed = {_WS_RUN.sub(" ", c) for c in candidate}
+        shortest = min(len(c.strip()) for c in squashed)
+        if shortest == 0:
+            continue  # some match may contain none of these literals
+        key = (shortest, -len(squashed))
+        if best is None or key > best_key:
+            best, best_key = squashed, key
+    return best
+
+
 def _literal_anchors(pattern: str) -> frozenset[str] | None:
-    """Anchors (lower-case, single-spaced) one of which starts every match, else ``None``."""
+    """Anchors (lower-case, single-spaced) one of which occurs in every match, else ``None``."""
     if _C is None or _sre_p is None:
         return None
     try:
-        strings, _complete = _anchor_seq(_sub_items(_sre_p.parse(pattern, 0)))
+        found = _required(_sub_items(_sre_p.parse(pattern, 0)))
     except Exception:  # noqa: BLE001 - optimisation only: anything unexpected disables gating
         return None
-    anchors: set[str] = set()
-    for s in strings:
-        s = _WS_RUN.sub(" ", s)
-        if not s.strip():
-            return None  # some match can start without a literal
-        anchors.add(s)
-    return frozenset(anchors) if anchors else None
+    return frozenset(found) if found else None
 
 
 def _set_anchors(patterns: Sequence[str]) -> frozenset[str] | None:

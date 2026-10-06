@@ -40,12 +40,20 @@ used by several independent open-source Marketplace tools; not an official contr
 Search results rarely carry a timestamp, so ``posted_at`` is only set when a
 ``creation_time`` is present.
 
-URL parameters (``minPrice``, ``maxPrice``, ``daysSinceListed`` ∈ {1, 7, 30},
-``sortBy=creation_time_descend``, ``exact=false``) are the ones Facebook's own UI
-produces. ``radius`` is sent as the UI's distance option (miles in miles-locales,
-otherwise km, snapped to {1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500}); its unit is
-not documented anywhere official and Facebook silently ignores unknown values, so the
-``city_slug`` location pin remains the primary location control.
+URL parameters (``minPrice``/``maxPrice`` in whole currency units, ``daysSinceListed``
+∈ {1, 7, 30}, ``sortBy=creation_time_descend``, ``exact=false``) are the ones Facebook's
+own UI produces; newest-first also returns the most complete result set. Location comes
+from the path (``city_slug`` or a numeric location id). No ``radius`` parameter is sent:
+for logged-in sessions Facebook ignores it and applies the radius saved on the account
+(Marketplace → Location). The ingestor reads the applied ``filter_radius_km`` from the
+page once and warns when it disagrees with ``location.radius_km``, and warns when an
+unrecognised slug was redirected to the account's default location.
+
+Recommended production setup (most to least important): the operator's home
+connection, a long-lived profile (``browser.user_data_dir``; fresh profiles get
+stricter treatment), and headed real Chrome (``executable_path`` to Google Chrome,
+``headless: false`` under Xvfb). Headless Chromium with :mod:`deal_radar.sources.stealth`
+works but is the weakest of these.
 
 CLI (run on a machine with a display, ideally the home connection the collector uses)::
 
@@ -95,12 +103,13 @@ SOURCE_NAME = "fb_marketplace"
 GRAPHQL_PATH = "/api/graphql"
 ITEM_LINK_SELECTOR = 'a[href*="/marketplace/item/"]'
 LISTING_MARKER = "marketplace_listing_title"
+#: Substrings that make a JSON payload worth parsing (listings, or an empty/withheld feed).
+PAYLOAD_MARKERS: tuple[str, ...] = (LISTING_MARKER, '"feed_units"')
 XSSI_PREFIX = "for (;;);"
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 
-#: Distance options of the Marketplace location dialog (miles or km depending on locale).
-FB_RADIUS_OPTIONS: tuple[int, ...] = (1, 2, 5, 10, 20, 40, 60, 80, 100, 250, 500)
-_MILES_REGIONS = frozenset({"US", "GB", "LR", "MM"})
+#: Relative difference between the account's saved radius and ``radius_km`` worth a warning.
+RADIUS_MISMATCH_TOLERANCE = 0.25
 
 #: Fraction of ``poll_timeout_seconds`` a poll may use before it stops starting queries.
 POLL_BUDGET_FRACTION = 0.8
@@ -158,6 +167,8 @@ _BLOCK_HINTS = {
     "rate_limited": "Facebook says requests are too fast; polling pauses (consider a longer poll interval)",
     "account_restricted": "the account is restricted; check facebook.com in your normal browser",
     "ineligible": "this account cannot use Marketplace (Page profile or unsupported region)",
+    "consent_required": "Facebook asks for Marketplace data-use consent (EU): accept it yourself in a normal "
+    f"browser session or in the `{LOGIN_COMMAND}` window",
 }
 
 # Single round-trip probes run inside the page.
@@ -166,11 +177,19 @@ _PROBE_JS = """() => {
     .slice(0, 25).map((el) => (el.innerText || '').trim()).filter(Boolean).join('\\n');
   const dialog = Array.from(document.querySelectorAll('[role="dialog"]'))
     .map((el) => (el.innerText || '').slice(0, 600)).join('\\n');
-  const form = document.querySelector('form#login_form, form[action*="/login"] input[name="pass"], input[name="pass"][type="password"]');
+  const form = document.querySelector(
+    'form#login_form, form[action*="/login"] input[name="pass"], input[name="pass"][type="password"]');
   return { title: document.title || '', text: (heads + '\\n' + dialog).slice(0, 4000), loginForm: !!form };
 }"""
-_EMBEDDED_JSON_JS = """(marker) => Array.from(document.querySelectorAll('script[type="application/json"]'))
-  .map((s) => s.textContent || '').filter((t) => t.includes(marker))"""
+_RADIUS_JS = """() => {
+  for (const s of document.querySelectorAll('script')) {
+    const m = (s.textContent || '').match(/"filter_radius_km"\\s*:\\s*([0-9.]+)/);
+    if (m) return parseFloat(m[1]);
+  }
+  return null;
+}"""
+_EMBEDDED_JSON_JS = """(markers) => Array.from(document.querySelectorAll('script[type="application/json"]'))
+  .map((s) => s.textContent || '').filter((t) => markers.some((m) => t.includes(m)))"""
 _DOM_CARDS_JS = """([selector, limit]) => {
   const out = [];
   const seen = new Set();
@@ -199,17 +218,6 @@ def listing_url(listing_id: str) -> str:
     return f"{FB_BASE_URL}/marketplace/item/{listing_id}/"
 
 
-def radius_param(radius_km: int, locale: str) -> int:
-    """``radius`` URL value: the Marketplace distance option closest to ``radius_km``.
-
-    The location dialog offers the same option list in miles for miles-locales (US/UK)
-    and in km elsewhere; ties resolve to the smaller radius.
-    """
-    region = locale.replace("_", "-").rsplit("-", 1)[-1].upper() if "-" in locale.replace("_", "-") else ""
-    value = radius_km / 1.609344 if region in _MILES_REGIONS else float(radius_km)
-    return min(FB_RADIUS_OPTIONS, key=lambda option: (abs(option - value), option))
-
-
 def build_search_url(
     base_url: str,
     *,
@@ -218,21 +226,18 @@ def build_search_url(
     min_price: float | None,
     max_price: float | None,
     days_since_listed: int,
-    radius: int | None = None,
 ) -> str:
     """Marketplace search URL, newest first, with the same parameters the UI emits."""
     path = f"/marketplace/{quote(location_slug.strip('/'), safe='')}/search" if location_slug else "/marketplace/search"
     params: list[tuple[str, str]] = []
     if min_price is not None and min_price > 0:
-        params.append(("minPrice", str(int(math.floor(min_price)))))
+        params.append(("minPrice", str(math.floor(min_price))))
     if max_price is not None and max_price > 0:
-        params.append(("maxPrice", str(int(math.ceil(max_price)))))
+        params.append(("maxPrice", str(math.ceil(max_price))))
     params.append(("daysSinceListed", str(int(days_since_listed))))
     params.append(("sortBy", "creation_time_descend"))
     params.append(("query", query))
     params.append(("exact", "false"))
-    if radius:
-        params.append(("radius", str(int(radius))))
     return f"{base_url.rstrip('/')}{path}?{urlencode(params, quote_via=quote)}"
 
 
@@ -246,10 +251,12 @@ def detect_block(url: str, *, title: str = "", text: str = "", has_login_form: b
     path = urlsplit(url).path.lower()
     if "/checkpoint" in path or "/two_step_verification" in path:
         return "checkpoint"
-    if path.startswith("/login") or path.startswith("/r.php") or "/login.php" in path:
+    if path.startswith(("/login", "/r.php")) or "/login.php" in path:
         return "login_required"
     if path.startswith("/marketplace/ineligible"):
         return "ineligible"
+    if path.startswith("/privacy/consent"):
+        return "consent_required"
     haystack = f"{title}\n{text}"
     for reason, pattern in _BLOCK_TEXT:
         if pattern.search(haystack):
@@ -338,6 +345,45 @@ def iter_listing_nodes(document: Any) -> Iterator[dict[str, Any]]:
         stack.extend(reversed([child for child in children if isinstance(child, (dict, list))]))
 
 
+def _cursor_match_count(page_info: Any) -> int:
+    """Matches announced by a feed cursor (``end_cursor`` is a JSON string with c2c/b2c ``it``)."""
+    cursor = page_info.get("end_cursor") if isinstance(page_info, Mapping) else None
+    if not isinstance(cursor, str) or not cursor.lstrip().startswith("{"):
+        return 0
+    try:
+        data = json.loads(cursor)
+    except ValueError:
+        return 0
+    total = 0
+    for key in ("c2c", "b2c"):
+        part = data.get(key) if isinstance(data, dict) else None
+        count = part.get("it") if isinstance(part, Mapping) else None
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            total += count
+    return total
+
+
+def count_withheld_feeds(document: Any) -> int:
+    """Search feeds that return no edges although their cursor reports matches.
+
+    Observed when Facebook withholds results from a client it distrusts (a soft block):
+    an empty page is then not an empty search.
+    """
+    withheld = 0
+    stack: list[Any] = [document]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            feed = node.get("feed_units")
+            if isinstance(feed, Mapping) and isinstance(feed.get("edges"), list) and not feed["edges"]:
+                if _cursor_match_count(feed.get("page_info")) > 0:
+                    withheld += 1
+            stack.extend(value for value in node.values() if isinstance(value, (dict, list)))
+        elif isinstance(node, list):
+            stack.extend(value for value in node if isinstance(value, (dict, list)))
+    return withheld
+
+
 def currency_from_text(text: str | None) -> str | None:
     """ISO currency for a formatted price ("CA$1,200" -> CAD, "350 €" -> EUR)."""
     if not text:
@@ -351,12 +397,10 @@ def currency_from_text(text: str | None) -> str | None:
 def _to_amount(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-    elif isinstance(value, str) and _DECIMAL_RE.match(value):
-        number = float(value)
-    else:
+    numeric = isinstance(value, (int, float)) or (isinstance(value, str) and _DECIMAL_RE.match(value) is not None)
+    if not numeric:
         return None
+    number = float(value)
     if math.isnan(number) or math.isinf(number) or number < 0:
         return None
     return number
@@ -552,7 +596,7 @@ def _merge(existing: RawListing, newer: RawListing) -> None:
 
 
 class ParseStats(Counter):
-    """Counts of skipped nodes per reason (``sold``, ``pending``, ``no_id``...) plus ``documents``."""
+    """Skipped nodes per reason (``sold``, ``pending``, ``no_id``...) plus ``documents`` and ``withheld``."""
 
 
 def parse_payloads(
@@ -573,6 +617,9 @@ def parse_payloads(
     for via, text in payloads:
         for document in iter_json_documents(text):
             stats["documents"] += 1
+            withheld = count_withheld_feeds(document)
+            if withheld:
+                stats["withheld"] += withheld
             for node in iter_listing_nodes(document):
                 listing, reason = _listing_from_node(node, query=query, profile_hint=profile_hint, via=via)
                 if listing is None:
@@ -718,6 +765,7 @@ class FbMarketplaceIngestor(BaseIngestor):
         # True once a poll succeeded, False again after a wall: only a session that
         # demonstrably works is written back over the saved one.
         self._session_ok = False
+        self._location_checked = False
         m = ctx.metrics
         self._m_payloads = m.counter("fb_payloads_total", "Facebook JSON payloads captured", ("kind",))
         self._m_skipped = m.counter("fb_listings_skipped_total", "Facebook listing nodes skipped", ("reason",))
@@ -817,7 +865,8 @@ class FbMarketplaceIngestor(BaseIngestor):
     async def _ensure_page(self) -> "Page":
         browser_dead = self._browser is not None and not self._browser.is_connected()
         if self._context is None or self._needs_restart or browser_dead:
-            self.log.warning("browser not available; restarting", extra={"source": self.name})
+            if self._needs_restart or browser_dead:
+                self.log.warning("browser died; restarting it", extra={"source": self.name})
             await self.setup()
         if self._page is None or self._page.is_closed():
             self._page = await self._new_page()
@@ -914,7 +963,6 @@ class FbMarketplaceIngestor(BaseIngestor):
             min_price=profile.search.price_min or band.floor,
             max_price=profile.search.price_max or band.ceiling,
             days_since_listed=self.cfg.days_since_listed,
-            radius=radius_param(geo.radius_km, geo.locale),
         )
         limit = self.cfg.max_listings_per_query
         browser_cfg = self.cfg.browser
@@ -925,10 +973,14 @@ class FbMarketplaceIngestor(BaseIngestor):
             response = await page.goto(url, wait_until="domcontentloaded")
             await self._raise_if_blocked(page, response.status if response is not None else None)
             await self._wait_for_results(page)
+            if not self._location_checked:
+                await self._check_location(page, geo)
             for _ in range(self.cfg.scrolls_per_query):
                 if await page.locator(ITEM_LINK_SELECTOR).count() >= limit:
                     break
-                await human_pause(self.ctx.rng, browser_cfg.min_action_delay_seconds / 2, browser_cfg.max_action_delay_seconds / 2)
+                await human_pause(
+                    self.ctx.rng, browser_cfg.min_action_delay_seconds / 2, browser_cfg.max_action_delay_seconds / 2
+                )
                 before = len(sink)
                 await human_scroll(
                     page,
@@ -940,7 +992,7 @@ class FbMarketplaceIngestor(BaseIngestor):
                 await self._wait_for_more(sink, before)
             await self._drain_pending()
             await self._raise_if_blocked(page, None)  # logged-out walls appear after scrolling
-            embedded: list[str] = await page.evaluate(_EMBEDDED_JSON_JS, LISTING_MARKER)
+            embedded: list[str] = await page.evaluate(_EMBEDDED_JSON_JS, list(PAYLOAD_MARKERS))
         finally:
             self._capture = None
         self._m_payloads.inc(len(embedded), kind="embedded")
@@ -948,8 +1000,14 @@ class FbMarketplaceIngestor(BaseIngestor):
         payloads = [("embedded", text) for text in embedded] + [("graphql", text) for text in sink]
         listings, stats = await asyncio.to_thread(parse_payloads, payloads, query=term, profile_hint=profile.id)
         for reason, count in stats.items():
-            if reason != "documents":
+            if reason not in ("documents", "withheld"):
                 self._m_skipped.inc(count, reason=reason)
+        if stats["withheld"] and not listings:
+            self._m_blocks.inc(reason="withheld")
+            self.log.warning(
+                "Facebook reported matches but returned no listings (results withheld; possible soft block)",
+                extra={"source": self.name, "query": term},
+            )
         if not listings:
             cards = await page.evaluate(_DOM_CARDS_JS, [ITEM_LINK_SELECTOR, limit])
             listings = parse_dom_cards(cards, query=term, profile_hint=profile.id)
@@ -962,7 +1020,7 @@ class FbMarketplaceIngestor(BaseIngestor):
                 "query": term,
                 "listings": len(listings),
                 "payloads": len(payloads),
-                "skipped": {k: v for k, v in stats.items() if k != "documents"},
+                "skipped": {k: v for k, v in stats.items() if k not in ("documents", "withheld")},
             },
         )
         return listings[:limit]
@@ -991,6 +1049,28 @@ class FbMarketplaceIngestor(BaseIngestor):
             f"Facebook {reason.replace('_', ' ')} at {where}: {_BLOCK_HINTS.get(reason, 'pausing')}",
             cooldown_seconds=self.cfg.checkpoint_pause_minutes * 60.0,
         )
+
+    async def _check_location(self, page: "Page", geo: GeoPin) -> None:
+        """Once per session: warn when Facebook does not search where the config says."""
+        self._location_checked = True
+        path = urlsplit(page.url).path
+        if geo.city_slug and not path.startswith(f"/marketplace/{geo.city_slug.strip('/')}/"):
+            self.log.warning(
+                "Facebook did not recognise location.city_slug; searches use the account's saved location",
+                extra={"source": self.name, "city_slug": geo.city_slug, "landed_on": path,
+                       "hint": "use the numeric location id from the Marketplace URL instead"},
+            )
+        try:
+            applied = await page.evaluate(_RADIUS_JS)
+        except PlaywrightError:
+            return
+        if isinstance(applied, (int, float)) and applied > 0:
+            if abs(applied - geo.radius_km) > RADIUS_MISMATCH_TOLERANCE * geo.radius_km:
+                self.log.warning(
+                    "Facebook applies the account's saved search radius, not location.radius_km",
+                    extra={"source": self.name, "account_radius_km": applied, "configured_radius_km": geo.radius_km,
+                           "hint": "change it in Marketplace > Location with the logged-in account"},
+                )
 
     async def _wait_for_results(self, page: "Page") -> bool:
         loop = asyncio.get_running_loop()
@@ -1043,7 +1123,7 @@ class FbMarketplaceIngestor(BaseIngestor):
             self._m_payloads.inc(kind="oversized")
             return
         text = body.decode("utf-8", errors="replace")
-        if LISTING_MARKER in text:
+        if any(marker in text for marker in PAYLOAD_MARKERS):
             sink.append(text)
             self._captured.set()
 
@@ -1216,6 +1296,7 @@ __all__ = [
     "FbMarketplaceIngestor",
     "ParseStats",
     "build_search_url",
+    "count_withheld_feeds",
     "currency_from_text",
     "detect_block",
     "has_session_cookie",
@@ -1226,7 +1307,6 @@ __all__ = [
     "parse_dom_cards",
     "parse_graphql_payload",
     "parse_payloads",
-    "radius_param",
     "run_check",
     "run_login",
     "session_problem",

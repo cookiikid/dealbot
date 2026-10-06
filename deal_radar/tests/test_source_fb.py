@@ -28,7 +28,7 @@ from deal_radar.core.metrics import Metrics
 from deal_radar.engine.types import SourceKind
 from deal_radar.sources import fb_marketplace as fb
 from deal_radar.sources import stealth
-from deal_radar.sources.base import IngestorContext, SourceAuthError, SourceBlocked
+from deal_radar.sources.base import IngestorContext, SourceAuthError, SourceBlocked, SourceError
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fb"
 GRAPHQL_PAGE1 = (FIXTURES / "search_graphql.txt").read_text(encoding="utf-8")
@@ -135,7 +135,7 @@ async def _require_chromium(build: str = "full") -> str | None:
             async with async_playwright() as pw:
                 browser = await stealth.launch_browser(pw, BrowserSection(headless=True, executable_path=exe))
                 await browser.close()
-        except Exception:  # noqa: BLE001 - any launch problem means "skip"
+        except Exception:  # noqa: BLE001, S112 - any launch problem means "try the next build, else skip"
             continue
         _LAUNCHABLE[build] = exe
         return exe
@@ -202,7 +202,9 @@ def test_iter_json_documents_single_document_and_empty() -> None:
 def test_iter_listing_nodes_walks_generically_in_document_order() -> None:
     doc = {
         "data": {
-            "viewer": {"marketplace_feed_stories": {"edges": [{"node": {"listing": {"id": "1", "marketplace_listing_title": "A"}}}]}},
+            "viewer": {
+                "marketplace_feed_stories": {"edges": [{"node": {"listing": {"id": "1", "marketplace_listing_title": "A"}}}]}
+            },
             "other": [{"deep": [{"x": {"id": "2", "marketplace_listing_title": "B", "listing_price": None}}]}],
             "not_a_listing": {"marketplace_listing_title": "no id or price"},
         }
@@ -316,7 +318,8 @@ def test_price_variants_and_defensive_fields() -> None:
     nodes = [
         {"id": "1", "marketplace_listing_title": "A", "listing_price": {"amount": 1250, "formatted_amount": "$1,250"}},
         {"id": "2", "marketplace_listing_title": "B", "listing_price": {"amount": "abc", "formatted_amount": "350 €"}},
-        {"id": "3", "marketplace_listing_title": "C", "listing_price": "garbage", "location": "nowhere", "primary_listing_photo": 7},
+        {"id": "3", "marketplace_listing_title": "C", "listing_price": "garbage", "location": "nowhere",
+         "primary_listing_photo": 7},
         {"id": "4", "marketplace_listing_title": "D", "listing_price": {"amount": "-5"}, "creation_time": "1759700000"},
         {"id": "5", "marketplace_listing_title": "E", "listing_price": {"amount": "10", "currency": "eur"}, "creation_time": 1},
         {"id": "6", "marketplace_listing_title": "F", "listing_price": {"formatted_amount_zeros_stripped": "£40"},
@@ -339,9 +342,25 @@ def test_price_variants_and_defensive_fields() -> None:
     assert (six.location.latitude, six.location.longitude) == (53.8, -1.55)
 
 
+def test_withheld_results_are_counted() -> None:
+    def feed(edges: list[Any], cursor: str | None) -> dict[str, Any]:
+        return {"data": {"marketplace_search": {"feed_units": {"edges": edges, "page_info": {"end_cursor": cursor}}}}}
+
+    withheld = feed([], json.dumps({"pg": 0, "b2c": {"br": "", "it": 0}, "c2c": {"br": "AbqX", "it": 12}}))
+    assert fb.count_withheld_feeds(withheld) == 1
+    assert fb.count_withheld_feeds(feed([], json.dumps({"c2c": {"it": 0}, "b2c": {"it": 0}}))) == 0  # truly empty
+    assert fb.count_withheld_feeds(feed([], "AQHRn0cX2vC1QWp6")) == 0  # opaque cursor
+    assert fb.count_withheld_feeds(feed([{"node": {}}], json.dumps({"c2c": {"it": 3}}))) == 0
+    _, stats = fb.parse_payloads([("graphql", json.dumps(withheld))])
+    assert stats["withheld"] == 1
+
+
 @pytest.mark.parametrize(
     ("text", "code"),
-    [("$650", "USD"), ("CA$1,200", "CAD"), ("A$90", "AUD"), ("350 €", "EUR"), ("£40", "GBP"), ("R$ 900", "BRL"), ("Free", None), (None, None)],
+    [
+        ("$650", "USD"), ("CA$1,200", "CAD"), ("A$90", "AUD"), ("350 €", "EUR"), ("£40", "GBP"), ("R$ 900", "BRL"),
+        ("Free", None), (None, None),
+    ],
 )
 def test_currency_from_text(text: str | None, code: str | None) -> None:
     assert fb.currency_from_text(text) == code
@@ -387,22 +406,19 @@ def test_build_search_url() -> None:
         min_price=299.5,
         max_price=900.2,
         days_since_listed=1,
-        radius=40,
     )
     assert url == (
         "https://www.facebook.com/marketplace/nyc/search?minPrice=299&maxPrice=901&daysSinceListed=1"
-        "&sortBy=creation_time_descend&query=rtx%203090%20%26%20fe&exact=false&radius=40"
+        "&sortBy=creation_time_descend&query=rtx%203090%20%26%20fe&exact=false"
     )
-    bare = fb.build_search_url("http://127.0.0.1:1", location_slug=None, query="x", min_price=None, max_price=0, days_since_listed=7)
+    numeric = fb.build_search_url(
+        "https://www.facebook.com", location_slug="108424279189115", query="x", min_price=1, max_price=2, days_since_listed=30
+    )
+    assert numeric.startswith("https://www.facebook.com/marketplace/108424279189115/search?minPrice=1&maxPrice=2&daysSinceListed=30")
+    bare = fb.build_search_url(
+        "http://127.0.0.1:1", location_slug=None, query="x", min_price=None, max_price=0, days_since_listed=7
+    )
     assert bare == "http://127.0.0.1:1/marketplace/search?daysSinceListed=7&sortBy=creation_time_descend&query=x&exact=false"
-
-
-@pytest.mark.parametrize(
-    ("radius_km", "locale", "expected"),
-    [(60, "en-US", 40), (40, "en-US", 20), (60, "de-DE", 60), (805, "en-US", 500), (1, "en-US", 1), (100, "en_GB", 60), (3, "fr-FR", 2)],
-)
-def test_radius_param(radius_km: int, locale: str, expected: int) -> None:
-    assert fb.radius_param(radius_km, locale) == expected
 
 
 @pytest.mark.parametrize(
@@ -415,6 +431,7 @@ def test_radius_param(radius_km: int, locale: str, expected: int) -> None:
         ("https://www.facebook.com/login/?next=https%3A%2F%2Fwww.facebook.com%2Fmarketplace", {}, "login_required"),
         ("https://www.facebook.com/login.php?skip_api_login=1", {}, "login_required"),
         ("https://www.facebook.com/marketplace/ineligible/", {}, "ineligible"),
+        ("https://www.facebook.com/privacy/consent/?flow=fb_dma_marketplace", {}, "consent_required"),
         ("https://www.facebook.com/marketplace/nyc/search", {"has_login_form": True}, "login_required"),
         ("https://www.facebook.com/marketplace/nyc/search", {"text": "You’re Temporarily Blocked"}, "temporarily_blocked"),
         ("https://www.facebook.com/marketplace/nyc/search", {"title": "You're temporarily blocked"}, "temporarily_blocked"),
@@ -441,7 +458,10 @@ def test_session_cookie_helpers(tmp_path: Path) -> None:
     assert fb.session_problem([1, 2]) == "not a Playwright storage-state file"
     _write_state(state_path, expires=1_700_000_000)
     assert "expired" in (fb.session_problem(json.loads(state_path.read_text())) or "")
-    other_site = [{"name": "c_user", "value": "1", "domain": ".example.com"}, {"name": "xs", "value": "1", "domain": ".example.com"}]
+    other_site = [
+        {"name": "c_user", "value": "1", "domain": ".example.com"},
+        {"name": "xs", "value": "1", "domain": ".example.com"},
+    ]
     assert not fb.has_session_cookie(other_site)
 
 
@@ -717,7 +737,7 @@ async def test_stealth_init_script_in_real_chromium(build: str, tmp_path: Path) 
     assert info["brandError"] == "TypeError"
     assert info["timezone"] == "America/Chicago"
     outer_w, outer_h, inner_w, inner_h, screen_w, screen_h = info["outer"]
-    assert outer_h > inner_h and screen_w >= outer_w and screen_h >= outer_h
+    assert outer_w >= inner_w and outer_h > inner_h and screen_w >= outer_w and screen_h >= outer_h
     assert info["child"] == {"webdriver": info["webdriver"], "languages": ["en-US", "en"], "chrome": "object",
                              "plugins": info["plugins"]}
     # One Accept-Language for the document and its own XHR/fetch, matching navigator.languages.
@@ -761,39 +781,57 @@ class FakeMarketplace:
 
     async def search(self, request: web.Request) -> web.Response:
         self.searches.append(
-            {"slug": request.match_info["slug"], "query": dict(request.query), "accept_language": request.headers.get("Accept-Language")}
+            {
+                "slug": request.match_info["slug"],
+                "query": dict(request.query),
+                "accept_language": request.headers.get("Accept-Language"),
+            }
         )
         mode = self.mode
         if mode == "checkpoint":
             raise web.HTTPFound("/checkpoint/1501092823525282/?next=%2Fmarketplace%2F")
+        if request.match_info["slug"] not in ("nyc", "category"):
+            # What Facebook does with an unknown slug: search around the account's saved location.
+            raise web.HTTPFound(f"/marketplace/category/search?{request.query_string}")
+        radius = "<script type='application/json'>{\"browse_request_params\":{\"filter_radius_km\":250}}</script>"
         if mode == "graphql":
             body = _GRAPHQL_PAGE_JS + "<div role='main'>Results</div>"
         elif mode == "ssr":
             body = (
                 f"<script type='application/json' data-content-len='{len(SSR_SCRIPT)}' data-sjs>{SSR_SCRIPT}</script>"
-                "<script type='application/json' data-sjs>{\"require\":[[\"Bootloader\",\"markComponentsAsImmediate\",null,[[]]]]}</script>"
+                "<script type='application/json' data-sjs>"
+                "{\"require\":[[\"Bootloader\",\"markComponentsAsImmediate\",null,[[]]]]}</script>"
                 "<a href='/marketplace/item/3131313131313131/?ref=search'><div>$480</div><div>Steam Deck OLED 1TB</div></a>"
             )
+        elif mode == "withheld":
+            empty = {"data": {"marketplace_search": {"feed_units": {
+                "edges": [], "page_info": {"end_cursor": json.dumps({"c2c": {"br": "Abq", "it": 12}}), "has_next_page": True}}}}}
+            body = f"<script type='application/json' data-sjs>{json.dumps(empty)}</script>"
         elif mode == "dom":
             body = (
                 "<div role='main'>"
                 "<a href='/marketplace/item/4242424242424242/?ref=search&amp;referral_code=null'>"
                 "<div><img src='/img/4242.jpg' alt='Steam Deck OLED 1TB in Queens, NY'></div>"
                 "<div>$450</div><div>$520</div><div>Steam Deck OLED 1TB</div><div>Queens, NY</div></a>"
-                "<a href='/marketplace/item/4343434343434343/'><div>$399</div><div>Steam Deck OLED 512GB</div><div>Bronx, NY</div></a>"
+                "<a href='/marketplace/item/4343434343434343/'>"
+                "<div>$399</div><div>Steam Deck OLED 512GB</div><div>Bronx, NY</div></a>"
                 f"<a href='/marketplace/item/4444444444444444/'><div>$1</div><div>{request.query.get('query', '')}</div></a>"
                 "</div>"
             )
         elif mode == "login":
             body = (
-                "<div role='dialog'><h2>See more on Facebook</h2><form id='login_form' action='/login/device-based/regular/login/'>"
+                "<div role='dialog'><h2>See more on Facebook</h2>"
+                "<form id='login_form' action='/login/device-based/regular/login/'>"
                 "<input name='email'><input type='password' name='pass'></form></div>"
             )
         elif mode == "blocked":
-            body = "<div role='dialog'><h2>You’re Temporarily Blocked</h2><p>It looks like you were misusing this feature.</p></div>"
+            body = (
+                "<div role='dialog'><h2>You’re Temporarily Blocked</h2>"
+                "<p>It looks like you were misusing this feature.</p></div>"
+            )
         else:  # pragma: no cover - test bug
             raise AssertionError(mode)
-        return web.Response(text=_HTML_HEAD + body + _HTML_TAIL, content_type="text/html")
+        return web.Response(text=_HTML_HEAD + radius + body + _HTML_TAIL, content_type="text/html")
 
     async def graphql(self, request: web.Request) -> web.Response:
         form = await request.post()
@@ -861,7 +899,6 @@ async def test_poll_captures_graphql_and_scroll_pagination(tmp_path: Path, http:
         "sortBy": "creation_time_descend",
         "query": "rtx 3090",
         "exact": "false",
-        "radius": "40",
     }
     assert (search["accept_language"] or "").startswith("en-US,en")
 
@@ -906,6 +943,24 @@ async def test_poll_budget_rotates_through_terms(tmp_path: Path, http: HttpClien
     ]
 
 
+async def test_poll_warns_about_location_and_withheld_results(
+    tmp_path: Path, http: HttpClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    metrics = Metrics()
+    caplog.set_level("WARNING", logger="deal_radar.sources.fb_marketplace")
+    (listings,), market, _ = await _run_against(
+        "withheld", tmp_path, http, profiles=["rtx3090"], metrics=metrics, scrolls_per_query=0,
+        location=_geo(city_slug="atlantis", radius_km=60),
+    )
+    assert listings == []
+    assert [s["slug"] for s in market.searches] == ["atlantis", "category"]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("did not recognise location.city_slug" in m for m in messages)
+    assert any("saved search radius" in m for m in messages)
+    assert any("results withheld" in m for m in messages)
+    assert metrics.counter("fb_blocks_total", "", ("reason",)).value(reason="withheld") == 1
+
+
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [("checkpoint", "checkpoint"), ("login", "login required"), ("blocked", "temporarily blocked")],
@@ -941,10 +996,51 @@ async def test_run_once_applies_change_detection(tmp_path: Path, http: HttpClien
     assert ingestor.health.polls == 2 and ingestor.health.state == "ok"
 
 
+async def test_poll_restarts_a_crashed_browser(tmp_path: Path, http: HttpClient, caplog: pytest.LogCaptureFixture) -> None:
+    exe = await _require_chromium("full")
+    caplog.set_level("WARNING", logger="deal_radar.sources.fb_marketplace")
+    server = TestServer(FakeMarketplace("dom").app(), host="127.0.0.1")
+    await server.start_server()
+    cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0)
+    _write_state(Path(cfg.browser.storage_state_path))
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()), base_url=str(server.make_url("/")))
+    ingestor.results_timeout_seconds = 3.0
+    try:
+        first = await ingestor.poll()
+        assert ingestor._browser is not None
+        await ingestor._browser.close()  # simulate a Chromium crash between polls
+        second = await ingestor.poll()
+    finally:
+        await ingestor.teardown()
+        await server.close()
+    assert [item.source_id for item in second] == [item.source_id for item in first]
+    assert any("browser died" in record.getMessage() for record in caplog.records)
+
+
+async def test_poll_turns_navigation_failures_into_source_error(tmp_path: Path, http: HttpClient) -> None:
+    exe = await _require_chromium("full")
+    cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0)
+    _write_state(Path(cfg.browser.storage_state_path))
+    metrics = Metrics()
+    # Nothing listens on port 9: every navigation fails with a Playwright error.
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config(), metrics), base_url="http://127.0.0.1:9")
+    try:
+        with pytest.raises(SourceError, match="searches failed"):
+            await ingestor.poll()
+        assert ingestor._browser is not None and ingestor._browser.is_connected()  # browser kept for the next poll
+        assert not ingestor._needs_restart
+    finally:
+        await ingestor.teardown()
+    assert metrics.counter("fb_queries_total", "", ("outcome",)).value(outcome="error") == 1
+    assert not Path(cfg.browser.storage_state_path).with_suffix(".json.tmp").exists()
+
+
 # --------------------------------------------------------------------------- CLI
 
 
-def test_cli_check_without_session_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_check_without_session_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.setattr(fb, "configure_logging", lambda *a, **k: None)
     config_path = tmp_path / "config.yaml"
     state_path = tmp_path / "state.json"

@@ -468,13 +468,18 @@ def test_aggregate_answers_rules() -> None:
 
 
 def test_image_request_headers() -> None:
-    fb = image_request_headers("https://scontent-lax3-1.xx.fbcdn.net/v/t45/123.jpg?oe=1", "https://www.facebook.com/marketplace/item/1/")
+    fb = image_request_headers(
+        "https://scontent-lax3-1.xx.fbcdn.net/v/t45/123.jpg?oe=1", "https://www.facebook.com/marketplace/item/1/"
+    )
     assert fb == {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "cross-site", "Referer": "https://www.facebook.com/"}
-    cl = image_request_headers("https://images.craigslist.org/00a_abc_600x450.jpg", "https://sfbay.craigslist.org/sfc/sys/d/1.html")
+    cl = image_request_headers(
+        "https://images.craigslist.org/00a_abc_600x450.jpg", "https://sfbay.craigslist.org/sfc/sys/d/1.html"
+    )
     assert cl["Sec-Fetch-Site"] == "same-site" and cl["Referer"] == "https://sfbay.craigslist.org/"
     same = image_request_headers("https://example.com/a.jpg", "https://example.com/item/1")
     assert same["Sec-Fetch-Site"] == "same-origin"
-    assert image_request_headers("https://cdn.example.com/a.jpg", None) == {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "cross-site"}
+    no_page = image_request_headers("https://cdn.example.com/a.jpg", None)
+    assert no_page == {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "cross-site"}
 
 
 def test_candidate_urls_dedupes_and_filters() -> None:
@@ -609,9 +614,9 @@ async def test_ollama_genuine_and_request_shape(backend, http: HttpClient, base_
     sent = state.image_headers[0]
     assert "Mozilla/5.0" in sent["User-Agent"]
     assert "image/" in sent["Accept"]
-    if "Sec-Fetch-Dest" in sent:  # Chromium / Firefox / Safari identities all send Fetch Metadata
-        assert sent["Sec-Fetch-Dest"] == "image" and sent["Sec-Fetch-Mode"] == "no-cors"
-        assert sent["Sec-Fetch-Site"] == "cross-site"
+    # every identity profile sends Fetch Metadata; an <img> load is no-cors with destination "image"
+    assert sent["Sec-Fetch-Dest"] == "image" and sent["Sec-Fetch-Mode"] == "no-cors"
+    assert sent["Sec-Fetch-Site"] == "cross-site"
     assert sent["Referer"] == "https://www.facebook.com/"
     assert "Upgrade-Insecure-Requests" not in sent and "Sec-Fetch-User" not in sent
 
