@@ -1553,3 +1553,14 @@ async def test_offerup_request_timeout_is_a_query_failure_not_a_block(
     with pytest.raises(SourceError) as caught:
         await ing.poll()
     assert not isinstance(caught.value, SourceBlocked)
+
+
+async def test_offerup_gated_geocode_also_parks_graphql_fallback(upstream: Upstream, ctx: IngestorContext) -> None:
+    upstream.route("POST", "/api/graphql", jsonr({"errors": [{"message": "Forbidden"}]}, status=403))
+    upstream.route("GET", "/search", text("<html><body><div id='__next'></div></body></html>"))  # degraded SSR
+    ing = offerup(ctx, upstream, latitude=None, longitude=None, zip_code="11216", profiles=["rtx_4090"])
+    with pytest.raises(SourceError) as caught:
+        await ing.poll()
+    assert not isinstance(caught.value, SourceBlocked)
+    posts = upstream.calls("POST", "/api/graphql")
+    assert [p["json"]["operationName"] for p in posts] == ["GeocodeLocation"]  # no second gated call in the same poll

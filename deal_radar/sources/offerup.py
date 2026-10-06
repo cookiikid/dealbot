@@ -950,7 +950,8 @@ class OfferUpIngestor(BaseIngestor):
 
     async def _ensure_coordinates(self) -> None:
         """Resolve a ZIP-only config to coordinates once (best effort, retried hourly)."""
-        if self._coordinates is not None or not self.cfg.zip_code or self._clock() < self._geocode_retry_at:
+        now = self._clock()
+        if self._coordinates is not None or not self.cfg.zip_code or now < max(self._geocode_retry_at, self._graphql_parked_until):
             return
         payload = {
             "operationName": "GeocodeLocation",
@@ -963,6 +964,8 @@ class OfferUpIngestor(BaseIngestor):
             raise
         except Exception as exc:  # noqa: BLE001 - ZIP cookie still scopes the page search
             coords = None
+            if isinstance(exc, OfferUpGraphQLUnavailable):  # same endpoint as the search fallback
+                self._graphql_parked_until = self._clock() + BLOCK_COOLDOWN_SECONDS
             self.log.warning("offerup geocode failed", extra={"source": self.name, "error": repr(exc)[:300]})
         if coords is None:
             self._geocode_retry_at = self._clock() + GEOCODE_RETRY_SECONDS
