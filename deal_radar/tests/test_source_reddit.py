@@ -1193,3 +1193,13 @@ async def test_run_once_times_out_cleanly_and_recovers(http: HttpClient, reddit:
         await ing.run_once()
     gate.set()
     assert len(await ing.run_once()) == 4
+
+
+def test_swap_payment_terms_reach_the_text_filter() -> None:
+    """[W] payment terms live in the title, which is replaced by [H]; they must survive in the body."""
+    from deal_radar.sources.reddit_stream import _with_payment_terms
+
+    assert _with_payment_terms("body", ["zelle"]).endswith("Payment: Zelle only")
+    assert _with_payment_terms("body", ["paypal", "zelle"]).endswith("Payment accepted: PayPal, Zelle")
+    assert _with_payment_terms("", ["friends_family"]) == "Payment: PayPal friends and family only"
+    assert _with_payment_terms("body", []) == "body"

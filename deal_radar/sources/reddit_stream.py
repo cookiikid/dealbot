@@ -249,6 +249,11 @@ _PAYMENT_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 # r/hardwareswap only allows PayPal Goods & Services and local cash; the rest are bannable.
 _DISALLOWED_PAYMENTS = frozenset({"zelle", "venmo", "cashapp", "friends_family", "crypto", "gift_card", "wire"})
+# Human wording the text filter's payment rules recognise.
+_PAYMENT_WORDS = {
+    "zelle": "Zelle", "venmo": "Venmo", "cashapp": "Cash App", "friends_family": "PayPal friends and family",
+    "crypto": "crypto", "gift_card": "gift cards", "wire": "wire transfer", "paypal": "PayPal", "local_cash": "local cash",
+}
 # "$400 shipped", "**$400** shipped" (markdown bold), "$400 (shipped)".
 _SHIPPED_AFTER_RE = re.compile(r"^[\s,.()*_~]*(?:\+\s*)?(?:shipped|ship(?:ping)?\s+incl|free\s+ship)", re.IGNORECASE)
 
@@ -783,6 +788,23 @@ def _swap_images(post: Mapping[str, Any], selftext: str) -> list[str]:
     return _dedupe(itertools.chain(direct, body, _media_metadata_images(post), _preview_images(post)))
 
 
+def _with_payment_terms(selftext: str, methods: list[str]) -> str:
+    """Surface the ``[W]`` payment terms to the text filter.
+
+    The title is the ``[H]`` part and the body rarely repeats the payment terms, so
+    without this a "[W] Zelle" post would never meet the payment risk rules. Asking
+    *only* for irreversible methods that r/hardwareswap bans reads as "<method> only".
+    """
+    if not methods:
+        return selftext
+    words = [_PAYMENT_WORDS.get(m, m.replace("_", " ")) for m in methods]
+    if all(m in _DISALLOWED_PAYMENTS for m in methods):
+        terms = f"Payment: {', '.join(words)} only"
+    else:
+        terms = f"Payment accepted: {', '.join(words)}"
+    return f"{selftext}\n\n{terms}" if selftext else terms
+
+
 def _timestamps_url(post: Mapping[str, Any], selftext: str) -> str | None:
     for pattern in (_IMGUR_ALBUM_RE, _IMGUR_PAGE_RE, _REDDIT_GALLERY_RE):
         m = pattern.search(selftext)
@@ -850,7 +872,7 @@ def parse_swap_post(
         source_id=_fullname(post),
         url=_permalink_url(post),
         title=swap.have,
-        description=selftext,
+        description=_with_payment_terms(selftext, methods),
         price=price,
         currency=_CURRENCY_BY_COUNTRY.get(location.country or "", "USD"),
         shipping=shipping,

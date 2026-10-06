@@ -60,7 +60,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import orjson
 import redis.asyncio as redis_asyncio
-from sqlalchemy import ColumnElement, Select, Table, case, delete, event, func, insert, select, true
+from sqlalchemy import ColumnElement, Select, Table, case, delete, event, func, insert, select, true, update
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.dialects import postgresql as pg_dialect
 from sqlalchemy.dialects import sqlite as sqlite_dialect
@@ -701,6 +701,32 @@ class Database:
         total = sum(deleted.values())
         log.info("database pruned", extra={"retention_days": retention_days, "deleted": deleted, "cutoff": cutoff.isoformat()})
         return total
+
+    PURGED_TITLE = "[purged]"
+
+    async def scrub_source_content(self, source: str, older_than_hours: float) -> int:
+        """Erase user-authored content for one source while keeping numeric price history.
+
+        Some platforms require stored user content to be deleted within a deadline (Reddit:
+        48 h). Titles, seller names, locations and image links of that source's listings
+        last seen before the cutoff are blanked, and the JSON payloads of their alerts are
+        emptied. Prices, scores and timestamps stay, so the price model keeps its evidence.
+        Returns the number of listing rows scrubbed.
+        """
+        if older_than_hours <= 0:
+            raise ValueError("older_than_hours must be > 0")
+        cutoff = utcnow() - timedelta(hours=older_than_hours)
+        stale = (LISTINGS.c.source == source) & (LISTINGS.c.last_seen < cutoff) & (LISTINGS.c.title != self.PURGED_TITLE)
+        async with self.engine.begin() as conn:
+            ids = select(LISTINGS.c.id).where(stale).scalar_subquery()
+            await conn.execute(update(ALERTS).where(ALERTS.c.listing_id.in_(ids)).values(payload={}))
+            result = await conn.execute(
+                update(LISTINGS).where(stale).values(title=self.PURGED_TITLE, seller_name=None, location_text=None, image_url=None)
+            )
+        scrubbed = max(int(result.rowcount or 0), 0)
+        if scrubbed:
+            log.info("scrubbed source content", extra={"source": source, "rows": scrubbed, "cutoff": cutoff.isoformat()})
+        return scrubbed
 
     async def _delete_chunked(self, table: Table, condition: ColumnElement[bool], chunk_size: int) -> int:
         id_col = table.c.id

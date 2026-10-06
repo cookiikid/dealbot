@@ -1223,3 +1223,34 @@ async def test_connect_redis_raises_when_unreachable() -> None:
     port = _free_port()  # nothing listens here
     with pytest.raises(redis.exceptions.ConnectionError):
         await connect_redis(f"redis://127.0.0.1:{port}/0", max_connections=2, socket_timeout=0.5)
+
+
+async def test_scrub_source_content_erases_text_but_keeps_prices(tmp_path) -> None:  # noqa: ANN001
+    from datetime import timedelta as _td
+
+    from sqlalchemy import select as _select
+
+    from deal_radar.db.database import Database as _Database, SnapshotRecord as _Snap
+    from deal_radar.db.models import Listing as _Listing, PriceSnapshot as _PriceSnapshot
+    from deal_radar.engine.types import DealItem as _DealItem, SellerInfo as _Seller, SourceKind as _Kind, utcnow as _now
+
+    db = _Database(f"sqlite+aiosqlite:///{tmp_path / 'scrub.db'}")
+    await db.connect()
+    try:
+        old = _now() - _td(hours=72)
+        def item(source: str, sid: str) -> _DealItem:
+            return _DealItem(source=source, source_kind=_Kind.LOCAL, source_id=sid, url=f"https://x/{sid}",
+                             title="RTX 4090 FE from u/someone", price=1200.0, total_price=1200.0,
+                             seller=_Seller(name="someone"), image_urls=["https://i.imgur.com/a.jpg"])
+        await db.write_snapshots([_Snap(item=item("reddit", "t3_a"), filter_result=None, score=None, observed_at=old),
+                                  _Snap(item=item("ebay", "1"), filter_result=None, score=None, observed_at=old)])
+        assert await db.scrub_source_content("reddit", 48) == 1
+        assert await db.scrub_source_content("reddit", 48) == 0  # idempotent
+        async with db.engine.connect() as conn:
+            rows = {r.source: r for r in (await conn.execute(_select(_Listing.__table__))).all()}
+            snaps = (await conn.execute(_select(_PriceSnapshot.__table__))).all()
+        assert rows["reddit"].title == "[purged]" and rows["reddit"].seller_name is None and rows["reddit"].image_url is None
+        assert rows["ebay"].title.startswith("RTX 4090")
+        assert len(snaps) == 2  # numeric history kept
+    finally:
+        await db.close()

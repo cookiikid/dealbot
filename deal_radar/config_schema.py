@@ -123,6 +123,9 @@ class StorageSection(Strict):
     snapshot_flush_seconds: float = Field(default=2.0, gt=0)
     record_rejected: bool = True
     retention_days: int = Field(default=120, ge=1)
+    # Per-source deadline for erasing user-authored text (titles, sellers, locations);
+    # numeric price history is kept. Reddit's Data API terms require ~48 h.
+    source_content_ttl_hours: dict[str, float] = Field(default_factory=lambda: {"reddit": 48.0})
 
     @field_validator("database_url")
     @classmethod

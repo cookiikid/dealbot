@@ -279,11 +279,19 @@ class DealRadarApp:
         backlog = self.metrics.gauge("bus_backlog_items", "Listings waiting on the bus", ())
         hist = self.metrics.gauge("history_keys", "Product/condition keys in the price model", ())
         last_prune = 0.0
+        last_scrub = 0.0
         while not self.stop_event.is_set():
             with contextlib.suppress(Exception):
                 backlog.set(self.bus.backlog())
                 if self.scorer is not None:
                     hist.set(len(self.scorer.history.keys()))
+            if self.db is not None and time.time() - last_scrub > 3600:
+                last_scrub = time.time()
+                for source, hours in self.config.storage.source_content_ttl_hours.items():
+                    try:
+                        await self.db.scrub_source_content(source, hours)
+                    except Exception:  # noqa: BLE001
+                        log.exception("source content scrub failed", extra={"source": source})
             if self.db is not None and time.time() - last_prune > 6 * 3600:
                 last_prune = time.time()
                 try:
