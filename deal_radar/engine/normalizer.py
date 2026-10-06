@@ -61,6 +61,7 @@ import math
 import re
 import unicodedata
 from datetime import datetime, timezone
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -303,22 +304,24 @@ def _match_floor(text: str, anchor: int, floor: int) -> int:
     return max(floor, j - 1)
 
 
-def _scan_text(text: str) -> list[_Candidate]:
-    """All $/USD amounts in free text, running the tokenizer only next to anchors."""
-    out: list[_Candidate] = []
+def _iter_text_candidates(text: str) -> Iterator[_Candidate]:
+    """$/USD amounts in free text, left to right, tokenizing only next to anchors.
+
+    Lazy, so callers that only need the first price stop scanning early.
+    """
     pos = 0
     n = len(text)
     while True:
         anchor = _TEXT_ANCHOR.search(text, pos)
         if anchor is None:
-            return out
+            return
         # The window end only bounds work for an anchor without an amount ("$$$");
         # any real amount is far shorter than _ANCHOR_WINDOW characters.
         m = _TEXT_RE.search(text, _match_floor(text, anchor.start(), pos), min(n, anchor.end() + _ANCHOR_WINDOW))
         if m is None:
             pos = anchor.end()
             continue
-        out.append(_candidate(m))
+        yield _candidate(m)
         pos = m.end()
 
 
@@ -458,7 +461,7 @@ def _find_text_price(text: str) -> tuple[float, str | None, bool] | None:
     """First explicit $/USD price in free text -> (amount, currency, bare_dollar)."""
     if not text:
         return None
-    cands = _scan_text(text)
+    cands = _iter_text_candidates(text)
     first: _Candidate | None = None
     for cand in cands:
         if cand.value is not None and not _is_skipped(text, cand):
@@ -469,7 +472,12 @@ def _find_text_price(text: str) -> tuple[float, str | None, bool] | None:
     value = first.value or 0.0
     paren = _enclosing_parens(text, first.start)
     if paren is not None:
-        value = _breakdown_value(text, first, cands, paren)
+        group = [first]
+        for cand in cands:  # the rest of the parenthesised breakdown only
+            if cand.start > paren[1]:
+                break
+            group.append(cand)
+        value = _breakdown_value(text, first, group, paren)
     currency, bare = _currency_from_marker(first.marker)
     return value, currency, bare
 
@@ -535,9 +543,13 @@ _NON_WORD = re.compile(r"[^0-9a-z]+")
 # fast) finds trigger positions; _HINT_RE is then matched *anchored* there, and the
 # word-start, exclusion and negation checks run in Python on those few positions.
 # Specific alternatives precede the plain "new" fallback.
-_HINT_TRIGGER = re.compile(
-    r"for|parts|refurb|renewed|recond|reman|recert|open|box|new|used|pre|second|like|brand|b?nib|nisb|b?nwt|factory|sealed|unopened"
+_TRIGGER_WORDS = (
+    "for", "parts", "refurb", "renewed", "recond", "reman", "recert", "open", "box", "new", "used", "pre",
+    "second", "like", "brand", "bnib", "nib", "nisb", "bnwt", "nwt", "factory", "sealed", "unopened",
 )
+# Each literal is followed by a lookbehind asserting it starts a word; it only runs after
+# the literal matched, so scanning stays fast and mid-word hits ("geforce") never surface.
+_HINT_TRIGGER = re.compile("|".join(rf"{w}(?<![a-z0-9_]{w})" for w in _TRIGGER_WORDS))
 _HINT_RE = re.compile(
     r"""
       (?P<parts>for[\s-]+parts(?:\s+(?:or|and|/)\s+(?:repair|not\s+working))?|parts(?:[\s-]+only|\s*/\s*repair))\b
@@ -623,8 +635,8 @@ def _text_hints(low: str, title_end: int) -> set[Condition]:
             return hints
         start = trigger.start()
         pos = start + 1
-        if start and (low[start - 1].isalnum() or low[start - 1] == "_"):
-            continue  # not at a word start ("renewal", "unused", "anew")
+        if start and low[start - 1].isalnum():
+            continue  # not at a word start for non-ASCII letters ("\u00e9new")
         m = _HINT_RE.match(low, start)
         if m is None:
             continue
@@ -833,6 +845,9 @@ def canonical_url(url: str) -> str:
     return _canonicalize(url)[0]
 
 
+_WHITESPACE = re.compile(r"\s")
+
+
 def _image_url(url: object) -> str | None:
     """Validate an image URL without touching its query (CDN signatures live there)."""
     if not isinstance(url, str):
@@ -844,7 +859,7 @@ def _image_url(url: object) -> str | None:
     if not sep or head.lower() not in ("http", "https"):
         return None
     host, slash, tail = rest.partition("/")
-    if not host or any(ch.isspace() for ch in host):
+    if not host or _WHITESPACE.search(host):
         return None
     if " " in tail:
         tail = tail.replace(" ", "%20")
@@ -861,6 +876,7 @@ _ENTITY = re.compile(r"&(?:#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,
 _CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]")
 _HSPACE = re.compile(r"[^\S\n]+")
 _NEWLINES = re.compile(r" ?\n\s*")
+_ALNUM = re.compile(r"[^\W_]")
 
 # Trademark-ish signs are removed *before* NFKC so "RTX™" does not become "RTXTM".
 _TRADEMARKS = re.compile("[\u2122\u00ae\u00a9\u2120]")
@@ -999,7 +1015,7 @@ class Normalizer:
     def normalize(self, raw: RawListing) -> DealItem:
         """Normalize one listing; raises :class:`NormalizationError` when it is unusable."""
         title = clean_text(raw.title, MAX_TITLE_LEN, keep_newlines=False)
-        if not any(ch.isalnum() for ch in title):
+        if not _ALNUM.search(title):
             raise NormalizationError("empty_title", f"{raw.listing_key}: title {raw.title[:60]!r}")
 
         url, url_ok = _canonicalize(raw.url)
