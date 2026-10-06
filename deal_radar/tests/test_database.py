@@ -765,6 +765,24 @@ async def test_prune_deletes_expired_rows_in_chunks(db: Database) -> None:
         await db.prune(0)
 
 
+async def test_prune_never_deletes_a_listing_refreshed_concurrently(db: Database) -> None:
+    # The chunk DELETE selects expired ids first; on PostgreSQL a writer may refresh one
+    # of them before the DELETE gets the row lock. Without re-checking the age on the
+    # locked row, prune deleted the live listing and cascaded away its new snapshot.
+    item = make_item("18001")
+    await db.write_snapshots([rec(item, accepted_fr(), make_score(), utcnow() - timedelta(days=200))])
+    listing_rows, snapshot_rows = build_snapshot_rows([rec(item, accepted_fr(), make_score(), utcnow())])
+    async with db.engine.connect() as conn:
+        trans = await conn.begin()
+        await conn.execute(listing_upsert_statement(db.dialect_name), listing_rows)  # row now locked
+        prune = asyncio.create_task(db.prune(120))
+        await asyncio.sleep(0.3)  # prune is now waiting on the row (PostgreSQL) / write lock (SQLite)
+        await conn.execute(SNAPSHOTS.insert(), snapshot_rows)
+        await trans.commit()
+    assert await asyncio.wait_for(prune, 10) == 1  # only the 200-day-old snapshot
+    assert await db.counts() == {"listings": 1, "snapshots": 1, "alerts": 0}
+
+
 async def test_listing_delete_cascades_to_snapshots(db: Database) -> None:
     item = make_item("12001")
     await db.write_snapshots([rec(item, accepted_fr(), make_score(), T0), rec(make_item("12001"), accepted_fr(), make_score(), T0 + timedelta(hours=1))])

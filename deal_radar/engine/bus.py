@@ -478,6 +478,9 @@ class RedisStreamBus(ListingBus):
         )
         self._m_lost = m.counter("bus_lost_total", "Pending entries trimmed from the stream before processing")
         self._m_errors = m.counter("bus_errors_total", "Redis errors in bus operations", ("op",))
+        self._m_sanitized = m.counter(
+            "bus_sanitized_total", "Listings whose text/extra had to be scrubbed to encode as JSON"
+        )
 
     # ------------------------------------------------------------------ setup
 
@@ -523,32 +526,57 @@ class RedisStreamBus(ListingBus):
     # ------------------------------------------------------------------ publish
 
     async def publish(self, raw: RawListing) -> None:
+        """XADD one listing. Waits out Redis outages (backpressure) until written or closed.
+
+        Raises :class:`BusClosedError` once closed (also while waiting) and
+        :class:`BusError` for non-transient errors; never raises for odd listing content.
+        """
         if self._closed:
             raise BusClosedError("bus is closed")
-        payload = raw.model_dump_json(fallback=_json_fallback)
-
-        async def _xadd() -> Any:
-            if not self._group_ready:
-                await self._create_group()
-            return await self.redis.xadd(
-                self.stream, {PAYLOAD_FIELD: payload}, maxlen=self.maxlen, approximate=True
+        payload, sanitized = encode_listing(raw)
+        if sanitized:
+            self._m_sanitized.inc()
+            log.warning("bus listing needed text scrubbing to encode", extra={**self._log_extra, "listing": raw.listing_key})
+        backoff = ExponentialBackoff(base=_PUBLISH_BACKOFF_BASE, cap=_PUBLISH_BACKOFF_CAP, jitter="equal")
+        failing_since: float | None = None
+        next_warning_at = 0.0
+        while True:
+            try:
+                if not self._group_ready:
+                    await self._create_group()
+                await self.redis.xadd(self.stream, {PAYLOAD_FIELD: payload}, maxlen=self.maxlen, approximate=True)
+                break
+            except asyncio.CancelledError:
+                raise
+            except PUBLISH_RETRY_ERRORS as exc:
+                self._m_errors.inc(op="publish")
+                now = time.monotonic()
+                if failing_since is None:
+                    failing_since = now
+                delay = backoff.next_delay()
+                if now >= next_warning_at:
+                    next_warning_at = now + _PUBLISH_LOG_INTERVAL
+                    log.warning(
+                        "bus publish failed; waiting for Redis",
+                        extra={
+                            **self._log_extra,
+                            "attempt": backoff.failures,
+                            "failing_for_s": round(now - failing_since, 1),
+                            "error": repr(exc),
+                            "retry_in_s": round(delay, 3),
+                        },
+                    )
+                await self._sleep(delay)
+                if self._closed:
+                    raise BusClosedError("bus closed while publish was waiting for Redis") from exc
+            except redis_exc.RedisError as exc:
+                self._m_errors.inc(op="publish")
+                raise BusError(f"publish to {self.stream!r} failed: {exc!r}") from exc
+        if failing_since is not None:
+            log.info(
+                "bus publish recovered",
+                extra={**self._log_extra, "attempts": backoff.failures + 1, "outage_s": round(time.monotonic() - failing_since, 2)},
             )
-
-        def _on_retry(attempt: int, exc: BaseException, delay: float) -> None:
-            self._m_errors.inc(op="publish")
-            log.warning(
-                "bus publish failed; retrying",
-                extra={**self._log_extra, "attempt": attempt, "error": repr(exc), "retry_in_s": round(delay, 3)},
-            )
-
-        try:
-            await retry_async(_xadd, policy=_PUBLISH_POLICY, retry_on=TRANSIENT_ERRORS, on_retry=_on_retry)
-        except RetryExhausted as exc:
-            self._m_errors.inc(op="publish")
-            raise BusError(f"publish to {self.stream!r} failed: {exc.last_exc!r}") from exc
-        except redis_exc.RedisError as exc:
-            self._m_errors.inc(op="publish")
-            raise BusError(f"publish to {self.stream!r} failed: {exc!r}") from exc
         self._m_published.inc()
         await self._maybe_refresh_backlog()
 
@@ -569,8 +597,10 @@ class RedisStreamBus(ListingBus):
                 transient = isinstance(exc, TRANSIENT_ERRORS)
                 if isinstance(exc, redis_exc.ResponseError) and not transient:
                     # NOGROUP (stream/group vanished) and friends: recreate before the next read.
+                    # Sticky until the group is recreated: a different error in between (e.g. an
+                    # OOM-denied XGROUP CREATE) must not downgrade the recreation to "$".
                     self._group_ready = False
-                    self._group_lost = "NOGROUP" in str(exc) or "requires the key to exist" in str(exc)
+                    self._group_lost = self._group_lost or "NOGROUP" in str(exc) or "requires the key to exist" in str(exc)
                     self._claim_cursor = "0-0"
                 log.warning(
                     "bus read failed; backing off",
@@ -788,10 +818,12 @@ __all__ = [
     "ListingBus",
     "MemoryBus",
     "PAYLOAD_FIELD",
+    "PUBLISH_RETRY_ERRORS",
     "RedisStreamBus",
     "TRANSIENT_ERRORS",
     "build_bus",
     "decode_payload",
+    "encode_listing",
     "parse_autoclaim",
     "stream_entries",
 ]

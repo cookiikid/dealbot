@@ -395,7 +395,7 @@ combine as `R = 1 − Π(1 − r_i)`:
 | Signal | r | Trigger |
 |---|---|---|
 | `bait_price` | 0.95 | `P < floor` ($1 bait, accessory priced as the product) |
-| `placeholder_price` | 0.60 | `P ∈ {1, 1234, 9999, 12345, …}` or `P ≤ 5` |
+| `placeholder_price` | 0.60 | seller-priced sources (local/eBay): `P ∈ {1, 1234, 9999, 12345, …}`; any source: `P ≤ 5` |
 | `extreme_discount_low_trust` | 0.50 | `Δ ≥ 0.55` on a source with reliability < 0.8 |
 | `title_price_mismatch` | 0.45 | title advertises a price outside ×0.5–×2 of the listing price |
 | `low_feedback` / `poor_feedback_pct` | 0.35 / 0.30 | eBay seller < 5 feedback / < 97 % positive |
@@ -420,7 +420,9 @@ S = 100 · O · (λ + (1 − λ)·C) · (1 − R)^γ          λ = 0.4,  γ = 2
   `R ≥ 0.85` (probable scam), `P ≤ 0`, explicitly out of stock.
 * **Price error**: `Δ ≥ 0.5` on a source with reliability ≥ 0.9, `R ≤ 0.3`, and
   condition new or refurbished. The result is forced to CRITICAL with
-  `is_price_error = true`.
+  `is_price_error = true`, and the score is raised to `max(S, 85)`. The model's own
+  value is kept in `components.S_model`, because a config-only reference caps
+  confidence at 0.5, so even a 60 %-off first-party glitch would otherwise read ≈ 70.
 * **Severity**: CRITICAL ≥ 85, HIGH ≥ 70, MEDIUM ≥ max(55, `profile.min_score`).
 
 Worked examples computed by the shipped implementation are in §5.7.

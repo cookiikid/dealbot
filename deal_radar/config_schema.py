@@ -613,8 +613,10 @@ class ScoringSection(Strict):
     low_trust_reliability: float = Field(default=0.8, ge=0, le=1)
     min_seller_feedback: int = Field(default=5, ge=0)
     min_seller_feedback_pct: float = Field(default=97.0, ge=0, le=100)
+    # Values sellers type when they do not want to show a price ("$1, DM me", "$1234").
+    # Deliberately excludes real price points such as 99 / 100 / 999 / 1999.
     placeholder_prices: list[float] = Field(
-        default_factory=lambda: [0.01, 1, 5, 10, 11, 99, 100, 111, 123, 999, 1111, 1234, 9999, 11111, 12345, 99999, 123456]
+        default_factory=lambda: [0.01, 1, 2, 11, 111, 123, 1111, 1234, 9999, 11111, 12345, 99999, 123456]
     )
     severity: SeverityThresholds = Field(default_factory=SeverityThresholds)
     source_history_weights: dict[str, float] = Field(default_factory=dict)
