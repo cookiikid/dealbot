@@ -1058,6 +1058,24 @@ async def test_recorder_with_real_database(db: Database) -> None:
     assert (await fetch_listing(db, item))["min_price"] == pytest.approx(900.0)
 
 
+async def test_recorder_isolates_a_poison_record_with_the_real_database(db: Database) -> None:
+    # A legacy/corrupt row owning listing_key "ebay:17003" under another id makes that one
+    # record violate the unique constraint (IntegrityError on both backends).
+    [legacy], _ = build_snapshot_rows([rec(make_item("17003"), None, None, T0)])
+    async with db.engine.begin() as conn:
+        await conn.execute(LISTINGS.insert().values(**{**legacy, "id": "legacy-row-id"}))
+    metrics = Metrics()
+    recorder = Recorder(db, batch_size=6, flush_seconds=60.0, metrics=metrics, retry_delay=0.0)
+    await recorder.start()
+    for i in range(6):
+        recorder.record(rec(make_item(f"1700{i}"), accepted_fr(), make_score(), T0))
+    await recorder.stop()
+    assert await db.counts() == {"listings": 1 + 5, "snapshots": 5, "alerts": 0}
+    dropped = metrics.counter("db_records_dropped_total", labelnames=("kind", "reason"))
+    assert dropped.value(kind="snapshot", reason="write_error") == 1
+    assert metrics.counter("db_records_written_total", labelnames=("kind",)).value(kind="snapshot") == 5
+
+
 def test_recorder_validates_arguments() -> None:
     with pytest.raises(ValueError):
         Recorder(FakeDB(), batch_size=0, flush_seconds=1.0)  # type: ignore[arg-type]

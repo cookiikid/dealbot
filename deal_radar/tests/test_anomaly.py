@@ -518,7 +518,7 @@ def test_history_only_and_no_reference_paths(scorer: AnomalyScorer, monkeypatch:
     assert none.market_basis == "none" and none.market_price is None and none.discount_pct is None
     assert none.components["c_ref"] == 0.25 and none.components["D"] == 0.0
 
-    seed_history(scorer, "rtx_4090", "used", [1600.0, 1700.0, 1800.0])
+    seed_history(scorer, "rtx_4090", "used", [1600.0, 1700.0, 1800.0], spacing=timedelta(0))
     thin = scorer.score(make_item(1300.0), make_fr(), now=NOW)
     assert thin.market_basis == "history" and thin.market_price == pytest.approx(1700.0)
     assert thin.components["c_ref"] == 0.35

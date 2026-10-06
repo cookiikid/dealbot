@@ -950,8 +950,9 @@ class OfferUpIngestor(BaseIngestor):
 
     async def _ensure_coordinates(self) -> None:
         """Resolve a ZIP-only config to coordinates once (best effort, retried hourly)."""
-        now = self._clock()
-        if self._coordinates is not None or not self.cfg.zip_code or now < max(self._geocode_retry_at, self._graphql_parked_until):
+        if self._coordinates is not None or not self.cfg.zip_code:
+            return
+        if self._clock() < max(self._geocode_retry_at, self._graphql_parked_until):
             return
         payload = {
             "operationName": "GeocodeLocation",

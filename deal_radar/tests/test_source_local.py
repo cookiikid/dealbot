@@ -1264,8 +1264,11 @@ async def test_craigslist_cancellation_mid_request_propagates_and_next_poll_reco
     upstream.route("GET", cl.SAPI_SEARCH_PATH, sapi)
     ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
     task = asyncio.create_task(ing.poll())
-    while not upstream.calls("GET", cl.SAPI_SEARCH_PATH):
+    for _ in range(500):  # bounded: fail, never hang, if the request is not issued
+        if upstream.calls("GET", cl.SAPI_SEARCH_PATH):
+            break
         await asyncio.sleep(0.01)
+    assert upstream.calls("GET", cl.SAPI_SEARCH_PATH), "request was never issued"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -1355,8 +1358,11 @@ async def test_offerup_cancellation_mid_request_propagates_and_next_poll_recover
     upstream.route("GET", "/search", search)
     ing = offerup(ctx, upstream, profiles=["rtx_4090"])
     task = asyncio.create_task(ing.poll())
-    while not upstream.calls("GET", "/search"):
+    for _ in range(500):  # bounded: fail, never hang, if the request is not issued
+        if upstream.calls("GET", "/search"):
+            break
         await asyncio.sleep(0.01)
+    assert upstream.calls("GET", "/search"), "request was never issued"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -1437,8 +1443,8 @@ def test_offerup_graphql_params_include_zipcode_when_configured() -> None:
         task, radius_miles=30, limit=50, coordinates=None, session_id="s", zip_code=" 11216-1234 "
     )}
     assert params["zipcode"] == "11216" and "lat" not in params
-    bad = {p["key"] for p in ou.graphql_search_params(task, radius_miles=30, limit=50, coordinates=None, session_id="s", zip_code="NW1")}
-    assert "zipcode" not in bad
+    bad = ou.graphql_search_params(task, radius_miles=30, limit=50, coordinates=None, session_id="s", zip_code="NW1")
+    assert "zipcode" not in {p["key"] for p in bad}
 
 
 def _garbage(rng: Any, depth: int = 0) -> Any:
