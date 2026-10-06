@@ -60,8 +60,8 @@ import html
 import math
 import re
 import unicodedata
-from datetime import datetime, timezone
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -180,7 +180,7 @@ _TEXT_RE = _build_money_regex(
 _TEXT_ANCHOR = re.compile(r"\$|[uU][sS][dD]")
 _PREFIX_LOOKBACK = 6  # "-US $" / "-CAD $": a prefix match starts at most this far before "$"
 _ANCHOR_WINDOW = 48  # chars after an anchor searched for its amount
-_RUN_SEPARATORS = ",.'   "
+_RUN_SEPARATORS = ",.'\u00a0\u202f\u2009"
 
 # Hot path for clean US-style fields: "1299", "1,299.99", "$1,299.99", "US $1,299.99".
 _US_PRICE = re.compile(r"\s*(US ?\$|\$)?[ ]?((?:\d{1,3}(?:,\d{3})+|\d{1,8})(?:\.\d{1,2})?)\s*")
@@ -294,7 +294,7 @@ def _match_floor(text: str, anchor: int, floor: int) -> int:
     ``_PREFIX_LOOKBACK`` characters before it.
     """
     i = anchor
-    if i > floor and text[i - 1] in "  ":
+    if i > floor and text[i - 1] in " \u00a0":
         i -= 1
     j = i
     while j > floor and (text[j - 1].isdigit() or text[j - 1] in _RUN_SEPARATORS):
@@ -565,7 +565,12 @@ _BE_BEFORE = re.compile(r"\bbe\s$")  # "can be used"
 _RE_BEFORE = re.compile(r"\bre[\s-]$")  # "re-sealed"
 _NEW_EXCLUDE_BEFORE = re.compile(r"\b(?:like|near|almost|as|pretty|basically)[\s-]$")
 _NEW_EXCLUDE_AFTER = re.compile(r"[\s-]*(?:to\s+me|thermal|pads?|paste|fans?|cooler|price|listing|account|in\s+town|ish)\b")
-_NEGATION = re.compile(r"\b(?:not|no|never|isn'?t|wasn'?t|aren'?t|without|non)\b[^.!?;,\n]{0,20}$")
+# A negation word directly before the hint, or with one word in between ("never been
+# used", "not for parts"); a wider window would let "No box - Refurbished" cancel the
+# (safe) refurbished downgrade.
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|non|without|(?:is|was|are|were|do|does|did|has|have|had)n'?t)[\s-]+(?:[a-z']+\s+)?$"
+)
 _CLAUSE_BREAK = re.compile(r"[.!?;,\n]")
 
 # Lower = safer (smaller market reference -> smaller apparent discount).
@@ -617,13 +622,11 @@ def _condition_from_raw(raw: str | int | None) -> Condition | None:
 
 def _negated(low: str, start: int) -> bool:
     """True when a negation word precedes ``start`` within the same clause."""
-    window = low[max(0, start - 28) : start]
-    last_break = None
-    for last_break in _CLAUSE_BREAK.finditer(window):
-        pass
-    if last_break is not None:
-        window = window[last_break.end() :]
-    return _NEGATION.search(window) is not None
+    clause_start = max(0, start - 28)
+    for brk in _CLAUSE_BREAK.finditer(low, clause_start, start):
+        clause_start = brk.end()
+    # pos/endpos (not a slice) so "\b" sees the real preceding character.
+    return _NEGATION.search(low, clause_start, start) is not None
 
 
 def _text_hints(low: str, title_end: int) -> set[Condition]:
