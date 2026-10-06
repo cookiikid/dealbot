@@ -851,6 +851,9 @@ class CraigslistIngestor(BaseIngestor):
             self.log.warning("craigslist reference data timed out", extra={"source": self.name})
 
     async def _load_reference(self) -> None:
+        missing = [s for s in self.sites if s not in self._areas]
+        if self._categories_loaded and (self._areas_loaded or not missing):
+            return
         now = self._clock()
         if not self._categories_loaded and now >= self._categories_retry_at:
             categories = await self._fetch_reference("Categories", parse_categories)
@@ -859,7 +862,6 @@ class CraigslistIngestor(BaseIngestor):
                 self._categories_loaded = True
             else:
                 self._categories_retry_at = now + REFERENCE_RETRY_SECONDS
-        missing = [s for s in self.sites if s not in self._areas]
         if missing and not self._areas_loaded and now >= self._areas_retry_at:
             areas = await self._fetch_reference("Areas", parse_areas)
             if areas:

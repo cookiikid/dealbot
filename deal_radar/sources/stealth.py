@@ -45,6 +45,7 @@ import os
 import platform as _platform
 import random
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlsplit
@@ -88,25 +89,44 @@ STEALTH_INIT_SCRIPT = r"""
   const nativeText = (name) => `function ${name}() { [native code] }`;
   const mask = (fn, name) => { nativeSource.set(fn, nativeText(name)); return fn; };
 
-  function stripFrames(err) {
+  // Re-capture an error's stack below `outer` (the patched function the page called) so
+  // our helper frames never show up; native frames on top (e.g. "at Number.toString
+  // (<anonymous>)") are kept, exactly like an error thrown by the built-in.
+  function cleanStack(err, outer) {
     try {
-      if (err && typeof err.stack === 'string') {
-        err.stack = err.stack.replace(/\n\s+at (?:Object|Reflect|Proxy)\.(?:apply|get)[^\n]*/g, '');
+      if (!err || typeof err !== 'object' || typeof err.stack !== 'string' || !Error.captureStackTrace) return err;
+      const lines = err.stack.split('\n');
+      const head = [lines[0]];
+      for (const line of lines.slice(1)) {
+        if (/^\s+at .*\(<anonymous>\)$/.test(line) || /^\s+at .*\(native\)$/.test(line)) head.push(line);
+        else break;
       }
+      const holder = {};
+      Error.captureStackTrace(holder, outer);
+      err.stack = head.concat(String(holder.stack).split('\n').slice(1)).join('\n');
     } catch (_) { /* frozen error objects */ }
     return err;
   }
 
-  function makeGetter(prop, impl) {
-    const holder = { get [prop]() { return impl(this); } };
-    return mask(Object.getOwnPropertyDescriptor(holder, prop).get, `get ${prop}`);
+  function callNative(fn, self, args, outer) {
+    try { return Reflect.apply(fn, self, args); } catch (err) { throw cleanStack(err, outer); }
   }
 
+  // impl(self, outer): `outer` is the getter itself, for cleanStack().
+  function makeGetter(prop, impl) {
+    let getter = null;
+    const holder = { get [prop]() { return impl(this, getter); } };
+    getter = Object.getOwnPropertyDescriptor(holder, prop).get;
+    return mask(getter, `get ${prop}`);
+  }
+
+  // impl(self, args, outer)
   function makeMethod(name, length, impl) {
-    const holder = { [name](...args) { return impl(this, args); } };
-    const fn = holder[name];
-    Object.defineProperty(fn, 'length', { value: length, configurable: true });
-    return mask(fn, name);
+    let method = null;
+    const holder = { [name](...args) { return impl(this, args, method); } };
+    method = holder[name];
+    Object.defineProperty(method, 'length', { value: length, configurable: true });
+    return mask(method, name);
   }
 
   function defineGetter(target, prop, getter) {
@@ -121,6 +141,17 @@ STEALTH_INIT_SCRIPT = r"""
     return true;
   }
 
+  // Replace a getter's value while keeping the native brand check: called on anything
+  // that is not a `brand` instance it defers to the original (-> "Illegal invocation").
+  function overrideGetter(target, prop, brand, valueOf) {
+    const desc = Object.getOwnPropertyDescriptor(target, prop);
+    const nativeGet = desc && desc.get;
+    return defineGetter(target, prop, makeGetter(prop, (self, outer) => {
+      if (nativeGet && brand && !(self instanceof brand)) return callNative(nativeGet, self, [], outer);
+      return valueOf(self);
+    }));
+  }
+
   function replaceMethod(target, name, fn) {
     const desc = Object.getOwnPropertyDescriptor(target, name);
     if (desc && !desc.configurable) return false;
@@ -133,10 +164,6 @@ STEALTH_INIT_SCRIPT = r"""
     return true;
   }
 
-  function callNative(fn, self, args) {
-    try { return Reflect.apply(fn, self, args); } catch (err) { throw stripFrames(err); }
-  }
-
   // Accessors that answer from `fakes` for synthetic objects and defer to the native
   // implementation (brand checks included) for real ones.
   function patchFakeAccessors(proto, props) {
@@ -144,9 +171,9 @@ STEALTH_INIT_SCRIPT = r"""
       const desc = Object.getOwnPropertyDescriptor(proto, prop);
       if (!desc || !desc.get || nativeSource.has(desc.get)) continue;
       const nativeGet = desc.get;
-      defineGetter(proto, prop, makeGetter(prop, (self) => {
+      defineGetter(proto, prop, makeGetter(prop, (self, outer) => {
         const data = fakes.get(self);
-        return data ? data[prop] : callNative(nativeGet, self, []);
+        return data ? data[prop] : callNative(nativeGet, self, [], outer);
       }));
     }
   }
@@ -155,33 +182,33 @@ STEALTH_INIT_SCRIPT = r"""
     const lengthDesc = Object.getOwnPropertyDescriptor(proto, 'length');
     if (lengthDesc && lengthDesc.get && !nativeSource.has(lengthDesc.get)) {
       const nativeLength = lengthDesc.get;
-      defineGetter(proto, 'length', makeGetter('length', (self) => {
+      defineGetter(proto, 'length', makeGetter('length', (self, outer) => {
         const data = fakes.get(self);
-        return data ? data.items.length : callNative(nativeLength, self, []);
+        return data ? data.items.length : callNative(nativeLength, self, [], outer);
       }));
     }
     const nativeItem = proto.item;
     if (typeof nativeItem === 'function' && !nativeSource.has(nativeItem)) {
-      replaceMethod(proto, 'item', makeMethod('item', 1, (self, args) => {
+      replaceMethod(proto, 'item', makeMethod('item', 1, (self, args, outer) => {
         const data = fakes.get(self);
-        if (!data) return callNative(nativeItem, self, args);
+        if (!data) return callNative(nativeItem, self, args, outer);
         const value = data.items[Number(args[0]) >>> 0];
         return value === undefined ? null : value;
       }));
     }
     const nativeNamed = proto.namedItem;
     if (named && typeof nativeNamed === 'function' && !nativeSource.has(nativeNamed)) {
-      replaceMethod(proto, 'namedItem', makeMethod('namedItem', 1, (self, args) => {
+      replaceMethod(proto, 'namedItem', makeMethod('namedItem', 1, (self, args, outer) => {
         const data = fakes.get(self);
-        if (!data) return callNative(nativeNamed, self, args);
+        if (!data) return callNative(nativeNamed, self, args, outer);
         const value = data.named.get(String(args[0]));
         return value === undefined ? null : value;
       }));
     }
     const nativeRefresh = proto.refresh;
     if (refresh && typeof nativeRefresh === 'function' && !nativeSource.has(nativeRefresh)) {
-      replaceMethod(proto, 'refresh', makeMethod('refresh', 0, (self, args) => {
-        if (!fakes.get(self)) return callNative(nativeRefresh, self, args);
+      replaceMethod(proto, 'refresh', makeMethod('refresh', 0, (self, args, outer) => {
+        if (!fakes.get(self)) return callNative(nativeRefresh, self, args, outer);
         return undefined;
       }));
     }
@@ -205,12 +232,13 @@ STEALTH_INIT_SCRIPT = r"""
     const proto = win.Function.prototype;
     const current = proto.toString;
     if (nativeSource.has(current)) return;
-    const proxy = new Proxy(current, {
+    const handler = {
       apply(target, thisArg, args) {
         if (nativeSource.has(thisArg)) return nativeSource.get(thisArg);
-        return callNative(target, thisArg, args);
+        return callNative(target, thisArg, args, handler.apply);
       },
-    });
+    };
+    const proxy = new Proxy(current, handler);
     nativeSource.set(proxy, nativeText('toString'));
     replaceMethod(proto, 'toString', proxy);
   }
@@ -222,8 +250,9 @@ STEALTH_INIT_SCRIPT = r"""
 
     // Modern Chrome reports `false` (property present). --disable-blink-features=
     // AutomationControlled already does that natively; this is the fallback.
+    const brand = win.Navigator;
     if (nav.webdriver === true) {
-      if (!defineGetter(proto, 'webdriver', makeGetter('webdriver', () => false))) {
+      if (!overrideGetter(proto, 'webdriver', brand, () => false)) {
         try { delete proto.webdriver; } catch (_) { /* non-configurable */ }
       }
     }
@@ -234,15 +263,15 @@ STEALTH_INIT_SCRIPT = r"""
     const langs = nav.languages;
     if (typeof lang === 'string' && lang.includes('-') && (!langs || langs.length < 2)) {
       const frozen = win.Object.freeze(win.Array.of(lang, lang.split('-')[0]));
-      defineGetter(proto, 'languages', makeGetter('languages', () => frozen));
+      overrideGetter(proto, 'languages', brand, () => frozen);
     }
 
     if (!(nav.hardwareConcurrency >= 2)) {
-      defineGetter(proto, 'hardwareConcurrency', makeGetter('hardwareConcurrency', () => 4));
+      overrideGetter(proto, 'hardwareConcurrency', brand, () => 4);
     }
     // deviceMemory only exists in secure contexts; leave it absent elsewhere.
     if ('deviceMemory' in proto && !(nav.deviceMemory >= 2)) {
-      defineGetter(proto, 'deviceMemory', makeGetter('deviceMemory', () => 8));
+      overrideGetter(proto, 'deviceMemory', brand, () => 8);
     }
   }
 
@@ -286,10 +315,10 @@ STEALTH_INIT_SCRIPT = r"""
     patchFakeCollection(win.PluginArray.prototype, { refresh: true });
     patchFakeCollection(win.MimeTypeArray.prototype);
 
-    defineGetter(proto, 'plugins', makeGetter('plugins', () => pluginArray));
-    defineGetter(proto, 'mimeTypes', makeGetter('mimeTypes', () => mimeArray));
+    overrideGetter(proto, 'plugins', win.Navigator, () => pluginArray);
+    overrideGetter(proto, 'mimeTypes', win.Navigator, () => mimeArray);
     if ('pdfViewerEnabled' in proto && nav.pdfViewerEnabled === false) {
-      defineGetter(proto, 'pdfViewerEnabled', makeGetter('pdfViewerEnabled', () => true));
+      overrideGetter(proto, 'pdfViewerEnabled', win.Navigator, () => true);
     }
   }
 
@@ -340,9 +369,9 @@ STEALTH_INIT_SCRIPT = r"""
     }
     // Desktop Chrome exposes chrome.runtime to pages on secure origins only.
     if (win.isSecureContext && !('runtime' in chrome)) {
-      const noId = (method, signature) => makeMethod(method, 0, () => {
-        throw new win.TypeError(`Error in invocation of runtime.${method}(${signature}): chrome.runtime.${method}() ` +
-          'called from a webpage must specify an Extension ID (string) for its first argument.');
+      const noId = (method, signature) => makeMethod(method, 0, (self, args, outer) => {
+        throw cleanStack(new win.TypeError(`Error in invocation of runtime.${method}(${signature}): ` +
+          `chrome.runtime.${method}() called from a webpage must specify an Extension ID (string) for its first argument.`), outer);
       });
       chrome.runtime = {
         OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
@@ -367,8 +396,8 @@ STEALTH_INIT_SCRIPT = r"""
     const nativeQuery = proto.query;
     if (nativeSource.has(nativeQuery)) return;
     patchFakeAccessors(statusProto, ['state', 'name', 'onchange']);
-    replaceMethod(proto, 'query', makeMethod('query', 1, (self, args) => {
-      const result = callNative(nativeQuery, self, args);
+    replaceMethod(proto, 'query', makeMethod('query', 1, (self, args, outer) => {
+      const result = callNative(nativeQuery, self, args, outer);
       const params = args[0];
       if (!params || params.name !== 'notifications') return result;
       return result.then((status) => {
@@ -402,11 +431,11 @@ STEALTH_INIT_SCRIPT = r"""
       const proto = ctor.prototype;
       const nativeGet = proto.getParameter;
       if (typeof nativeGet !== 'function' || nativeSource.has(nativeGet)) continue;
-      replaceMethod(proto, 'getParameter', makeMethod('getParameter', 1, (self, args) => {
-        const value = callNative(nativeGet, self, args);
+      replaceMethod(proto, 'getParameter', makeMethod('getParameter', 1, (self, args, outer) => {
+        const value = callNative(nativeGet, self, args, outer);
         const param = args[0];
         if (param !== UNMASKED_VENDOR && param !== UNMASKED_RENDERER) return value;
-        const actual = param === UNMASKED_RENDERER ? value : callNative(nativeGet, self, [UNMASKED_RENDERER]);
+        const actual = param === UNMASKED_RENDERER ? value : callNative(nativeGet, self, [UNMASKED_RENDERER], outer);
         if (typeof actual !== 'string' || !SOFTWARE_GL.test(actual)) return value;
         return param === UNMASKED_VENDOR ? vendor : renderer;
       }));
@@ -430,8 +459,8 @@ STEALTH_INIT_SCRIPT = r"""
     const desc = Object.getOwnPropertyDescriptor(proto, 'contentWindow');
     if (!desc || !desc.get || nativeSource.has(desc.get)) return;
     const nativeGet = desc.get;
-    defineGetter(proto, 'contentWindow', makeGetter('contentWindow', (self) => {
-      const child = callNative(nativeGet, self, []);
+    defineGetter(proto, 'contentWindow', makeGetter('contentWindow', (self, outer) => {
+      const child = callNative(nativeGet, self, [], outer);
       if (child) {
         try { applyAll(child); } catch (_) { /* cross-origin frame */ }
       }
@@ -493,17 +522,33 @@ _UA_PLATFORM = {
 }
 
 
-def accept_language(locale: str) -> str:
-    """``Accept-Language`` that matches ``navigator.languages`` for ``locale``.
+def normalize_locale(locale: str) -> str:
+    """BCP-47 form of a locale (``en_US`` -> ``en-US``); empty -> ``en-US``."""
+    return locale.replace("_", "-").strip() or "en-US"
 
-    ``en-US`` -> ``en-US,en;q=0.9`` (what Chrome sends for a US-English profile);
-    a bare language (``de``) is sent as-is.
-    """
-    tag = locale.replace("_", "-").strip() or "en-US"
-    if "-" not in tag:
-        return tag
+
+def accept_languages(locale: str) -> list[str]:
+    """Language list a desktop Chrome derives from its UI locale: region tag + base."""
+    tag = normalize_locale(locale)
     base = tag.split("-", 1)[0]
-    return f"{tag},{base};q=0.9"
+    return [tag, base] if base != tag else [tag]
+
+
+def accept_language(locale: str) -> str:
+    """``Accept-Language`` value Chrome sends for ``locale`` (``en-US,en;q=0.9``)."""
+    langs = accept_languages(locale)
+    return ",".join([langs[0], *(f"{lang};q=0.9" for lang in langs[1:])])
+
+
+def locale_env(locale: str, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Process environment whose POSIX locale matches ``locale`` (drives ICU / ``Intl``)."""
+    tag = normalize_locale(locale)
+    posix = tag.replace("-", "_")
+    env = dict(os.environ if base_env is None else base_env)
+    env["LANG"] = f"{posix}.UTF-8"
+    env["LANGUAGE"] = ":".join(lang.replace("-", "_") for lang in accept_languages(tag))
+    env.pop("LC_ALL", None)  # would override LANG for every category
+    return env
 
 
 def screen_for_viewport(width: int, height: int) -> tuple[int, int]:
@@ -550,27 +595,34 @@ def parse_proxy(proxy: str) -> dict[str, str]:
 def build_context_options(cfg: "BrowserSection", geo: "GeoPin", user_agent: str | None = None) -> dict[str, Any]:
     """Keyword arguments for ``browser.new_context`` describing one coherent device.
 
-    Consistency beats randomisation. Anti-bot systems score *contradictions* between
-    independent signals far more than any single value: the egress IP geolocates to a
-    city, so the emulated ``geolocation`` must be that city (``geo``), ``timezone_id``
-    must be its zone (``Intl`` and ``Date`` leak it), ``locale`` must match the
-    region, and ``navigator.languages`` and the ``Accept-Language`` header must agree
-    with the locale. A viewport is set together with a larger, common ``screen`` so
+    **Consistency beats randomisation.** Anti-bot systems score *contradictions*
+    between independent signals far more than any single value. The egress IP
+    geolocates to a city, so the emulated ``geolocation`` must be that city (``geo``);
+    ``timezone_id`` must be its zone (``Date`` and ``Intl`` leak it); the locale must
+    fit the region, and ``navigator.language(s)`` and the ``Accept-Language`` header
+    must agree with it. A viewport comes with a larger, common ``screen`` so
     ``screen.width >= innerWidth`` holds like on a real desktop. Run the collector on
     the operator's home connection (or a residential proxy in the same metro) so the
     IP completes the picture.
 
+    The locale itself is configured on the *browser process* by :func:`launch_options`
+    (``--lang``/``--accept-lang`` + ``LANG``), not with Playwright's ``locale``
+    context option: that option overrides ``Accept-Language`` with a bare ``en-US``
+    on navigations while ``extra_http_headers`` only reach sub-resources, so a page
+    and its own XHRs would advertise different language lists. The native switches
+    give one value for documents, XHR/fetch and ``navigator.languages``.
+
     The User-Agent is *not* rotated. A logged-in session's cookies were issued to the
     device fingerprint that performed the login; presenting a different UA (or
     screen, timezone...) with the same cookies looks like a hijacked session and
-    burns the account's accumulated trust, triggering checkpoints. Pass
-    ``user_agent`` only to remove the ``HeadlessChrome`` token in headless mode
-    (see :func:`user_agent_for`); it stays identical for the life of the session.
+    burns the trust the account has accumulated, which is exactly what triggers
+    checkpoints. Pass ``user_agent`` only to remove the ``HeadlessChrome`` token in
+    headless mode (see :func:`user_agent_for`); it then stays identical for the
+    whole life of the session.
 
     ``storage_state`` is included when the file exists, so a context starts with the
     cookies saved by the login CLI.
     """
-    locale = geo.locale.replace("_", "-")
     screen_w, screen_h = screen_for_viewport(cfg.viewport_width, cfg.viewport_height)
     options: dict[str, Any] = {
         "viewport": {"width": cfg.viewport_width, "height": cfg.viewport_height},
@@ -578,7 +630,6 @@ def build_context_options(cfg: "BrowserSection", geo: "GeoPin", user_agent: str 
         "device_scale_factor": 1,
         "is_mobile": False,
         "has_touch": False,
-        "locale": locale,
         "timezone_id": geo.timezone_id,
         "geolocation": {"latitude": geo.latitude, "longitude": geo.longitude, "accuracy": GEO_ACCURACY_METERS},
         "permissions": ["geolocation"],
@@ -586,7 +637,6 @@ def build_context_options(cfg: "BrowserSection", geo: "GeoPin", user_agent: str 
         "reduced_motion": "no-preference",
         "java_script_enabled": True,
         "accept_downloads": False,
-        "extra_http_headers": {"Accept-Language": accept_language(locale)},
     }
     if user_agent:
         options["user_agent"] = user_agent
@@ -596,20 +646,28 @@ def build_context_options(cfg: "BrowserSection", geo: "GeoPin", user_agent: str 
     return options
 
 
-def launch_options(cfg: "BrowserSection") -> dict[str, Any]:
+def launch_options(cfg: "BrowserSection", *, locale: str | None = None) -> dict[str, Any]:
     """Keyword arguments for ``chromium.launch`` / ``launch_persistent_context``.
 
     Without an explicit ``executable_path`` headless runs use the ``chromium`` channel,
     i.e. the full browser in Chrome's *new* headless mode, which shares the rendering
     stack (plugins, ``window.chrome``, codecs) of headed Chrome — unlike the separate
     ``chrome-headless-shell`` binary Playwright uses by default.
+
+    ``locale`` sets the UI language, the accept-language list and the process locale
+    together (see :func:`build_context_options` for why this is not done per context).
     """
     window_h = cfg.viewport_height + BROWSER_UI_HEIGHT - 35
+    args = [*BROWSER_ARGS, f"--window-size={cfg.viewport_width},{window_h}"]
     options: dict[str, Any] = {
         "headless": cfg.headless,
-        "args": [*BROWSER_ARGS, f"--window-size={cfg.viewport_width},{window_h}"],
+        "args": args,
         "ignore_default_args": list(IGNORED_DEFAULT_ARGS),
     }
+    if locale:
+        tag = normalize_locale(locale)
+        args += [f"--lang={tag}", f"--accept-lang={','.join(accept_languages(tag))}"]
+        options["env"] = locale_env(tag)
     if cfg.executable_path:
         options["executable_path"] = cfg.executable_path
     elif cfg.headless:
@@ -620,17 +678,17 @@ def launch_options(cfg: "BrowserSection") -> dict[str, Any]:
 
 
 def _missing_executable(exc: BaseException) -> bool:
-    return "Executable doesn't exist" in str(exc) or "executable doesn't exist" in str(exc).lower()
+    return "executable doesn't exist" in str(exc).lower()
 
 
-async def launch_browser(playwright: "Playwright", cfg: "BrowserSection") -> "Browser":
+async def launch_browser(playwright: "Playwright", cfg: "BrowserSection", *, locale: str | None = None) -> "Browser":
     """Launch Chromium with the hardened switches (see :func:`launch_options`).
 
     Falls back from the full-browser ``chromium`` channel to Playwright's default
     headless build when only ``chrome-headless-shell`` is installed; the init script
     then fills in what the shell lacks (plugins, ``window.chrome``).
     """
-    options = launch_options(cfg)
+    options = launch_options(cfg, locale=locale)
     try:
         return await playwright.chromium.launch(**options)
     except PlaywrightError as exc:
@@ -647,6 +705,7 @@ async def _launch_persistent(playwright: "Playwright", user_data_dir: str, optio
     except PlaywrightError as exc:
         if "channel" not in options or not _missing_executable(exc):
             raise
+        log.warning("full chromium build not installed; falling back to headless shell", extra={"error": str(exc)[:200]})
         options = {k: v for k, v in options.items() if k != "channel"}
         return await playwright.chromium.launch_persistent_context(user_data_dir, **options)
 
@@ -667,10 +726,11 @@ async def new_stealth_context(
     timeout_ms = cfg.navigation_timeout_seconds * 1000.0
     browser: Browser | None = None
     if cfg.user_data_dir:
-        launch = launch_options(cfg)
         user_agent = None
         if cfg.headless:
-            probe = await launch_browser(playwright, cfg)
+            # A persistent context exposes no Browser before it exists, and the UA must
+            # be fixed at creation: read the version from a short-lived probe launch.
+            probe = await launch_browser(playwright, cfg, locale=geo.locale)
             try:
                 user_agent = user_agent_for(probe.version)
             finally:
@@ -679,9 +739,10 @@ async def new_stealth_context(
         options.pop("storage_state", None)  # the profile directory holds the cookies
         profile_dir = Path(cfg.user_data_dir).expanduser()
         await asyncio.to_thread(profile_dir.mkdir, mode=0o700, parents=True, exist_ok=True)
+        launch = launch_options(cfg, locale=geo.locale)
         context = await _launch_persistent(playwright, str(profile_dir), {**launch, **options})
     else:
-        browser = await launch_browser(playwright, cfg)
+        browser = await launch_browser(playwright, cfg, locale=geo.locale)
         try:
             user_agent = user_agent_for(browser.version) if cfg.headless else None
             options = build_context_options(cfg, geo, user_agent)
@@ -805,12 +866,15 @@ __all__ = [
     "IGNORED_DEFAULT_ARGS",
     "STEALTH_INIT_SCRIPT",
     "accept_language",
+    "accept_languages",
     "build_context_options",
     "human_pause",
     "human_scroll",
     "launch_browser",
     "launch_options",
+    "locale_env",
     "new_stealth_context",
+    "normalize_locale",
     "parse_proxy",
     "save_storage_state",
     "screen_for_viewport",

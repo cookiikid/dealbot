@@ -4,7 +4,8 @@ Every source hands the engine loosely structured data ("US $1,299.99", "1.299,99
 "$800 OBO", "Open-Box Excellent", eBay condition id "3000", tracking-laden URLs,
 HTML-escaped titles...). This module turns it into the one canonical
 :class:`DealItem` schema that every later stage relies on, so price/condition
-parsing lives in exactly one battle-tested place.
+parsing lives in exactly one battle-tested place. (``DealItem`` and ``RawListing``
+are defined in :mod:`deal_radar.engine.types` and re-exported here.)
 
 Design decisions
 ----------------
@@ -13,38 +14,44 @@ Design decisions
   ambiguous (``"$1,250k"``), malformed (``"1,2,3"``), negative or absurd
   (``> 10,000,000``), and :meth:`Normalizer.normalize` raises
   :class:`NormalizationError` instead of guessing.
-* **One numeric grammar.** Prices are tokenised by a single regex family
-  (currency prefix/suffix, sign, digit run, ``k`` multiplier) and interpreted by
+* **One numeric grammar.** Prices are tokenised by one regex family (sign,
+  currency prefix/suffix, digit run, ``k`` multiplier) and interpreted by
   :func:`_to_number`, which resolves US (``1,299.99``), European (``1.299,99``),
-  Swiss (``1'299.50``) and space-grouped (``1 299,99``) notations. A separator
+  Swiss (``1'299.50``) and space-grouped (``1 299,99``) notations: a separator
   followed by exactly three digits is a thousands separator, otherwise decimal.
 * **Currency markers beat bare numbers.** In a price field ``"2 for $50"`` means
   $50, so the first currency-marked amount wins over unmarked numbers. A bare
-  ``$`` is USD unless the listing already says it is in another dollar currency
-  (``C$``/``A$``/... are always explicit).
+  ``$`` is USD unless the listing itself says it is priced in another dollar
+  currency; ``C$``/``A$``/``CAD``... are always explicit.
 * **Title prices are only explicit money.** :func:`extract_title_price` ignores
   every number without ``$``/``USD`` (model numbers, VRAM, refresh rates, years,
-  percentages), skips amounts that are labelled as discounts/fees ("$50 off",
-  "$20 shipping", "(-$100 rebate)") and understands Slickdeals/buildapcsales
+  percentages), skips amounts labelled as discounts/fees ("$50 off", "$20
+  shipping", "(-$100 rebate)") and understands Slickdeals/buildapcsales
   breakdowns: ``"$1199 ($1599 - $400)"`` -> 1199, ``"($449 - $50 = $399)"`` -> 399.
-* **Condition is conservative.** Structured fields (eBay condition ids/enums,
-  retailer strings) are authoritative; free text may only *downgrade* them
-  (``New`` + title "like new" -> ``USED``). Without a structured value, the
-  source kind sets the default (retail/aggregator -> ``NEW``, local/marketplace
-  -> ``USED``); retail text can downgrade it, local text can upgrade to ``NEW``
-  only on explicit "brand new / sealed / BNIB / NIB" wording, and a negated hint
-  ("never used", "not refurbished") is ignored.
+* **Condition is conservative.** Structured values (eBay condition ids/enums,
+  retailer strings) are authoritative and free text may only *downgrade* them
+  ("New" + "like new" in the title -> USED). Without a structured value the source
+  kind sets the default (retail/aggregator -> NEW, local/marketplace -> USED);
+  retail text can downgrade it, local text upgrades to NEW only on explicit "brand
+  new / sealed / BNIB / NIB / new in box" wording, and negated hints ("never
+  used", "not refurbished") are ignored. Lower classes are the *safe* direction:
+  they compare the price against a lower market reference, so they can only
+  shrink an apparent discount.
 * **URLs are canonical but functional.** Tracking parameters (``utm_*``,
   ``fbclid``, ``gclid``, eBay ``_trksid``/``hash``, Facebook ``tracking``...) and
   fragments are removed; parameters that select the page/offer (eBay ``var``,
   Best Buy ``skuId``, Amazon ``th``/``psc``/``smid``) are kept byte-for-byte (no
   re-encoding). Affiliate attribution the operator can configure (eBay Partner
-  Network ``campid``/``mkcid``..., Amazon ``tag``) is preserved. Amazon product
+  Network ``campid``/``mkcid``/..., Amazon ``tag``) is preserved. Amazon product
   pages collapse to ``/dp/<ASIN>``. Image URLs are never rewritten beyond
   scheme/host case because CDN signatures (Facebook ``oh``/``oe``) live in the query.
-* **Hot path.** ``normalize`` targets < 50 µs for a typical listing: all regexes
-  are compiled at import time, ASCII fast paths skip Unicode normalization and
-  plain prices (``"1299.99"``) bypass the tokenizer.
+* **Hot path.** :meth:`Normalizer.normalize` targets < 50 us for a typical
+  listing. CPython's regex engine is slow on wide alternations that start with
+  assertions, so hot patterns start with literals and rare context checks
+  (word boundaries, "like new" exclusions, negation) run in Python only on the few
+  matches; price scanning in free text jumps between ``$``/``USD`` anchors; ASCII
+  text skips Unicode normalization; plain prices (``"1,299.99"``) bypass the
+  tokenizer.
 """
 
 from __future__ import annotations
@@ -76,7 +83,7 @@ class NormalizationError(Exception):
     """A listing cannot be turned into a trustworthy :class:`DealItem`.
 
     ``code`` is a stable machine code (``no_price``, ``negative_price``,
-    ``unsupported_currency``, ``bad_url``, ``empty_title``) suitable for metrics
+    ``unsupported_currency``, ``bad_url``, ``empty_title``) suitable for metric
     labels; ``detail`` is a short human explanation.
     """
 
@@ -89,7 +96,7 @@ class NormalizationError(Exception):
 # =========================================================================== money
 
 # Dollar prefixes. Single-letter prefixes must touch the "$" ("A $50 gift card" is
-# not Australian dollars); only "US $" (eBay's format) may contain a space.
+# not Australian dollars); only eBay's "US $" may contain a space.
 _DOLLAR_PREFIX_CODES: dict[str, str] = {
     "": "USD",
     "US": "USD",
@@ -107,15 +114,15 @@ _DOLLAR_PREFIX_CODES: dict[str, str] = {
 }
 _DOLLAR_CODES = frozenset({"USD", "CAD", "AUD", "NZD", "HKD", "SGD", "MXN", "TWD"})
 _SYMBOL_CODES: dict[str, str] = {
-    "€": "EUR",
-    "£": "GBP",
-    "¥": "JPY",
-    "₹": "INR",
-    "₩": "KRW",
-    "₽": "RUB",
-    "₺": "TRY",
-    "₪": "ILS",
-    "₱": "PHP",
+    "\u20ac": "EUR",
+    "\u00a3": "GBP",
+    "\u00a5": "JPY",
+    "\u20b9": "INR",
+    "\u20a9": "KRW",
+    "\u20bd": "RUB",
+    "\u20ba": "TRY",
+    "\u20aa": "ILS",
+    "\u20b1": "PHP",
 }
 _ISO_CODES = frozenset(
     {
@@ -124,19 +131,20 @@ _ISO_CODES = frozenset(
     }
 )
 
-_DOLLAR = r"(?:(?<![A-Za-z])(?:US[  ]?|CA|AU|NZ|HK|SG|MX|NT|C|A|S|R))?\$"
+_SP = "[ \u00a0]"  # a space inside a money expression (regular or no-break)
+_DOLLAR = rf"(?:(?<![A-Za-z])(?:US{_SP}?|CA|AU|NZ|HK|SG|MX|NT|C|A|S|R))?\$"
 _CODE_ALT = "|".join(sorted(_ISO_CODES))
-_CODE_PREFIX = rf"(?<![A-Za-z])(?i:{_CODE_ALT})(?![A-Za-z])(?:[  ]?\$)?"
-_CODE_SUFFIX = rf"[  ]?(?<![A-Za-z])(?i:{_CODE_ALT})(?![A-Za-z])"
+_CODE_PREFIX = rf"(?<![A-Za-z])(?i:{_CODE_ALT})(?![A-Za-z])(?:{_SP}?\$)?"
+_CODE_SUFFIX = rf"{_SP}?(?<![A-Za-z])(?i:{_CODE_ALT})(?![A-Za-z])"
 _SYMBOLS = "[" + "".join(_SYMBOL_CODES) + "]"
 
-# A digit run: separators only count when another digit follows ("$1,299," ends at 9).
-_NUM_RUN = r"\d(?:\d|[,.'   ](?=\d))*"
-# Regular-space thousands grouping ("1 299,99 €"), only accepted in price fields.
+# A digit run; separators only count when another digit follows ("$1,299," ends at 9).
+_NUM_RUN = r"\d(?:\d|[,.'\u00a0\u202f\u2009](?=\d))*"
+# Regular-space thousands grouping ("1 299,99 EUR"); only accepted in price fields.
 _NUM_SPACED = r"\d{1,3}(?:[ ]\d{3}(?!\d))+(?:[.,]\d{1,2}(?!\d))?"
 # A sign only when attached to the amount and preceded by a boundary: "-5", "(-$100)".
 # "$800-$900" and "Title - $549" are ranges/separators, not negatives.
-_NEG = r"(?P<neg>(?<![^\s(\[{:/])[-−])?"
+_NEG = r"(?P<neg>(?<![^\s(\[{:/])[-\u2212])?"
 _KILO = r"[kK](?![A-Za-z0-9])"
 
 
@@ -146,30 +154,33 @@ def _build_money_regex(*, prefix: str, suffix: str, number: str, plain: bool) ->
     return re.compile(
         rf"""{_NEG}
         (?:
-            (?P<pre>{prefix})[  ]{{0,2}}(?P<neg2>[-−])?(?P<n1>{number})(?P<k1>{_KILO})?
+            (?P<pre>{prefix}){_SP}{{0,2}}(?P<neg2>[-\u2212])?(?P<n1>{number})(?P<k1>{_KILO})?
           |
-            (?<![\w.,'’$])(?P<n2>{number})(?P<k2>{_KILO})?{tail}
+            (?<![\w.,'\u2019$])(?P<n2>{number})(?P<k2>{_KILO})?{tail}
         )""",
         re.VERBOSE,
     )
 
 
-# Price fields: any currency, any position, unmarked numbers allowed.
+# Price fields: any currency, prefix or suffix, unmarked numbers allowed.
 _FIELD_RE = _build_money_regex(
     prefix=rf"{_DOLLAR}|{_CODE_PREFIX}|{_SYMBOLS}",
-    suffix=rf"[  ]?\$(?![  ]?[\d$])|[  ]?{_SYMBOLS}(?![  ]?\d)|{_CODE_SUFFIX}(?![  ]?\d)",
+    suffix=rf"{_SP}?\$(?!{_SP}?[\d$])|{_SP}?{_SYMBOLS}(?!{_SP}?\d)|{_CODE_SUFFIX}(?!{_SP}?\d)",
     number=rf"(?:{_NUM_SPACED}|{_NUM_RUN})",
     plain=True,
 )
 # Free text (titles/descriptions): only explicit dollar/USD amounts.
 _TEXT_RE = _build_money_regex(
-    prefix=rf"{_DOLLAR}|(?<![A-Za-z])(?i:usd)(?![A-Za-z])(?:[  ]?\$)?",
-    suffix=r"\$(?![\d$])|[  ]?(?<![A-Za-z])(?i:usd)(?![A-Za-z])(?![  ]?\d)",
+    prefix=rf"{_DOLLAR}|(?<![A-Za-z])(?i:usd)(?![A-Za-z])(?:{_SP}?\$)?",
+    suffix=rf"\$(?![\d$])|{_SP}?(?<![A-Za-z])(?i:usd)(?![A-Za-z])(?!{_SP}?\d)",
     number=_NUM_RUN,
     plain=False,
 )
+_TEXT_ANCHOR = re.compile(r"\$|[uU][sS][dD]")
+_ANCHOR_LOOKBACK = 24  # max chars a match may start before its "$"/"USD" anchor
 
-_SIMPLE_PRICE = re.compile(r"\s*(\$)?\s?(\d{1,7}(?:\.\d{1,2})?)\s*")
+# Hot path for clean US-style fields: "1299", "1,299.99", "$1,299.99", "US $1,299.99".
+_US_PRICE = re.compile(r"\s*(US ?\$|\$)?[ ]?((?:\d{1,3}(?:,\d{3})+|\d{1,8})(?:\.\d{1,2})?)\s*")
 _FREE_ITEM = re.compile(
     r"\bfree\b(?!\s*(?:shipping|ship\b|delivery|returns?|s&h|s/h|gifts?\b|install\w*|pick[\s-]?up\s+in\s+store|trial))",
     re.IGNORECASE,
@@ -179,7 +190,7 @@ _FREE_SHIPPING = re.compile(
     r"|^\W*(?:shipping|delivery)\s*:?\s*(?:free|included)\b",
     re.IGNORECASE,
 )
-_KEYCAP = re.compile(r"[0-9#*]️?⃣")
+_KEYCAP = re.compile(r"[0-9#*]\ufe0f?\u20e3")
 
 # Amounts in free text that are labelled as something other than the item price.
 _SKIP_AFTER = re.compile(
@@ -192,22 +203,22 @@ _SKIP_BEFORE = re.compile(
     r"\b(?:save|saving|savings|extra|additional|discount|rebate|credit)\s*(?:of\s+|up\s+to\s+|an?\s+)?$",
     re.IGNORECASE,
 )
-_DASHES = frozenset("-−–—")
+_DASHES = frozenset("-\u2212\u2013\u2014")
 
 
 class _Candidate(NamedTuple):
     start: int
     end: int
     value: float | None  # None when malformed/ambiguous/over the cap
-    marker: str | None  # raw currency marker text ("US $", "€", "CAD", "$")
+    marker: str | None  # raw currency marker text ("US $", "CAD", "$"...)
     negative: bool
 
 
 class _Money(NamedTuple):
     amount: float | None
     currency: str | None
-    negative: bool  # the only amount found carried a minus sign
-    bare_dollar: bool  # currency came from a bare "$" (could be another dollar currency)
+    negative: bool  # amounts were found but every one carried a minus sign
+    bare_dollar: bool  # currency came from a bare "$" (may be another dollar currency)
 
 
 _NO_MONEY = _Money(None, None, False, False)
@@ -222,7 +233,7 @@ def _valid_groups(groups: list[str]) -> bool:
 def _to_number(run: str, kilo: bool) -> float | None:
     """Interpret one digit run ("1.299,99", "1,299.99", "1'299", "1,2" + k)."""
     s = run
-    for ch in "'    ":
+    for ch in "'\u00a0\u202f\u2009 ":
         if ch in s:
             s = s.replace(ch, "")
     dots = s.count(".")
@@ -244,13 +255,10 @@ def _to_number(run: str, kilo: bool) -> float | None:
             num = "".join(parts)
         else:
             head, tail = parts
-            if len(tail) == 3 and head != "0":
+            if len(tail) == 3 and head != "0" and len(head) <= 3:
                 if kilo:
                     return None  # "1,250k": 1.25k or 1,250k? refuse to guess
-                if len(head) > 3:
-                    num = head + "." + tail
-                else:
-                    num = head + tail
+                num = head + tail
             else:
                 num = head + "." + tail
     else:
@@ -266,29 +274,40 @@ def _to_number(run: str, kilo: bool) -> float | None:
     return value
 
 
-def _scan(pattern: re.Pattern[str], text: str) -> list[_Candidate]:
+def _candidate(m: re.Match[str]) -> _Candidate:
+    if m.group("n1") is not None:
+        run, kilo, marker = m.group("n1"), m.group("k1") is not None, m.group("pre")
+    else:
+        run, kilo, marker = m.group("n2"), m.group("k2") is not None, m.group("post")
+    negative = m.group("neg") is not None or m.group("neg2") is not None
+    return _Candidate(m.start(), m.end(), _to_number(run, kilo), marker, negative)
+
+
+def _scan_text(text: str) -> list[_Candidate]:
+    """All $/USD amounts in free text, scanning only near currency anchors."""
     out: list[_Candidate] = []
-    for m in pattern.finditer(text):
-        if m.group("n1") is not None:
-            run, kilo, marker = m.group("n1"), m.group("k1") is not None, m.group("pre")
-        else:
-            run, kilo, marker = m.group("n2"), m.group("k2") is not None, m.group("post")
-        negative = m.group("neg") is not None or m.group("neg2") is not None
-        out.append(_Candidate(m.start(), m.end(), _to_number(run, kilo), marker, negative))
-    return out
+    pos = 0
+    while True:
+        anchor = _TEXT_ANCHOR.search(text, pos)
+        if anchor is None:
+            return out
+        m = _TEXT_RE.search(text, max(pos, anchor.start() - _ANCHOR_LOOKBACK))
+        if m is None:
+            return out
+        out.append(_candidate(m))
+        pos = m.end()
 
 
 def _currency_from_marker(marker: str | None) -> tuple[str | None, bool]:
     """Map a currency marker to (ISO code, is_bare_dollar)."""
     if not marker:
         return None, False
-    m = marker.replace(" ", "").replace(" ", "").upper()
+    m = marker.replace(" ", "").replace("\u00a0", "").upper()
     if m.endswith("$"):
         head = m[:-1]
         if head in _ISO_CODES:
             return head, False
-        code = _DOLLAR_PREFIX_CODES.get(head)
-        return code, head == ""
+        return _DOLLAR_PREFIX_CODES.get(head), head == ""
     if m in _ISO_CODES:
         return m, False
     return _SYMBOL_CODES.get(m), False
@@ -310,28 +329,33 @@ def _parse_money_detail(value: str | float | int | None) -> _Money:
             return _NO_MONEY
         return _Money(number, None, False, False)
 
-    simple = _SIMPLE_PRICE.fullmatch(value)
-    if simple is not None:  # hot path: "1299", "1299.99", "$1299.99"
-        dollar = simple.group(1) is not None
-        return _Money(float(simple.group(2)), "USD" if dollar else None, False, dollar)
+    simple = _US_PRICE.fullmatch(value)
+    if simple is not None:
+        amount = float(simple.group(2).replace(",", ""))
+        if amount > MAX_PRICE:
+            return _NO_MONEY
+        marker = simple.group(1)
+        if marker is None:
+            return _Money(amount, None, False, False)
+        return _Money(amount, "USD", False, marker == "$")
 
     text = value.strip()
     if not text:
         return _NO_MONEY
-    if "⃣" in text:
+    if "\u20e3" in text:
         text = _KEYCAP.sub(" ", text)
     lead = text.lstrip(" \t\"'*~!:([")
     if lead[:4].lower() == "free" and _FREE_ITEM.match(lead):  # "Free", "FREE - pick up only"
         return _Money(0.0, None, False, False)
 
-    candidates = _scan(_FIELD_RE, text)
+    candidates = [_candidate(m) for m in _FIELD_RE.finditer(text)]
     chosen: _Candidate | None = None
     for cand in candidates:  # first valid currency-marked amount
         if cand.marker and cand.value is not None and not cand.negative:
             chosen = cand
             break
     if chosen is None:
-        for cand in candidates:  # else first valid plain number
+        for cand in candidates:  # else the first valid plain number
             if not cand.marker and cand.value is not None and not cand.negative:
                 chosen = cand
                 break
@@ -349,9 +373,11 @@ def parse_money(text: str | float | int | None) -> tuple[float | None, str | Non
     """Parse a price field into ``(amount, ISO currency or None)``.
 
     ``"US $1,299.99"`` -> ``(1299.99, "USD")``; ``"1.299,99 €"`` -> ``(1299.99, "EUR")``;
-    ``"C$1,100"`` -> ``(1100.0, "CAD")``; ``"1299 OBO"`` -> ``(1299.0, None)``;
-    ``"Free"`` -> ``(0.0, None)``. Unparseable, negative, NaN or > 10M -> ``(None, None)``.
-    The currency is ``None`` when the text carries no symbol/code.
+    ``"C$1,100"`` -> ``(1100.0, "CAD")``; ``"$1.2k"`` -> ``(1200.0, "USD")``;
+    ``"1299 OBO"`` -> ``(1299.0, None)``; ``"$800-$900"`` -> ``(800.0, "USD")``;
+    ``"Free"`` -> ``(0.0, None)``. Unparseable ("Ask", "Contact for price"),
+    ambiguous (``"$1,250k"``), negative, NaN or > 10,000,000 -> ``(None, None)``.
+    The currency is ``None`` when the text carries no symbol or ISO code.
     """
     money = _parse_money_detail(text)
     if money.amount is None:
@@ -387,27 +413,28 @@ def _is_skipped(text: str, cand: _Candidate) -> bool:
 
 def _breakdown_value(text: str, first: _Candidate, cands: list[_Candidate], paren: tuple[int, int]) -> float:
     """Resolve "($1599 - $400)" -> 1199 and "($449 - $50 = $399)" -> 399."""
-    group = [c for c in cands if paren[0] < c.start and c.end <= paren[1] and c.value is not None and c.start >= first.start]
+    base = first.value or 0.0
+    group = [c for c in cands if c.start >= first.start and c.end <= paren[1] and c.value is not None]
     for prev, cand in zip(group, group[1:]):
-        if text[prev.end : cand.start].strip().endswith("="):
-            return cand.value if cand.value is not None else first.value or 0.0
-    result = first.value or 0.0
+        if text[prev.end : cand.start].strip().endswith("=") and cand.value is not None:
+            return cand.value
+    result = base
     for prev, cand in zip(group, group[1:]):
         gap = text[prev.end : cand.start].strip()
-        if (gap and gap in _DASHES) or (not gap and cand.negative):
+        if (gap in _DASHES) if gap else cand.negative:
             result -= cand.value or 0.0
         else:
             break
-    if 0 < result < (first.value or 0.0):
+    if 0 < result < base:
         return round(result, 2)
-    return first.value or 0.0
+    return base
 
 
 def _find_text_price(text: str) -> tuple[float, str | None, bool] | None:
     """First explicit $/USD price in free text -> (amount, currency, bare_dollar)."""
-    if not text or ("$" not in text and "usd" not in text.lower()):
+    if not text:
         return None
-    cands = _scan(_TEXT_RE, text)
+    cands = _scan_text(text)
     first: _Candidate | None = None
     for cand in cands:
         if cand.value is not None and not _is_skipped(text, cand):
@@ -462,7 +489,7 @@ _EBAY_CONDITION_IDS: dict[int, Condition] = {
 
 # Structured condition strings, normalised to lowercase words separated by one space
 # ("Open-Box Excellent" -> "open box excellent", "USED_VERY_GOOD" -> "used very good").
-# Order matters: the first rule that matches wins.
+# Order matters: the first matching rule wins.
 _RAW_CONDITION_RULES: tuple[tuple[Condition, re.Pattern[str]], ...] = (
     (Condition.FOR_PARTS, re.compile(r"\b(?:for parts|parts only|parts or repair|not working|non working|salvage)\b")),
     (Condition.REFURBISHED, re.compile(r"\b(?:refurb\w*|renewed|reconditioned|remanufactured|re ?certified)\b")),
@@ -474,42 +501,41 @@ _RAW_CONDITION_RULES: tuple[tuple[Condition, re.Pattern[str]], ...] = (
         Condition.USED,
         re.compile(r"(?<!never )(?<!not )\bused\b|\b(?:pre ?owned|second ?hand|like new|gently used|lightly used|normal wear)\b"),
     ),
-    (
-        Condition.NEW,
-        re.compile(r"\b(?:new|brand new|bnib|nib|nisb|nwt|bnwt|sealed|factory sealed|unopened)\b"),
-    ),
+    (Condition.NEW, re.compile(r"\b(?:new|brand new|bnib|nib|nisb|nwt|bnwt|sealed|factory sealed|unopened)\b")),
     # Bare grades ("Very Good", "Excellent", Craigslist "fair") only describe used items.
     (Condition.USED, re.compile(r"\b(?:very good|good|acceptable|fair|excellent|mint|poor|worn|collectible)\b")),
 )
 _NON_WORD = re.compile(r"[^0-9a-z]+")
 
-# Free-text hints, one pass. Specific alternatives precede the plain "new" fallback.
+# Free-text hints over *lowercased* text, one pass. Every alternative starts with a
+# literal (fast scanning); word-start, exclusion and negation checks run in Python on
+# the few matches. Specific alternatives precede the plain "new" fallback.
 _HINT_RE = re.compile(
     r"""
-    (?P<parts>\bfor[\s-]+parts(?:\s+(?:or|and|/)\s+(?:repair|not\s+working))?\b|\bparts[\s-]+only\b
-        |\bparts\s*/\s*repair\b|\bsold\s+as[\s-]is\s+for\s+parts\b)
-  | (?P<refurb>\b(?:refurb(?:ished)?|renewed|reconditioned|remanufactured|recertified)\b)
-  | (?P<open>\bopen[\s-]?box(?:ed)?\b|\bopened\b|\bbox\s+(?:was\s+|has\s+been\s+)?opened\b
-        |\bnew\s+other\b|\bnew\s+with\s+defects\b)
-  | (?P<used>(?<!\bbe\s)\bused\b|\bpre[\s-]?owned\b|\bsecond[\s-]?hand\b|\blike[\s-]new\b)
-  | (?P<new>\bbrand[\s-]new\b|\bb?nib\b|\bnisb\b|\bb?nwt\b|\bnew\s+in\s+(?:the\s+)?(?:sealed\s+)?box\b
-        |\bfactory[\s-]sealed\b|\bnew\s+sealed\b|(?<!re-)(?<!re\s)\bsealed\b|\bunopened\b)
-  | (?P<plain_new>(?<!\blike\s)(?<!\blike-)(?<!\bnear\s)(?<!\balmost\s)(?<!\bas\s)(?<!\bpretty\s)\bnew\b
-        (?!\s+(?:to\s+me|thermal|pads?|paste|fans?|cooler|price|listing|account|in\s+town)\b)(?!-?ish\b))
+      (?P<parts>for[\s-]+parts(?:\s+(?:or|and|/)\s+(?:repair|not\s+working))?|parts(?:[\s-]+only|\s*/\s*repair))\b
+    | (?P<refurb>refurb(?:ished)?|renewed|reconditioned|remanufactured|recertified)\b
+    | (?P<open>open[\s-]?box(?:ed)?|opened|box\s+(?:was\s+|has\s+been\s+)?opened|new\s+other|new\s+with\s+defects)\b
+    | (?P<used>used|pre[\s-]?owned|second[\s-]?hand|like[\s-]new)\b
+    | (?P<new>brand[\s-]new|b?nib|nisb|b?nwt|new\s+in\s+(?:the\s+)?(?:sealed\s+)?box|factory[\s-]sealed|new\s+sealed|sealed|unopened)\b
+    | (?P<plain_new>new)\b
     """,
-    re.IGNORECASE | re.VERBOSE,
+    re.VERBOSE,
 )
-_NEGATION = re.compile(r"\b(?:not|no|never|isn'?t|wasn'?t|aren'?t|without|non)\b[^.!?;,\n]{0,20}$", re.IGNORECASE)
+_BE_BEFORE = re.compile(r"\bbe\s$")  # "can be used"
+_RE_BEFORE = re.compile(r"\bre[\s-]$")  # "re-sealed"
+_NEW_EXCLUDE_BEFORE = re.compile(r"\b(?:like|near|almost|as|pretty|basically)[\s-]$")
+_NEW_EXCLUDE_AFTER = re.compile(r"[\s-]*(?:to\s+me|thermal|pads?|paste|fans?|cooler|price|listing|account|in\s+town|ish)\b")
+_NEGATION = re.compile(r"\b(?:not|no|never|isn'?t|wasn'?t|aren'?t|without|non)\b[^.!?;,\n]{0,20}$")
 _CLAUSE_BREAK = re.compile(r"[.!?;,\n]")
 
 # Lower = safer (smaller market reference -> smaller apparent discount).
 _SAFETY_RANK = {
     Condition.FOR_PARTS: 0,
     Condition.USED: 1,
+    Condition.UNKNOWN: 1,
     Condition.REFURBISHED: 2,
     Condition.OPEN_BOX: 3,
     Condition.NEW: 4,
-    Condition.UNKNOWN: 1,
 }
 _HINT_CLASSES = {
     "parts": Condition.FOR_PARTS,
@@ -541,7 +567,7 @@ def _condition_from_raw(raw: str | int | None) -> Condition | None:
             return Condition.REFURBISHED
         if 2750 <= cid < 7000:
             return Condition.USED
-        return Condition.FOR_PARTS if cid == 7000 else None
+        return None
     norm = _NON_WORD.sub(" ", text.lower()).strip()
     for condition, pattern in _RAW_CONDITION_RULES:
         if pattern.search(norm):
@@ -549,29 +575,42 @@ def _condition_from_raw(raw: str | int | None) -> Condition | None:
     return None
 
 
-def _negated(text: str, start: int) -> bool:
-    window = text[max(0, start - 28) : start]
-    breaks = list(_CLAUSE_BREAK.finditer(window))
-    if breaks:
-        window = window[breaks[-1].end() :]
+def _negated(low: str, start: int) -> bool:
+    """True when a negation word precedes ``start`` within the same clause."""
+    window = low[max(0, start - 28) : start]
+    last_break = None
+    for last_break in _CLAUSE_BREAK.finditer(window):
+        pass
+    if last_break is not None:
+        window = window[last_break.end() :]
     return _NEGATION.search(window) is not None
 
 
-def _text_hints(text: str, title_end: int) -> set[Condition]:
+def _text_hints(low: str, title_end: int) -> set[Condition]:
     hints: set[Condition] = set()
-    for m in _HINT_RE.finditer(text):
-        kind = m.lastgroup
-        if kind is None:
+    for m in _HINT_RE.finditer(low):
+        start = m.start()
+        if start and (low[start - 1].isalnum() or low[start - 1] == "_"):
+            continue  # not at a word start ("renewal", "unused", "anew")
+        kind = m.lastgroup or ""
+        if kind == "used" and low.startswith("used", start) and _BE_BEFORE.search(low, max(0, start - 4), start):
             continue
-        if kind == "plain_new" and m.start() >= title_end:
-            continue  # bare "new" is only trusted in the title ("new thermal pads" noise)
-        if _negated(text, m.start()):
+        if kind == "new" and low.startswith("sealed", start) and _RE_BEFORE.search(low, max(0, start - 4), start):
+            continue
+        if kind == "plain_new":
+            # A bare "new" is trusted in the title only ("new thermal pads" is noise).
+            if start >= title_end or _NEW_EXCLUDE_BEFORE.search(low, max(0, start - 10), start):
+                continue
+            if _NEW_EXCLUDE_AFTER.match(low, m.end()):
+                continue
+        if _negated(low, start):
             continue
         hints.add(_HINT_CLASSES[kind])
     return hints
 
 
 def _safest(base: Condition, hints: set[Condition]) -> Condition:
+    """Apply downgrade-only hints to a base class."""
     best = base
     for hint in hints:
         if hint is not Condition.NEW and _SAFETY_RANK[hint] < _SAFETY_RANK[best]:
@@ -589,29 +628,31 @@ def _coerce_kind(kind: SourceKind | str) -> SourceKind | None:
 
 
 def parse_condition(raw: str | None, kind: SourceKind, text: str = "") -> Condition:
-    """Classify an item's condition from a structured value, the listing text and the source kind.
+    """Classify an item's condition from a structured value, listing text and source kind.
 
     * ``raw`` (eBay id "3000", "Open-Box Excellent", "USED_GOOD"...) is authoritative;
       title hints may only downgrade it ("New" + "like new" in the title -> USED).
     * Without a recognisable ``raw``: RETAIL/AGGREGATOR default to NEW and are
-      downgraded by open-box/refurbished/used/for-parts wording; LOCAL/MARKETPLACE
-      default to USED and become NEW only on explicit "brand new / sealed / BNIB /
-      NIB / new in box" wording (capped to OPEN_BOX/REFURBISHED if the text also
-      says so, and overridden by any "used"/"like new" wording).
+      downgraded by open-box / refurbished / used / for-parts wording;
+      LOCAL/MARKETPLACE default to USED and become NEW only on explicit "brand new /
+      sealed / BNIB / NIB / new in box" wording (or a bare "new" in the title),
+      capped to OPEN_BOX/REFURBISHED when the text also says so and overridden by
+      any "used"/"like new" wording.
     * Negated hints ("never used", "not refurbished") are ignored. The first line of
       ``text`` is treated as the title.
     """
     source_kind = _coerce_kind(kind)
-    title_end = text.find("\n")
+    low = text.lower() if text else ""
+    title_end = low.find("\n")
     if title_end == -1:
-        title_end = len(text)
+        title_end = len(low)
     base = _condition_from_raw(raw)
     if base is not None:
-        if base is Condition.FOR_PARTS or not text:
+        if base is Condition.FOR_PARTS or not low:
             return base
-        return _safest(base, _text_hints(text[:title_end], title_end))
+        return _safest(base, _text_hints(low[:title_end], title_end))
 
-    hints = _text_hints(text, title_end) if text else set()
+    hints = _text_hints(low, title_end) if low else set()
     if Condition.FOR_PARTS in hints:
         return Condition.FOR_PARTS
     if source_kind in (SourceKind.RETAIL, SourceKind.AGGREGATOR):
@@ -626,7 +667,7 @@ def parse_condition(raw: str | None, kind: SourceKind, text: str = "") -> Condit
                 return Condition.OPEN_BOX
             return Condition.NEW
         return Condition.USED
-    # Unknown kind: only an explicit textual statement decides.
+    # Unknown kind: only an explicit textual statement decides (the safest one wins).
     if not hints:
         return Condition.UNKNOWN
     return min(hints, key=lambda c: _SAFETY_RANK[c])
@@ -662,7 +703,12 @@ _HOST_TRACKING_PARAMS: tuple[tuple[str, frozenset[str]], ...] = (
     ("slickdeals.", frozenset({"src", "attrsrc"})),
     (
         "walmart.",
-        frozenset({"athbdg", "athcpid", "athpgid", "athznid", "athieid", "athstid", "athguid", "athwpid", "athtvid", "athancid", "athena", "adsredirect", "wmlspartner", "affiliates_ad_id", "veh", "sourceid", "wl13"}),
+        frozenset(
+            {
+                "athbdg", "athcpid", "athpgid", "athznid", "athieid", "athstid", "athguid", "athwpid", "athtvid",
+                "athancid", "athena", "adsredirect", "wmlspartner", "affiliates_ad_id", "veh", "sourceid", "wl13",
+            }
+        ),
     ),
     ("target.", frozenset({"clkid", "afid", "cpng", "lnk", "dpid"})),
 )
@@ -684,7 +730,7 @@ def _is_tracking(key: str, host_specific: frozenset[str]) -> bool:
 
 
 def _clean_netloc(scheme: str, netloc: str) -> tuple[str, str]:
-    """Return (netloc, host): credentials, default port and trailing dot removed."""
+    """Return (netloc, host) with credentials, default port and trailing dot removed."""
     if "@" in netloc:
         netloc = netloc.rsplit("@", 1)[1]  # never keep credentials
     netloc = netloc.lower()
@@ -700,16 +746,10 @@ def _clean_netloc(scheme: str, netloc: str) -> tuple[str, str]:
     return host, host
 
 
-def canonical_url(url: str) -> str:
-    """Canonical form of a listing URL.
-
-    Lowercases scheme and host, drops credentials, default ports, fragments and
-    tracking parameters, keeps every functional parameter verbatim and in order, and
-    collapses Amazon product URLs to ``/dp/<ASIN>``. Never raises: input that cannot be
-    parsed is returned stripped (the caller validates the scheme).
-    """
+def _canonicalize(url: str) -> tuple[str, bool]:
+    """(canonical URL, is a usable http(s) URL with a host)."""
     if not url:
-        return ""
+        return "", False
     u = url.strip().strip("<>").strip()
     if u.startswith("//"):
         u = "https:" + u
@@ -720,11 +760,13 @@ def canonical_url(url: str) -> str:
     try:
         parts = urlsplit(u)
     except ValueError:
-        return u
+        return u, False
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https") or not parts.netloc:
-        return u
+        return u, False
     netloc, host = _clean_netloc(scheme, parts.netloc)
+    if not host or host == "[]":
+        return u, False
     path = parts.path or "/"
     query = parts.query
 
@@ -733,33 +775,26 @@ def canonical_url(url: str) -> str:
         if m:
             path = f"/dp/{m.group(1).upper()}"
         if query:
-            kept = [seg for seg in query.split("&") if unquote(seg.split("=", 1)[0]).lower() in _AMAZON_KEEP]
-            query = "&".join(kept)
+            query = "&".join(seg for seg in query.split("&") if unquote(seg.split("=", 1)[0]).lower() in _AMAZON_KEEP)
     elif query:
         host_specific = _host_tracking(host)
-        kept = []
-        for seg in query.split("&"):
-            if not seg:
-                continue
-            if _is_tracking(unquote(seg.split("=", 1)[0]), host_specific):
-                continue
-            kept.append(seg)
-        query = "&".join(kept)
-    return urlunsplit((scheme, netloc, path, query, ""))
+        query = "&".join(
+            seg for seg in query.split("&") if seg and not _is_tracking(unquote(seg.split("=", 1)[0]), host_specific)
+        )
+    return urlunsplit((scheme, netloc, path, query, "")), True
 
 
-def _http_url(url: str | None) -> str | None:
-    """Canonical http(s) URL with a host, else ``None``."""
-    if not url or not isinstance(url, str):
-        return None
-    canon = canonical_url(url)
-    try:
-        parts = urlsplit(canon)
-    except ValueError:
-        return None
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        return None
-    return canon
+def canonical_url(url: str) -> str:
+    """Canonical form of a listing URL.
+
+    Lowercases scheme and host, drops credentials, default ports, fragments and
+    tracking parameters (``utm_*``, ``fbclid``, ``gclid``, ``mc_cid``, ``_ga``,
+    ``spm``, ``ref_``, ``igshid``, eBay ``_trksid``/``hash``...), keeps functional
+    parameters verbatim and in order (eBay ``var``, Best Buy ``skuId``...), and
+    collapses Amazon product URLs to ``/dp/<ASIN>``. Never raises: input that is not
+    an absolute http(s) URL is returned stripped (callers validate the scheme).
+    """
+    return _canonicalize(url)[0]
 
 
 def _image_url(url: object) -> str | None:
@@ -784,31 +819,26 @@ def _image_url(url: object) -> str | None:
 
 _TAG_DROP_BLOCKS = re.compile(r"<(script|style|noscript)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 _TAG_COMMENT = re.compile(r"<!--.*?-->|<!\[CDATA\[|\]\]>|<![A-Za-z][^>]*>", re.DOTALL)
-_TAG_BREAK = re.compile(r"<\s*(?:br|/p|/div|/li|/tr|/h[1-6]|p|div|li|tr|h[1-6]|hr)\b[^<>]*>", re.IGNORECASE)
+_TAG_BREAK = re.compile(r"<\s*/?\s*(?:br|p|div|li|tr|h[1-6]|hr|ul|ol|table|blockquote)\b[^<>]*>", re.IGNORECASE)
 _TAG_ANY = re.compile(r"</?[A-Za-z][^<>]*>")
 _ENTITY = re.compile(r"&(?:#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
 _CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]")
 _HSPACE = re.compile(r"[^\S\n]+")
-_NEWLINES = re.compile(r" ?\n[\s]*")
-_ANY_SPACE = re.compile(r"\s+")
+_NEWLINES = re.compile(r" ?\n\s*")
 
-# Removed before NFKC so "RTX™" does not become "RTXTM".
-_PRE_NFKC = str.maketrans({"™": None, "®": None, "©": None, "℠": None, "´": "'"})
-_POST_NFKC = str.maketrans(
-    {
-        **{ch: None for ch in "​‌‍⁠﻿­᠎‎‏︎️"},
-        **{chr(cp): None for cp in range(0x202A, 0x202F)},
-        **{chr(cp): None for cp in range(0x2066, 0x206A)},
-        **{ch: "'" for ch in "‘’‚‛′‵ʼʻ"},
-        **{ch: '"' for ch in "“”„‟″‶«»"},
-        **{ch: "-" for ch in "‐‑‒–—―−﹘﹣"},
-    }
-)
+# Trademark-ish signs are removed *before* NFKC so "RTX™" does not become "RTXTM".
+_TRADEMARKS = re.compile("[\u2122\u00ae\u00a9\u2120]")
+_INVISIBLE = re.compile("[\u200b-\u200f\u2060\ufeff\u00ad\u180e\u202a-\u202e\u2066-\u2069\ufe0e\ufe0f]")
+_SINGLE_QUOTES = re.compile("[\u2018\u2019\u201a\u201b\u2032\u2035\u02bc\u02bb\u00b4]")
+_DOUBLE_QUOTES = re.compile("[\u201c\u201d\u201e\u201f\u2033\u2036\u00ab\u00bb]")
+_FANCY_DASHES = re.compile("[\u2010-\u2015\u2212\ufe58\ufe63]")
 
 
 def _strip_tags(text: str) -> str:
-    text = _TAG_DROP_BLOCKS.sub(" ", text)
-    text = _TAG_COMMENT.sub(" ", text)
+    if "<s" in text or "<S" in text or "<n" in text or "<N" in text:
+        text = _TAG_DROP_BLOCKS.sub(" ", text)
+    if "<!" in text or "]]>" in text:
+        text = _TAG_COMMENT.sub(" ", text)
     text = _TAG_BREAK.sub("\n", text)
     return _TAG_ANY.sub("", text)
 
@@ -831,12 +861,13 @@ def clean_text(text: str, max_len: int | None = None, *, keep_newlines: bool = T
     """Make listing text safe and uniform for regex matching and display.
 
     HTML entities are unescaped (twice for double-escaped feeds), tags removed
-    (block tags become line breaks, ``<script>``/``<style>`` bodies dropped), text is
-    NFKC-normalised (after removing ™/®/© so "RTX™" stays "RTX"), typographic quotes
-    and dashes become ASCII, zero-width/bidi/control characters are removed and
-    whitespace is collapsed (single ``\\n`` line breaks are kept unless
-    ``keep_newlines=False``). With ``max_len`` the result is cut at a word boundary
-    when one exists in the last 40 % of the budget, else hard-cut; no ellipsis.
+    (block tags become line breaks, ``<script>``/``<style>`` bodies dropped), text
+    is NFKC-normalised (after removing trademark signs so "RTX™" stays "RTX"),
+    typographic quotes and dashes become ASCII, zero-width/bidi/control characters
+    are removed and whitespace is collapsed; single ``\\n`` line breaks are kept
+    unless ``keep_newlines=False``. With ``max_len`` the result is cut at a word
+    boundary when one exists in the last 40 % of the budget, else hard-cut; no
+    ellipsis is added.
     """
     if not text:
         return ""
@@ -853,17 +884,21 @@ def clean_text(text: str, max_len: int | None = None, *, keep_newlines: bool = T
     if "\r" in text:
         text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not text.isascii():
-        text = text.translate(_PRE_NFKC)
+        text = _TRADEMARKS.sub("", text)
+        text = _SINGLE_QUOTES.sub("'", text)  # before NFKC: it turns U+00B4 into a combining mark
         text = unicodedata.normalize("NFKC", text)
-        text = text.translate(_POST_NFKC)
+        text = _INVISIBLE.sub("", text)
+        text = _SINGLE_QUOTES.sub("'", text)
+        text = _DOUBLE_QUOTES.sub('"', text)
+        text = _FANCY_DASHES.sub("-", text)
     text = _CONTROL.sub("", text)
     if keep_newlines:
         text = _HSPACE.sub(" ", text)
         if "\n" in text:
             text = _NEWLINES.sub("\n", text)
+        text = text.strip()
     else:
-        text = _ANY_SPACE.sub(" ", text)
-    text = text.strip()
+        text = " ".join(text.split())
     if max_len is not None:
         text = _truncate(text, max_len)
     return text
@@ -878,27 +913,25 @@ def _normalize_currency_code(value: str | None) -> str | None:
     v = value.strip()
     if not v:
         return None
+    if v in _SYMBOL_CODES:
+        return _SYMBOL_CODES[v]
     upper = v.upper().replace(" ", "")
-    if upper in _ISO_CODES:
-        return upper
     if upper.endswith("$"):
         head = upper[:-1]
         if head in _ISO_CODES:
             return head
         if head in _DOLLAR_PREFIX_CODES:
             return _DOLLAR_PREFIX_CODES[head]
-    if v in _SYMBOL_CODES:
-        return _SYMBOL_CODES[v]
     return upper
 
 
 def _parse_shipping(value: str | float | int | None) -> float | None:
+    """Shipping cost; ``None`` = unknown ("Calculated", "Local pickup", garbage, negative)."""
     if value is None:
         return None
     if isinstance(value, str) and _FREE_SHIPPING.search(value):
         return 0.0
-    money = _parse_money_detail(value)
-    return money.amount  # negatives/garbage -> unknown
+    return _parse_money_detail(value).amount
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
@@ -909,14 +942,18 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-def _has_word_char(text: str) -> bool:
-    return any(ch.isalnum() for ch in text)
-
-
 class Normalizer:
     """Turns :class:`RawListing` objects into validated :class:`DealItem` objects.
 
-    Stateless after construction (safe to share between pipeline workers).
+    Rules: price falls back to the first explicit ``$`` amount in the title, then
+    the description, when ``raw.price`` is missing/unparseable (``extra
+    ["price_origin"]`` records the fallback); ``total_price = price + (shipping or
+    0)``; the currency must be in ``filters.allowed_currencies``; URLs must be
+    http(s) (an invalid ``outbound_url`` is dropped, an invalid ``url`` is an
+    error); images are deduplicated, http(s) only, at most 8; the title is cleaned
+    and cut to 300 chars, the description to 5000; ``posted_at`` becomes tz-aware
+    UTC (naive = UTC); prices are rounded to cents. Stateless after construction,
+    so one instance can be shared by all pipeline workers.
     """
 
     def __init__(self, config: AppConfig) -> None:
@@ -926,15 +963,21 @@ class Normalizer:
     def normalize(self, raw: RawListing) -> DealItem:
         """Normalize one listing; raises :class:`NormalizationError` when it is unusable."""
         title = clean_text(raw.title, MAX_TITLE_LEN, keep_newlines=False)
-        if not title or not _has_word_char(title):
+        if not any(ch.isalnum() for ch in title):
             raise NormalizationError("empty_title", f"{raw.listing_key}: title {raw.title[:60]!r}")
 
-        url = _http_url(raw.url)
-        if url is None:
+        url, url_ok = _canonicalize(raw.url)
+        if not url_ok:
             raise NormalizationError("bad_url", f"{raw.listing_key}: url {raw.url[:120]!r}")
-        outbound = _http_url(raw.outbound_url) if raw.outbound_url else None
-        if raw.outbound_url and outbound is None:
-            log.debug("dropping invalid outbound_url", extra={"listing": raw.listing_key, "outbound_url": raw.outbound_url[:120]})
+        outbound: str | None = None
+        if raw.outbound_url:
+            outbound, outbound_ok = _canonicalize(raw.outbound_url)
+            if not outbound_ok:
+                log.debug(
+                    "dropping invalid outbound_url",
+                    extra={"listing": raw.listing_key, "outbound_url": raw.outbound_url[:120]},
+                )
+                outbound = None
 
         description = clean_text(raw.description, MAX_DESCRIPTION_LEN) if raw.description else ""
 
@@ -972,7 +1015,8 @@ class Normalizer:
         if list_price is not None:
             list_price = round(list_price, 2) if list_price > 0 else None
 
-        # ---- condition (retail/aggregator titles only: their descriptions mention other offers)
+        # ---- condition. Retail/aggregator descriptions mention other offers
+        # ("also available refurbished"), so only their titles are used.
         if raw.source_kind in (SourceKind.RETAIL, SourceKind.AGGREGATOR) or not description:
             condition_text = title
         else:
@@ -981,18 +1025,16 @@ class Normalizer:
 
         # ---- images
         images: list[str] = []
-        seen: set[str] = set()
         for candidate in raw.image_urls:
             img = _image_url(candidate)
-            if img is None or img in seen:
+            if img is None or img in images:
                 continue
-            seen.add(img)
             images.append(img)
             if len(images) >= MAX_IMAGES:
                 break
 
-        retailer = clean_text(raw.retailer, 120, keep_newlines=False) if raw.retailer else None
-        sku = raw.sku.strip() if raw.sku else None
+        retailer = clean_text(raw.retailer, 120, keep_newlines=False) if raw.retailer else ""
+        sku = raw.sku.strip() if raw.sku else ""
 
         return DealItem(
             source=raw.source,
