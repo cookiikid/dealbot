@@ -192,14 +192,15 @@ def _compile_joined(sources: Sequence[str], flags: int) -> list[re.Pattern[str]]
 # --------------------------------------------------------------------------- gate text
 #
 # The gate scans a "gate form" of the lower-cased listing: every non-word character
-# becomes a space, whitespace runs collapse to one space, and the text is padded
-# with a space on both sides. Anchors are mapped through the same function, so an
-# anchor occurring in the text also occurs in its gate form, and a word start in
-# the text is always preceded by a space in the gate form.
+# becomes a space and the text is padded with a space on both sides, so a word
+# start is always preceded by a space. Anchors are mapped the same way and their
+# whitespace runs collapsed to one space, which the trie regexes match as " +"
+# (collapsing the text itself would cost more than the whole scan).
 
-_ASCII_NON_WORD = {c: " " for c in range(128) if not (chr(c).isalnum() or chr(c) == "_")}
+_ASCII_NON_WORD = "".join(c if (c.isalnum() or c == "_") else " " for c in map(chr, range(128)))
 _NON_WORD_RUN = re.compile(r"\W+")
 _WS_RUN = re.compile(r"\s+")
+_SPACE_RUN = re.compile(r" {2,}")
 
 
 def _gate_form(text: str) -> str:
@@ -209,7 +210,7 @@ def _gate_form(text: str) -> str:
 
 def _gate_text(low: str) -> str:
     mapped = low.translate(_ASCII_NON_WORD) if low.isascii() else _NON_WORD_RUN.sub(" ", low)
-    return " " + " ".join(mapped.split()) + " "
+    return f" {mapped} "
 
 
 def _is_word_char(ch: str) -> bool:
@@ -225,7 +226,7 @@ def _anchor_constants() -> dict[str, Any] | None:
     if _sre_c is None or _sre_p is None:
         return None
     names = (
-        "LITERAL", "IN", "RANGE", "CATEGORY", "CATEGORY_SPACE", "CATEGORY_NOT_WORD", "SUBPATTERN", "BRANCH",
+        "LITERAL", "IN", "RANGE", "CATEGORY", "CATEGORY_SPACE", "CATEGORY_WORD", "CATEGORY_NOT_WORD", "SUBPATTERN", "BRANCH",
         "AT", "AT_BOUNDARY", "AT_BEGINNING", "AT_BEGINNING_STRING", "ASSERT", "ASSERT_NOT",
     )
     try:
@@ -342,6 +343,44 @@ def _nested_required(op: Any, av: Any, aligned: bool) -> set[str] | None:
     return None
 
 
+def _behind_is_non_word(av: Any, negative: bool) -> bool:
+    """Whether a look-behind proves the previous character is not a word character.
+
+    ``(?<![\\w.$-])`` (negative, class containing ``\\w``) and ``(?<=\\s)`` (positive,
+    class of non-word characters only) both do.
+    """
+    assert _C is not None
+    direction, sub = av
+    items = _sub_items(sub)
+    if direction != -1 or len(items) != 1 or items[0][0] is not _C["IN"]:
+        return False
+    members = items[0][1]
+    if negative:
+        return any(op is _C["CATEGORY"] and arg is _C["CATEGORY_WORD"] for op, arg in members)
+    chars = _class_chars(members)
+    return chars is not None and all(not _is_word_char(ch) for ch in chars)
+
+
+def _ends_non_word(items: Sequence[tuple[Any, Any]]) -> bool:
+    """Whether every match of ``items`` ends with a non-word character (``...\\s+``)."""
+    assert _C is not None
+    consuming = [(op, av) for op, av in items if op is not _C["AT"] and op is not _C["ASSERT"] and op is not _C["ASSERT_NOT"]]
+    if not consuming:
+        return False
+    node = _anchor_node(*consuming[-1])
+    return node is not None and node[1] and bool(node[0]) and all(s and not _is_word_char(s[-1]) for s in node[0])
+
+
+def _aligned_after(op: Any, av: Any, aligned_before: bool) -> bool:
+    """Word-start knowledge after a non-literal item such as ``(?:[\\w-]+\\s+){0,2}``."""
+    assert _C is not None
+    if op in _C["REPEATS"]:
+        low, _high, sub = av
+        ends = _ends_non_word(_sub_items(sub))
+        return ends and (aligned_before or low >= 1)
+    return False
+
+
 def _ends_aligned(strings: set[str], aligned_before: bool) -> bool:
     """Whether the character after a literal step is known to follow a non-word char."""
     result = True
@@ -381,8 +420,12 @@ def _required(items: Sequence[tuple[Any, Any]], aligned: bool = False) -> set[st
             inner = _required(_sub_items(av[1]), aligned if av[0] == 1 else False)
             if inner:
                 candidates.append(inner)
+            if run == {""} and _behind_is_non_word(av, negative=False):
+                aligned = True
             continue
         if op is _C["ASSERT_NOT"]:
+            if run == {""} and _behind_is_non_word(av, negative=True):
+                aligned = True
             continue
         node = _anchor_node(op, av)
         if node is None:
@@ -390,7 +433,7 @@ def _required(items: Sequence[tuple[Any, Any]], aligned: bool = False) -> set[st
             nested = _nested_required(op, av, aligned)
             if nested:
                 candidates.append(nested)
-            aligned = False
+            aligned = _aligned_after(op, av, aligned)
             continue
         strings, complete = node
         if run == {""}:
@@ -445,6 +488,11 @@ def _set_anchors(patterns: Sequence[str]) -> frozenset[str] | None:
     return frozenset(out) if out else None
 
 
+# sre tries alternatives in order, so branches are ordered by how often a word starts
+# with that character in listing text (cheaper failed attempts on ordinary words).
+_BRANCH_ORDER = {ch: i for i, ch in enumerate("tscapbmwfhoidlrneguvkyjqzx0123456789 ")}
+
+
 def _trie_regex(words: Iterable[str]) -> str:
     """Greedy trie alternation: at any position it matches the LONGEST word starting there."""
     trie: dict[str | None, Any] = {}
@@ -455,7 +503,8 @@ def _trie_regex(words: Iterable[str]) -> str:
         node[None] = True
 
     def render(node: dict[str | None, Any]) -> str:
-        branches = [re.escape(ch) + render(child) for ch, child in sorted((k, v) for k, v in node.items() if k is not None)]
+        keys = sorted((k for k in node if k is not None), key=lambda k: (_BRANCH_ORDER.get(k, len(_BRANCH_ORDER)), k))
+        branches = [(" +" if ch == " " else re.escape(ch)) + render(node[ch]) for ch in keys]
         if not branches:
             return ""
         body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
@@ -569,7 +618,10 @@ class _AnchorGate:
                 m = regex.search(text, pos)
                 if m is None:
                     break
-                hits |= sets_for[m.group()]
+                key = m.group()
+                if "  " in key:  # the gate text keeps whitespace runs; anchors are single-spaced
+                    key = _SPACE_RUN.sub(" ", key)
+                hits |= sets_for[key]
                 pos = m.start() + 1
         return hits
 
@@ -617,9 +669,10 @@ class _Profile:
     def priority(self) -> int:
         return self.profile.priority
 
-    def pattern_sets(self) -> list[_PatternSet]:
-        sets = [ps for ps in (self.any, self.none, *self.all) if ps is not None]
-        sets.extend(v.patterns for v in self.variants)
+    def pattern_sets(self) -> list[tuple[_PatternSet, bool]]:
+        """Every compiled pattern set with whether it only ever looks at the title."""
+        sets = [(ps, self.on_title) for ps in (self.any, self.none, *self.all) if ps is not None]
+        sets.extend((v.patterns, v.on_title) for v in self.variants)
         return sets
 
 
@@ -685,10 +738,14 @@ class TextFilter:
         }
         self._mismatch_p = config.scoring.risk_probabilities.get("title_price_mismatch", 0.45)
 
-        pattern_sets = [g.patterns for g in self._groups]
+        # Two gates: title-only pattern sets are gated by a scan of the (short) title,
+        # the rest by a scan of title + description. Keeping title anchors out of the
+        # text gate keeps the per-character cost on long descriptions low.
+        pattern_sets = [(g.patterns, g.on_title) for g in self._groups]
         for cp in self._profiles:
             pattern_sets.extend(cp.pattern_sets())
-        self._gate = _AnchorGate(pattern_sets)
+        self._title_gate = _AnchorGate(ps for ps, on_title in pattern_sets if on_title)
+        self._text_gate = _AnchorGate(ps for ps, on_title in pattern_sets if not on_title)
         log.debug(
             "text filter compiled",
             extra={
@@ -696,8 +753,8 @@ class TextFilter:
                 "rule_groups": len(self._groups),
                 "negation_terms": len(terms),
                 "pattern_sets": len(pattern_sets),
-                "gated_pattern_sets": sum(1 for ps in pattern_sets if ps.anchors is not None),
-                "anchors": self._gate.anchor_count,
+                "gated_pattern_sets": sum(1 for ps, _ in pattern_sets if ps.anchors is not None),
+                "anchors": self._title_gate.anchor_count + self._text_gate.anchor_count,
             },
         )
 
@@ -722,8 +779,9 @@ class TextFilter:
             text, text_low = f"{title}\n{item.description}", f"{title_low}\n{_lower(item.description)}"
         else:
             text, text_low = title, title_low
-        # Title rules only see a prefix of ``text``, so text-level hits are a safe superset.
-        hay = _Haystacks(title, title_low, text, text_low, self._gate.scan(text_low))
+        hits = self._title_gate.scan(title_low)
+        hits |= self._text_gate.scan(text_low)
+        hay = _Haystacks(title, title_low, text, text_low, hits)
 
         # 2. product identification -------------------------------------------
         ident, unknown = self._identify(hay)

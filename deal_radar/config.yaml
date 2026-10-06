@@ -306,9 +306,9 @@ filters:
         # "for rent" - not "money for rent", "pay for rent"
         - '\bfor(?<!\bmoney\sfor)(?<!\bcash\sfor)(?<!\bpay\sfor)(?<!\bpaying\sfor)\s+rent\b'
         - '\bfor\s+lease\b|\bleasing\b|\blease\s+(?:my|a|an|this|it|out|per)\b'
-        - '\$\s*\d[\d,.]*\s*(?:/|per\s+|an?\s+)\s*(?:hr|hrs|hour|day|wk|week)\b'
+        - '\$\s*\d[\d,.]*(?:\s*/\s*|\s+(?:per|an?)\s+)(?:hr|hrs|hour|day|wk|week)\b'
         # monthly prices are rentals unless they are financing offers ("$108/mo with Affirm")
-        - '\$\s*\d[\d,.]*\s*(?:/|per\s+|an?\s+)\s*(?:mo|month)\b(?![^\n.]{0,48}\b(?:financ\w*|affirm|klarna|afterpay|apr|installments?|payments?|months?|mos)\b)'
+        - '\$\s*\d[\d,.]*(?:\s*/\s*|\s+(?:per|an?)\s+)(?:mo|month)\b(?![^\n.]{0,48}\b(?:financ\w*|affirm|klarna|afterpay|apr|installments?|payments?|months?|mos)\b)'
         - '\b(?:per|by\s+the)\s+hour\b|\bhourly\s+(?:rate|rental|basis)\b'
         - '\b(?:cloud|hosted)\s+(?:gpus?|compute|servers?|access|instances?)\b'
         - '\b(?:remote|virtual|dedicated)\s+(?:gpus?|compute|gpu\s+servers?|instances?)\b'

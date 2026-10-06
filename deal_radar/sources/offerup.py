@@ -685,7 +685,12 @@ class OfferUpIngestor(BaseIngestor):
             (float(cfg.latitude), float(cfg.longitude)) if cfg.latitude is not None and cfg.longitude is not None else None
         )
         self._geocode_retry_at = 0.0
+        self._graphql_parked_until = 0.0
         self._session_id = str(uuid.uuid4())
+        # Client-minted identifiers the web app sends with every GraphQL call: one anonymous
+        # device token per process (sticky, like a browser profile) and a session id.
+        self._device_token = "web-" + secrets.token_hex(28)
+        self._ou_session = f"{self._device_token}@{int(time.time() * 1000)}"
         m = ctx.metrics
         self._m_queries = m.counter("offerup_queries_total", "OfferUp search requests", ("strategy", "outcome"))
         self._m_skipped = m.counter("offerup_items_skipped_total", "Malformed OfferUp feed items", ("reason",))
@@ -755,14 +760,18 @@ class OfferUpIngestor(BaseIngestor):
     # ------------------------------------------------------------------ strategies
 
     def _strategy_order(self) -> list[str]:
+        now = self._clock()
         if (
             self._preferred != STRATEGY_PAGE
             and self._fallback_since is not None
-            and self._clock() - self._fallback_since >= PRIMARY_RETRY_SECONDS
+            and now - self._fallback_since >= PRIMARY_RETRY_SECONDS
         ):
             self._preferred, self._fallback_since = STRATEGY_PAGE, None
         other = STRATEGY_GRAPHQL if self._preferred == STRATEGY_PAGE else STRATEGY_PAGE
-        return [self._preferred, other]
+        order = [self._preferred, other]
+        if now < self._graphql_parked_until:
+            order.remove(STRATEGY_GRAPHQL)
+        return order
 
     async def _search(self, task: SearchTask) -> list[RawListing]:
         await self._ensure_coordinates()
@@ -775,6 +784,15 @@ class OfferUpIngestor(BaseIngestor):
                     listings = await self._search_graphql(task)
             except (SourceBlocked, asyncio.CancelledError):
                 raise
+            except OfferUpGraphQLUnavailable as exc:
+                last_error = exc
+                self._graphql_parked_until = self._clock() + BLOCK_COOLDOWN_SECONDS
+                self._m_queries.inc(strategy=strategy, outcome="gated")
+                self.log.warning(
+                    "offerup graphql gated; parking it",
+                    extra={"source": self.name, "error": str(exc)[:300], "parked_s": BLOCK_COOLDOWN_SECONDS},
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - try the other strategy
                 last_error = exc
                 self._m_queries.inc(strategy=strategy, outcome="error")
@@ -848,6 +866,7 @@ class OfferUpIngestor(BaseIngestor):
                     limit=self.cfg.max_listings_per_query,
                     coordinates=self._coordinates,
                     session_id=self._session_id,
+                    zip_code=self.cfg.zip_code,
                 ),
             },
             "query": FEED_QUERY,
@@ -870,12 +889,14 @@ class OfferUpIngestor(BaseIngestor):
             **self._common_headers(),
             "Origin": OFFERUP_ORIGIN,
             "Referer": referer,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
+            "x-ou-operation-name": str(payload.get("operationName") or ""),
+            "x-ou-d-token": self._device_token,
+            "ou-session-id": self._ou_session,
+            "x-request-id": str(uuid.uuid4()),
         }
         resp = await self._call(
-            "POST", f"{self.base_url}/api/graphql", payload=payload, headers=headers, accept="application/json"
+            "POST", f"{self.base_url}/api/graphql", payload=payload, headers=headers, accept="*/*", api=True
         )
         body = resp.data if isinstance(resp.data, str) else ""
         try:
@@ -895,7 +916,9 @@ class OfferUpIngestor(BaseIngestor):
         payload: Any = None,
         headers: Mapping[str, str] | None = None,
         accept: str,
+        api: bool = False,
     ) -> HttpResponse:
+        """One request; ``api=True`` marks a fetch()-style GraphQL call (CORS fetch metadata)."""
         try:
             return await self.ctx.http.request(
                 method,
@@ -904,12 +927,16 @@ class OfferUpIngestor(BaseIngestor):
                 json=payload,
                 headers=headers,
                 browser_identity=True,
+                fetch_mode="cors" if api else "navigate",
                 accept=accept,
                 parse="text",
                 max_bytes=MAX_BODY_BYTES,
             )
         except HttpStatusError as exc:
-            reason = detect_block(exc.status, exc.body if exc.status in (401, 403, 429) else None)
+            body = exc.body if exc.status in (401, 403, 429, 503) else None  # walls are often 403/503
+            if api and exc.status in (401, 403) and not _BLOCK_RE.search((body or "")[:_SKIP_SCAN_BYTES]):
+                raise OfferUpGraphQLUnavailable(f"offerup graphql answered {exc.status} without a challenge") from exc
+            reason = detect_block(exc.status, body)
             if reason is not None:
                 raise self._blocked(f"offerup {method} {url.rsplit('/', 1)[-1]} blocked ({reason})", reason) from exc
             raise
@@ -950,6 +977,7 @@ __all__ = [
     "GEOCODE_QUERY",
     "ITEM_URL_TEMPLATE",
     "OFFERUP_ORIGIN",
+    "OfferUpGraphQLUnavailable",
     "OfferUpIngestor",
     "OfferUpParseError",
     "RADIUS_CHOICES",

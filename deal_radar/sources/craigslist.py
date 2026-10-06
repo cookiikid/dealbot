@@ -945,7 +945,7 @@ class CraigslistIngestor(BaseIngestor):
 
     async def _fetch_reference(self, name: str, parser: Callable[[Any], dict[Any, Any]]) -> dict[Any, Any]:
         try:
-            resp = await self._call("GET", f"{self.reference_origin}/{name}", accept="application/json")
+            resp = await self._call("GET", f"{self.reference_origin}/{name}", accept="application/json", api=True)
             payload = json_loads(resp.data if isinstance(resp.data, str) else "")
             return await asyncio.to_thread(parser, payload)
         except asyncio.CancelledError:
@@ -1038,13 +1038,7 @@ class CraigslistIngestor(BaseIngestor):
         site_base = self._site_base(site)
         parts = urlsplit(site_base)
         origin = f"{parts.scheme}://{parts.netloc}"
-        headers = {
-            "Origin": origin,
-            "Referer": f"{site_base}/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-        }
+        headers = {"Origin": origin, "Referer": f"{site_base}/", "Sec-Fetch-Site": "same-site"}
         params = sapi_params(
             task,
             area=area,
@@ -1058,6 +1052,7 @@ class CraigslistIngestor(BaseIngestor):
             params=params,
             headers=headers,
             accept="application/json, text/plain, */*",
+            api=True,
         )
         body = resp.data if isinstance(resp.data, str) else ""
         try:
@@ -1109,7 +1104,9 @@ class CraigslistIngestor(BaseIngestor):
         params: Mapping[str, str] | None = None,
         headers: Mapping[str, str] | None = None,
         accept: str,
+        api: bool = False,
     ) -> HttpResponse:
+        """One request; ``api=True`` marks a fetch()-style JSON call (CORS fetch metadata)."""
         try:
             return await self.ctx.http.request(
                 method,
@@ -1117,6 +1114,7 @@ class CraigslistIngestor(BaseIngestor):
                 params=params,
                 headers=headers,
                 browser_identity=True,
+                fetch_mode="cors" if api else "navigate",
                 accept=accept,
                 parse="text",
                 max_bytes=MAX_BODY_BYTES,
@@ -1146,6 +1144,7 @@ __all__ = [
     "SAPI_ORIGIN",
     "SAPI_SEARCH_PATH",
     "SearchTask",
+    "VIEW_URL_TEMPLATE",
     "block_cooldown",
     "build_tasks",
     "coerce_price",
@@ -1161,6 +1160,8 @@ __all__ = [
     "parse_categories",
     "parse_geo",
     "parse_search_html",
+    "posting_key",
     "posting_url",
     "sapi_params",
+    "view_url",
 ]

@@ -22,7 +22,8 @@ from typing import Any
 
 import pytest
 import redis.exceptions
-from sqlalchemy import select
+from sqlalchemy import exc as sa_exc
+from sqlalchemy import make_url, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.schema import CreateTable
@@ -35,14 +36,18 @@ from deal_radar.db.database import (
     Database,
     Recorder,
     SnapshotRecord,
+    _sqlite_file_path,
     alert_upsert_statement,
+    build_snapshot_rows,
     classify_record,
     connect_redis,
+    is_transient_error,
+    json_safe,
     listing_upsert_statement,
     price_history_query,
     redact_url,
 )
-from deal_radar.db.models import Listing, UTCDateTime, ensure_utc
+from deal_radar.db.models import Listing, UTCDateTime, db_text, ensure_utc
 from deal_radar.engine.types import (
     Alert,
     Condition,
@@ -440,6 +445,109 @@ async def test_long_values_are_clipped_to_column_widths(db: Database) -> None:
     assert len((await fetch_snapshots(db, item))[0]["reject_code"]) == 64
 
 
+# --------------------------------------------------------------------------- hostile input
+# Each of these used to fail the whole (Recorder: 200-record) transaction: PostgreSQL rejects
+# NUL in text and \u0000 in jsonb, no driver can encode lone surrogates, orjson rejects
+# integers outside 64 bits, SQLite stores NaN as NULL (NOT NULL violation) and alerts.id
+# was VARCHAR(64).
+
+
+def test_db_text_and_json_safe() -> None:
+    assert db_text(None) is None
+    assert db_text("plain ascii") == "plain ascii"
+    assert db_text("café \U0001f600") == "café \U0001f600"  # valid non-ASCII untouched
+    assert db_text("a\x00b") == "ab"
+    assert db_text("lone \ud83d here") == "lone � here"
+    assert db_text("split pair 😀") == "split pair \U0001f600"  # halves re-joined
+    assert db_text("abcdef", 3) == "abc"
+    assert db_text("a\x00bcdef", 3) == "abc"  # sanitised before clipping
+    doc = {"s": "x\x00", "n": [1, 2**70, -(2**70), 1.5, float("nan"), float("inf")], "b": True, "z": None, 3: (b"\xff", {1})}
+    safe = json_safe(doc)
+    assert safe == {"s": "x", "n": [1, str(2**70), str(-(2**70)), 1.5, None, None], "b": True, "z": None, "3": ["b'\\xff'", [1]]}
+    clean = {"a": [1, "b", {"c": 2.5, "d": None, "e": False}]}
+    assert json_safe(clean) == clean
+
+
+async def test_hostile_text_is_sanitised_not_fatal(db: Database) -> None:
+    nul = make_item("14001", title="RTX 4090\x00 FE", seller="bob\x00by", location=Location(text="Austin\x00"))
+    sur = make_item("14002", title="RTX 4090 \ud83d deal 😀")
+    await db.write_snapshots([rec(nul, accepted_fr(), make_score(), T0), rec(sur, accepted_fr(), make_score(), T0)])
+    n = await fetch_listing(db, nul)
+    assert (n["title"], n["seller_name"], n["location_text"]) == ("RTX 4090 FE", "bobby", "Austin")
+    assert (await fetch_listing(db, sur))["title"] == "RTX 4090 � deal \U0001f600"
+    assert (await db.counts())["snapshots"] == 2
+
+    item = make_item("14003", title="RTX\x00 4090").model_copy(
+        update={"extra": {"bad": "x\ud83d", "huge": 2**70, "nested": [{"k\x00": "v\x00"}]}}
+    )
+    alert = make_alert(item)
+    report = DispatchReport(
+        alert_id=alert.alert_id,
+        results=[DispatchResult(target="discord:gpu", ok=False, status=502, error="bad gateway\x00")],
+        suppressed_reason="flood\x00guard",
+    )
+    await db.write_alert(alert, report)
+    [row] = await db.recent_alerts()
+    assert row["payload"]["item"]["title"] == "RTX 4090"
+    assert row["payload"]["item"]["extra"] == {"bad": "x�", "huge": str(2**70), "nested": [{"k": "v"}]}
+    assert row["results"][0]["error"] == "bad gateway"
+    assert row["suppressed_reason"] == "floodguard"
+
+
+async def test_non_finite_prices_are_skipped_not_fatal(db: Database, caplog: pytest.LogCaptureFixture) -> None:
+    nan_item = make_item("14101").model_copy(update={"price": float("nan"), "total_price": float("nan")})
+    inf_item = make_item("14102").model_copy(update={"total_price": float("inf")})
+    good = make_item("14103").model_copy(update={"shipping": float("nan")})
+    with caplog.at_level(logging.WARNING, logger="deal_radar.db"):
+        await db.write_snapshots(
+            [
+                rec(nan_item, accepted_fr(), make_score(), T0),
+                rec(inf_item, accepted_fr(), make_score(), T0),
+                rec(good, accepted_fr(), make_score(risk=float("nan")), T0),
+            ]
+        )
+        await db.write_snapshots([rec(nan_item, accepted_fr(), make_score(), T0)])  # nothing valid: no-op
+    assert await db.counts() == {"listings": 1, "snapshots": 1, "alerts": 0}
+    [snapshot] = await fetch_snapshots(db)
+    assert snapshot["listing_id"] == good.fingerprint
+    assert snapshot["shipping"] is None and snapshot["risk"] is None
+    assert sum("non-finite price" in r.getMessage() for r in caplog.records) == 3
+
+    alert = make_alert(good).model_copy(update={"ingest_lag_ms": float("nan"), "pipeline_ms": float("inf")})
+    await db.write_alert(alert, make_report(alert))
+    [row] = await db.recent_alerts()
+    assert row["ingest_lag_ms"] is None and row["pipeline_ms"] == 0.0
+
+
+async def test_long_alert_ids_are_stored(db: Database) -> None:
+    alert = make_alert(make_item("14201")).model_copy(update={"alert_id": "x" * 300})
+    await db.write_alert(alert, make_report(alert))
+    assert [r["alert_id"] for r in await db.recent_alerts()] == ["x" * 300]
+
+
+def test_listing_rows_are_upserted_in_primary_key_order() -> None:
+    # Two nodes upserting the same listings in different orders deadlock on PostgreSQL;
+    # a global lock order (sorted primary keys) makes that impossible.
+    records = [rec(make_item(f"15{i:03d}"), accepted_fr(), make_score(), T0) for i in range(50)]
+    rows, snapshots = build_snapshot_rows(list(reversed(records)))
+    ids = [r["id"] for r in rows]
+    assert ids == sorted(ids) and len(ids) == 50
+    assert [s["listing_id"] for s in snapshots] == [r.item.fingerprint for r in reversed(records)]
+
+
+async def test_concurrent_writers_with_opposite_order_do_not_deadlock(db: Database) -> None:
+    other = Database(db.url.render_as_string(hide_password=False))
+    await other.connect()
+    try:
+        items = [make_item(f"16{i:03d}") for i in range(150)]
+        for round_ in range(4):
+            batch = [rec(item, accepted_fr(), make_score(), T0 + timedelta(minutes=round_)) for item in items]
+            await asyncio.gather(db.write_snapshots(batch), other.write_snapshots(list(reversed(batch))))
+    finally:
+        await other.close()
+    assert await db.counts() == {"listings": 150, "snapshots": 150 * 2 * 4, "alerts": 0}
+
+
 # --------------------------------------------------------------------------- alerts
 
 
@@ -665,6 +773,7 @@ def test_postgres_statements_compile() -> None:
     assert "ON DELETE CASCADE" in snapshots_ddl
     alerts_ddl = str(CreateTable(ALERTS).compile(dialect=pg))
     assert "payload JSONB NOT NULL" in alerts_ddl and "targets JSONB NOT NULL" in alerts_ddl
+    assert "id TEXT NOT NULL" in alerts_ddl  # Alert.alert_id has no length limit
 
     sqlite_sql = str(listing_upsert_statement("sqlite").compile(dialect=sqlite.dialect()))
     assert "ON CONFLICT (id) DO UPDATE SET" in sqlite_sql
@@ -678,8 +787,36 @@ def test_redact_url() -> None:
     assert redact_url("redis://:s3cret@redis.internal:6379/0") == "redis://:***@redis.internal:6379/0"
     assert redact_url("redis://user:s3cret@host/1") == "redis://user:***@host/1"
     assert redact_url("redis://localhost:6379/0") == "redis://localhost:6379/0"
+    # redis-py also reads credentials from the query string.
+    assert redact_url("redis://cache:6379/0?password=s3cret&db=1") == "redis://cache:6379/0?password=***&db=1"
+    assert redact_url("unix:///run/redis.sock?db=0&password=s3cret") == "unix:///run/redis.sock?db=0&password=***"
     db = Database("postgresql+asyncpg://dealradar:hunter2@db:5432/deals")
     assert "hunter2" not in redact_url(db.url)
+
+
+def test_sqlite_file_path_detection(tmp_path: Path) -> None:
+    assert _sqlite_file_path(make_url("sqlite+aiosqlite://")) is None
+    assert _sqlite_file_path(make_url("sqlite+aiosqlite:///:memory:")) is None
+    assert _sqlite_file_path(make_url("sqlite+aiosqlite:///file:mem1?mode=memory&cache=shared&uri=true")) is None
+    assert _sqlite_file_path(make_url(f"sqlite+aiosqlite:///{tmp_path}/x/y.db")) == tmp_path / "x" / "y.db"
+    assert _sqlite_file_path(make_url(f"sqlite+aiosqlite:///file:{tmp_path}/z.db?uri=true")) == tmp_path / "z.db"
+
+
+def test_is_transient_error() -> None:
+    def dbapi_error(sqlstate: str) -> sa_exc.DBAPIError:
+        orig = type("PgError", (Exception,), {"sqlstate": sqlstate})("boom")
+        return sa_exc.DBAPIError("INSERT ...", {}, orig)
+
+    assert is_transient_error(ConnectionRefusedError())
+    assert is_transient_error(TimeoutError())
+    assert is_transient_error(sa_exc.OperationalError("INSERT ...", {}, Exception("database is locked")))
+    assert is_transient_error(sa_exc.InterfaceError("INSERT ...", {}, Exception("connection is closed")))
+    assert is_transient_error(dbapi_error("40P01"))  # deadlock_detected
+    assert is_transient_error(dbapi_error("08006"))  # connection_failure
+    assert not is_transient_error(dbapi_error("22021"))  # NUL byte / bad encoding: poison record
+    assert not is_transient_error(sa_exc.IntegrityError("INSERT ...", {}, Exception("NOT NULL constraint failed")))
+    assert not is_transient_error(UnicodeEncodeError("utf-8", "\ud83d", 0, 1, "surrogates not allowed"))
+    assert not is_transient_error(TypeError("Integer exceeds 64-bit range"))
 
 
 # --------------------------------------------------------------------------- Recorder

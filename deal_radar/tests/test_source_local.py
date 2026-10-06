@@ -1313,16 +1313,18 @@ async def test_offerup_graphql_sends_web_app_headers(upstream: Upstream, ctx: In
     ing = offerup(ctx, upstream, profiles=["rtx_4090"])
     await ing.poll()
     await ing.poll()
-    first, second = upstream.calls("POST", "/api/graphql")
-    for call in (first, second):
-        headers = call["headers"]
+    first, second = ({k.lower(): v for k, v in c["headers"].items()} for c in upstream.calls("POST", "/api/graphql"))
+    for headers in (first, second):
         assert headers["x-ou-operation-name"] == "GetModularFeed"
-        assert headers["x-ou-d-token"].startswith("web-")
+        assert headers["x-ou-d-token"].startswith("web-") and len(headers["x-ou-d-token"]) == 4 + 56
         assert headers["ou-session-id"].startswith(headers["x-ou-d-token"] + "@")
         assert len(headers["x-request-id"]) == 36
+        # fetch()-style call: CORS fetch metadata, no navigation-only headers.
+        assert headers["sec-fetch-mode"] == "cors" and headers["sec-fetch-dest"] == "empty"
+        assert "sec-fetch-user" not in headers and "upgrade-insecure-requests" not in headers
     # Device token is sticky per ingestor (like a browser profile); request ids are not.
-    assert first["headers"]["x-ou-d-token"] == second["headers"]["x-ou-d-token"]
-    assert first["headers"]["x-request-id"] != second["headers"]["x-request-id"]
+    assert first["x-ou-d-token"] == second["x-ou-d-token"]
+    assert first["x-request-id"] != second["x-request-id"]
 
 
 def test_offerup_removed_listing_is_marked_unavailable() -> None:
@@ -1360,3 +1362,139 @@ async def test_offerup_cancellation_mid_request_propagates_and_next_poll_recover
         await task
     gate["slow"] = False
     assert len(await ing.poll()) == 1
+
+
+HCAPTCHA_PAGE = (
+    "<html><head><title>craigslist | verification</title>"
+    '<script src="https://js.hcaptcha.com/1/api.js" async defer></script></head>'
+    '<body><form><div class="h-captcha" data-sitekey="x"></div></form></body></html>'
+)
+
+
+async def test_craigslist_api_calls_use_cors_fetch_metadata(upstream: Upstream, ctx: IngestorContext) -> None:
+    _cl_reference_routes(upstream)
+    upstream.route("GET", cl.SAPI_SEARCH_PATH, jsonr(cl_sapi_payload()))
+    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
+    await ing.poll()
+    for call in (*upstream.calls("GET", cl.SAPI_SEARCH_PATH), *upstream.calls("GET", "/ref/Areas")):
+        headers = {k.lower(): v for k, v in call["headers"].items()}
+        assert headers["sec-fetch-mode"] == "cors" and headers["sec-fetch-dest"] == "empty"
+        assert "sec-fetch-user" not in headers and "upgrade-insecure-requests" not in headers
+    assert {k.lower(): v for k, v in upstream.calls("GET", cl.SAPI_SEARCH_PATH)[0]["headers"].items()}[
+        "sec-fetch-site"
+    ] == "same-site"
+
+
+async def test_craigslist_hcaptcha_wall_served_as_503_is_a_block(upstream: Upstream, ctx: IngestorContext) -> None:
+    _cl_reference_routes(upstream)
+    upstream.route("GET", cl.SAPI_SEARCH_PATH, text(HCAPTCHA_PAGE, status=503))
+    upstream.route("GET", "/site/newyork/search/sss", text(CL_HTML))
+    ing = craigslist(ctx, upstream, profiles=["rtx_4090"])
+    with pytest.raises(SourceBlocked, match="captcha") as caught:
+        await ing.poll()
+    assert caught.value.cooldown_seconds == cl.IP_BLOCK_COOLDOWN_SECONDS
+    assert not upstream.calls("GET", "/site/newyork/search/sss")  # never routed around
+
+
+async def test_offerup_challenge_served_as_503_is_a_block_not_a_fallback(upstream: Upstream, ctx: IngestorContext) -> None:
+    upstream.route("GET", "/search", text(CLOUDFLARE_PAGE, status=503))
+    upstream.route("POST", "/api/graphql", jsonr({"data": {"modularFeed": ou_feed(OU_LISTING_TUF)}}))
+    ing = offerup(ctx, upstream, profiles=["rtx_4090"])
+    with pytest.raises(SourceBlocked, match="challenge"):
+        await ing.poll()
+    assert not upstream.calls("POST")
+
+
+def test_offerup_hcaptcha_detected_and_job_tiles_skipped() -> None:
+    assert ou.detect_block(200, HCAPTCHA_PAGE) is not None
+    feed = ou_feed(OU_LISTING_FE)
+    feed["looseTiles"].append(
+        {"__typename": "ModularFeedTileJob", "tileId": "j-1", "tileType": "JOB",
+         "job": {"listingId": "job-1", "title": "Warehouse associate"}}
+    )
+    listings = ou.parse_graphql_feed({"data": {"modularFeed": feed}})
+    assert [r.source_id for r in listings] == [OU_LISTING_FE["listingId"]]
+
+
+def test_offerup_graphql_feed_reads_module_grid_tiles() -> None:
+    assert "modules {" in ou.FEED_QUERY and "ModularFeedModuleGrid" in ou.FEED_QUERY
+    feed = {
+        "looseTiles": [],
+        "modules": [
+            {
+                "__typename": "ModularFeedModuleGrid",
+                "grid": {"tiles": [{"__typename": "ModularFeedTileListing", "tileType": "LISTING", "listing": OU_LISTING_TUF}]},
+            }
+        ],
+        "pageCursor": None,
+    }
+    assert [r.source_id for r in ou.parse_graphql_feed({"data": {"modularFeed": feed}})] == ["1234567890"]
+
+
+def test_offerup_graphql_params_include_zipcode_when_configured() -> None:
+    task = ou.SearchTask("rtx_4090", "rtx 4090", 450, 1950)
+    params = {p["key"]: p["value"] for p in ou.graphql_search_params(
+        task, radius_miles=30, limit=50, coordinates=None, session_id="s", zip_code=" 11216-1234 "
+    )}
+    assert params["zipcode"] == "11216" and "lat" not in params
+    bad = {p["key"] for p in ou.graphql_search_params(task, radius_miles=30, limit=50, coordinates=None, session_id="s", zip_code="NW1")}
+    assert "zipcode" not in bad
+
+
+def _garbage(rng: Any, depth: int = 0) -> Any:
+    """Deterministic pseudo-random JSON-ish value (mixed types, nesting, extreme numbers)."""
+    choice = rng.randrange(12 if depth < 4 else 7)
+    if choice == 0:
+        return None
+    if choice == 1:
+        return rng.choice([True, False])
+    if choice == 2:
+        return rng.choice([0, -1, -2, 1, 2**63, -(2**63), 7_880_000_000, 1_759_600_000])
+    if choice == 3:
+        return rng.choice([0.0, float("nan"), float("inf"), -1.5, 1e300])
+    if choice == 4:
+        return rng.choice(["", " ", "0", "-1", "abc", "$1,200", "0:0:0~x~y", "3:..", "<script>", "9" * 40, ":::~~~"])
+    if choice == 5:
+        return rng.choice(["listingId", "title", "price", "looseTiles", "AD_1P", "Tile Ad"])
+    if choice == 6:
+        return {}
+    if choice in (7, 8):
+        return [_garbage(rng, depth + 1) for _ in range(rng.randrange(8))]
+    keys = ["listingId", "title", "price", "image", "photos", "owner", "locationName", "locationDetails", "tileType",
+            "__typename", "listing", "postDate", "flags", "isRemoved", "state", "items", "decode", "data", "minPostingId",
+            "minPostedDate", "locations", "locationDescriptions", "neighborhoods", "postingId", "location", "images", "seo"]
+    return {rng.choice(keys): _garbage(rng, depth + 1) for _ in range(rng.randrange(1, 7))}
+
+
+def test_pure_parsers_survive_malformed_payloads() -> None:
+    import random
+
+    rng = random.Random(20261006)
+    ctx_ = _cl_ctx()
+    for _ in range(1500):
+        blob = _garbage(rng)
+        # OfferUp
+        try:
+            ou.parse_graphql_feed({"data": {"modularFeed": blob}} if rng.random() < 0.7 else blob)
+        except ou.OfferUpParseError:
+            pass
+        page = ou_page(None, page_props={"searchFeedResponse": blob} if rng.random() < 0.5 else {"x": blob})
+        try:
+            ou.parse_search_page(page)
+        except ou.OfferUpParseError:
+            pass
+        ou.parse_geocode(blob)
+        if isinstance(blob, dict):
+            ou.parse_listing(blob)
+        # Craigslist
+        payload = {"data": {"items": blob if isinstance(blob, list) else [blob], "decode": _garbage(rng)}}
+        try:
+            cl.decode_search_response(payload if rng.random() < 0.8 else blob, ctx_)
+        except cl.CraigslistParseError:
+            pass
+        item = [rng.randrange(-5, 10**6), _garbage(rng), _garbage(rng), _garbage(rng), _garbage(rng)]
+        item += [_garbage(rng) for _ in range(rng.randrange(6))]
+        cl.decode_compact_item(item, cl._Decode.from_payload(_garbage(rng)), ctx_)
+        cl.parse_geo(_garbage(rng))
+        cl.parse_areas(blob)
+        cl.parse_categories(blob)

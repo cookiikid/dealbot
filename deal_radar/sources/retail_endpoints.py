@@ -150,7 +150,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
-from typing import Any, ClassVar, Union
+from typing import Any, ClassVar
 from urllib.parse import quote, urljoin, urlsplit
 
 from deal_radar.config_schema import (
@@ -168,7 +168,7 @@ from deal_radar.core.metrics import Metrics
 from deal_radar.engine.types import Condition, RawListing, SellerInfo, SourceKind, utcnow
 from deal_radar.sources.base import BaseIngestor, IngestorContext, SourceAuthError, SourceBlocked, SourceError
 
-AnyEndpoint = Union[BestBuyEndpoint, ShopifyEndpoint, TargetEndpoint, NeweggEndpoint, GenericJsonEndpoint]
+AnyEndpoint = BestBuyEndpoint | ShopifyEndpoint | TargetEndpoint | NeweggEndpoint | GenericJsonEndpoint
 SkipFn = Callable[[str, str], None]  # (reason, item id or "") -> None
 
 SOURCE_NAME = "retail"
@@ -254,7 +254,7 @@ class RetailEndpointError(SourceError):
         self.retry_after = retry_after
         self.partial: list[RawListing] = list(partial)
 
-    def with_partial(self, partial: Sequence[RawListing]) -> "RetailEndpointError":
+    def with_partial(self, partial: Sequence[RawListing]) -> RetailEndpointError:
         clone = RetailEndpointError(
             self.endpoint,
             self.detail,
@@ -902,7 +902,9 @@ def _newegg_images(main: Mapping[str, Any]) -> list[str]:
     patterns = image.get("ImagePathPattern")
     if isinstance(patterns, list):
         for entry in patterns:
-            if isinstance(entry, Mapping) and entry.get("Size") == NEWEGG_IMAGE_SIZE and isinstance(entry.get("PathPattern"), str):
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("PathPattern"), str):
+                continue
+            if entry.get("Size") == NEWEGG_IMAGE_SIZE:
                 pattern = entry["PathPattern"]
                 break
     names: list[str] = []
@@ -1017,7 +1019,7 @@ class CompiledFieldMap:
     condition: tuple[str | int, ...] | None
 
     @classmethod
-    def from_endpoint(cls, endpoint: GenericJsonEndpoint) -> "CompiledFieldMap":
+    def from_endpoint(cls, endpoint: GenericJsonEndpoint) -> CompiledFieldMap:
         f = endpoint.fields
 
         def opt(path: str | None) -> tuple[str | int, ...] | None:
@@ -1037,10 +1039,7 @@ class CompiledFieldMap:
 
 
 def _generic_images(value: Any, base: str) -> list[str]:
-    if isinstance(value, list):
-        values = value
-    else:
-        values = [value]
+    values = value if isinstance(value, list) else [value]
     urls: list[str | None] = []
     for entry in values:
         if isinstance(entry, Mapping):
@@ -1210,7 +1209,7 @@ class EndpointAdapter(abc.ABC):
             except PayloadError as exc:
                 errors.append(RetailEndpointError(self.name, self.redact(f"unusable payload: {exc}"), status=reply.status))
                 return
-            except Exception as exc:  # noqa: BLE001 - a parser bug must not orphan sibling requests
+            except Exception as exc:
                 self.log.exception("retail parser crashed", extra={"endpoint": self.name, "error": self.redact(repr(exc))})
                 errors.append(RetailEndpointError(self.name, self.redact(f"parser error: {exc!r}"), status=reply.status))
                 return
@@ -1738,7 +1737,7 @@ class RetailIngestor(BaseIngestor):
         except RetailEndpointError as exc:
             error = exc
             listings = exc.partial
-        except Exception as exc:  # noqa: BLE001 - a parser bug must not take down the other endpoints
+        except Exception as exc:
             self.log.exception("retail endpoint crashed", extra={"endpoint": state.name, "error": adapter.redact(repr(exc))})
             error = RetailEndpointError(state.name, adapter.redact(f"unexpected error: {exc!r}"))
             listings = []
@@ -1829,17 +1828,17 @@ __all__ = [
     "ADAPTERS",
     "BESTBUY_API_BASE",
     "BESTBUY_SHOW_FIELDS",
+    "NEWEGG_MIN_INTERVAL_SECONDS",
+    "NEWEGG_REALTIME_URL",
+    "REDSKY_BASE",
+    "REDSKY_SUMMARY_PATH",
     "BestBuyAdapter",
     "CompiledFieldMap",
     "EndpointAdapter",
     "EndpointState",
     "GenericJsonAdapter",
-    "NEWEGG_MIN_INTERVAL_SECONDS",
-    "NEWEGG_REALTIME_URL",
     "NeweggAdapter",
     "PayloadError",
-    "REDSKY_BASE",
-    "REDSKY_SUMMARY_PATH",
     "RequestSpec",
     "RetailEndpointError",
     "RetailIngestor",
