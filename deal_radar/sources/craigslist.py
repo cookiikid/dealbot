@@ -18,12 +18,22 @@ The response is compact: ``data.items`` is a list of positional arrays and
     item[4]  "locIdx[:descIdx[:hoodIdx]]~lat~lon"  (indexes into decode.locations /
              decode.locationDescriptions / decode.neighborhoods; locations[i] is
              [areaId, hostname, subareaAbbr?])
+    item[5]  thumbnail suffix (``0`` when there are no photos); an optional negative int
+             (dedupe key) may follow
     tagged   [4, "3:<imgId>", ...] images, [6, "<slug>"] URL slug, [10, "$1,350"] price text,
-             [13, token] opaque; the title is the last plain string of the array.
+             [13, "<token>"] posting token; housing adds [5, beds, sqft] *after* the title.
+             The title is the last plain string of the array (scan backwards).
 
 Images are served as ``https://images.craigslist.org/<imgId>_600x450.jpg`` (the
 ``N:`` prefix of an image ref is dropped; 300x300 / 1200x900 sizes also exist).
-Posting URLs are ``https://<host>.craigslist.org/<subarea>/<cat>/d/<slug>/<id>.html``.
+
+Posting URLs (verified on live pages, Sept 2026): Craigslist moved postings to
+``https://www.craigslist.org/view/d/<slug>/<token>`` (token = tag 13) and city
+sub-domain search pages now 301 to ``www.craigslist.org/search/...``. The legacy
+``https://<host>.craigslist.org/<subarea>/<cat>/d/<slug>/<id>.html`` still redirects
+there but 404s when ``<cat>`` is wrong, so it is only used when an item carries no
+token. The static (no-JS) result list links to the ``/view/d/`` form and no longer
+exposes the numeric posting id.
 
 Design decisions:
 
@@ -47,6 +57,10 @@ Design decisions:
   surfaces on the next poll so the base loop applies its cooldown.
 * Price ``0``/``-1`` means "no price given" on Craigslist far more often than "free"
   for hardware, so it maps to ``None`` and the normalizer falls back to the title price.
+* **Listing identity**: the JSON API yields numeric posting ids, the static page only
+  the posting token. Both carry the token (``extra["posting_key"]``), so the ingestor
+  keeps a bounded token -> listing-id map and the *first* identity a posting was seen
+  under wins. A switch between modes therefore never re-emits (re-alerts) a listing.
 """
 
 from __future__ import annotations
@@ -56,6 +70,7 @@ import html as html_lib
 import math
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -78,6 +93,7 @@ SAPI_SEARCH_PATH = "/web/v8/postings/search/full"
 REFERENCE_ORIGIN = "https://reference.craigslist.org"
 SITE_URL_TEMPLATE = "https://{site}.craigslist.org"
 IMAGE_URL_TEMPLATE = "https://images.craigslist.org/{image_id}_600x450.jpg"
+VIEW_URL_TEMPLATE = "https://www.craigslist.org/view/d/{slug}/{key}"
 BATCH_SIZE = 360  # the web UI's page size (API maximum)
 DEFAULT_SITE_RADIUS_MILES = 60  # radius around a site's centre when no postal code is configured
 MAX_IMAGES = 8
@@ -86,24 +102,28 @@ BUDGET_FRACTION = 0.8
 PRIMARY_RETRY_SECONDS = 1800.0
 REFERENCE_RETRY_SECONDS = 3600.0
 BLOCK_COOLDOWN_SECONDS = 1800.0  # minimum pause after a 403 wall (429 uses the configured cooldown)
-IP_BLOCK_COOLDOWN_SECONDS = 3600.0  # "This IP has been automatically blocked" lasts hours
+IP_BLOCK_COOLDOWN_SECONDS = 3600.0  # "This IP has been automatically blocked" / hCaptcha walls last hours
+IDENTITY_MAP_SIZE = 50_000  # posting token -> listing id aliases kept per process
 MODE_SAPI = "sapi"
 MODE_HTML = "html"
 
 TAG_IMAGES = 4
 TAG_SLUG = 6
 TAG_PRICE_TEXT = 10
+TAG_POSTING_KEY = 13
 
 _SITE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _IMAGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,128}$")
 _SLUG_RE = re.compile(r"^[A-Za-z0-9-]{1,200}$")
 _CATEGORY_RE = re.compile(r"^[a-z]{2,6}$")
 _POSTING_ID_RE = re.compile(r"/(\d{6,15})\.html(?:[?#].*)?$")
+_VIEW_PATH_RE = re.compile(r"^/view/d/([A-Za-z0-9-]{1,200})/([A-Za-z0-9]{8,64})/?$")
+_POSTING_KEY_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
 _AREA_ID_RE = re.compile(r'"areaId"\s*:\s*(\d+)')
 _PLAIN_PRICE_RE = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?$")
 _BLOCK_RE = re.compile(
     r"ip has been automatically blocked|your request has been blocked|blocks-[a-z0-9.]*@craigslist"
-    r"|<title>\s*access denied\s*</title>|\bcaptcha\b",
+    r"|<title>\s*access denied\s*</title>|\bh-?captcha\b|\bcaptcha\b",
     re.I,
 )
 _COUNTRY_CURRENCY = {
@@ -236,7 +256,8 @@ def block_cooldown(reason: str, configured: float) -> float | None:
     """Cooldown for a block: rate limits use the configured pause, walls 30-60 min at least."""
     if reason == "http_429":
         return None
-    floor = IP_BLOCK_COOLDOWN_SECONDS if "blocked" in reason or "blocks-" in reason else BLOCK_COOLDOWN_SECONDS
+    ip_level = "blocked" in reason or "blocks-" in reason or "captcha" in reason
+    floor = IP_BLOCK_COOLDOWN_SECONDS if ip_level else BLOCK_COOLDOWN_SECONDS
     return max(configured, floor)
 
 
@@ -265,6 +286,21 @@ def posting_url(host: str, subarea: str | None, category: str, slug: str | None,
     if slug:
         path += ["d", slug]
     return f"https://{host}.craigslist.org/{'/'.join(path)}/{posting_id}.html"
+
+
+def posting_key(value: Any) -> str | None:
+    """The tag-13 posting token when it has the expected shape (base58/62 id)."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if _POSTING_KEY_RE.match(value) else None
+
+
+def view_url(slug: str | None, key: str | None) -> str | None:
+    """Current canonical posting URL ``https://www.craigslist.org/view/d/<slug>/<token>``."""
+    if not slug or not key or not _SLUG_RE.match(slug) or not _POSTING_KEY_RE.match(key):
+        return None
+    return VIEW_URL_TEMPLATE.format(slug=slug, key=key)
 
 
 def coerce_price(value: Any) -> float | str | None:
@@ -381,17 +417,21 @@ def _build_listing(
     images: list[str],
     location: Location | None,
     extra: dict[str, Any],
+    key: str | None = None,
 ) -> RawListing:
-    host = host if host and _SITE_RE.match(host) else ctx.site
+    host = host if host and host != "www" and _SITE_RE.match(host) else ctx.site
     subarea = subarea if subarea and _CATEGORY_RE.match(subarea) else None
     category = category if category and _CATEGORY_RE.match(category) else ctx.category
     slug = slug if slug and _SLUG_RE.match(slug) else None
+    key = posting_key(key)
     extra = {"site": host, **({"subarea": subarea} if subarea else {}), "category": category, **extra}
+    if key:
+        extra["posting_key"] = key
     return RawListing(
         source="craigslist",
         source_kind=SourceKind.LOCAL,
         source_id=str(posting_id),
-        url=posting_url(host, subarea, category, slug, posting_id),
+        url=view_url(slug, key) or posting_url(host, subarea, category, slug, posting_id),
         title=title,
         price=price,
         currency=ctx.currency,
@@ -421,7 +461,7 @@ def decode_compact_item(item: Any, decode: _Decode, ctx: DecodeContext) -> RawLi
     if not title:
         return None
     tags: dict[int, list[Any]] = {}
-    for element in item[5:title_index]:
+    for element in item[5:]:  # tagged arrays precede the title, housing's [5, beds, sqft] follows it
         if isinstance(element, list) and element and isinstance(element[0], int) and not isinstance(element[0], bool):
             tags.setdefault(element[0], element[1:])
     date_offset = _as_int(item[1])
@@ -444,7 +484,8 @@ def decode_compact_item(item: Any, decode: _Decode, ctx: DecodeContext) -> RawLi
         location = Location(text=description or hood, latitude=lat, longitude=lon)
     slug = next((v for v in tags.get(TAG_SLUG, []) if isinstance(v, str)), None)
     images = [u for u in (image_url(ref) for ref in tags.get(TAG_IMAGES, [])) if u]
-    extra: dict[str, Any] = {"via": MODE_SAPI}
+    key = next((v for v in tags.get(TAG_POSTING_KEY, []) if isinstance(v, str)), None)
+    extra: dict[str, Any] = {"via": MODE_SAPI, "posting_id": posting_id}
     if category_id is not None:
         extra["category_id"] = category_id
     if price_text:
@@ -464,6 +505,7 @@ def decode_compact_item(item: Any, decode: _Decode, ctx: DecodeContext) -> RawLi
         images=images,
         location=location,
         extra=extra,
+        key=key,
     )
 
 
@@ -486,7 +528,7 @@ def decode_object_item(item: Any, ctx: DecodeContext) -> RawListing | None:
     lon = _as_float(loc.get("lon") if loc.get("lon") is not None else item.get("lon"))
     images_raw = item.get("images")
     images = [u for u in (image_url(r) for r in images_raw) if u] if isinstance(images_raw, list) else []
-    extra: dict[str, Any] = {"via": MODE_SAPI}
+    extra: dict[str, Any] = {"via": MODE_SAPI, "posting_id": posting_id}
     if price_text:
         extra["price_text"] = price_text
     return _build_listing(
@@ -607,7 +649,15 @@ def parse_search_html(
     base_url: str | None = None,
     stats: dict[str, int] | None = None,
 ) -> list[RawListing]:
-    """Listings from the static (no-JS) search result list of a Craigslist site."""
+    """Listings from the static (no-JS) search result list of a Craigslist site.
+
+    Rows link either to the 2026 ``/view/d/<slug>/<token>`` form (the token becomes the
+    listing id and ``extra["posting_key"]``) or to the legacy ``.../<id>.html`` form.
+    ``base_url`` should be the *final* page URL (city searches redirect to www) so
+    relative links resolve correctly. Raises :class:`CraigslistParseError` when result
+    rows exist but none can be mapped (link scheme drift), so a broken fallback never
+    passes for an empty search.
+    """
     parser = _StaticResultsParser()
     parser.feed(page or "")
     parser.close()
@@ -616,21 +666,26 @@ def parse_search_html(
     seen: set[str] = set()
     for row in parser.rows:
         href = row.get("href", "")
-        url = urljoin(base + "/", href) if href else ""
-        match = _POSTING_ID_RE.search(urlsplit(url).path) if url else None
+        url = urljoin(base if "?" in base or base.endswith("/") else base + "/", href) if href else ""
+        path = urlsplit(url).path if url else ""
+        legacy = _POSTING_ID_RE.search(path)
+        view = None if legacy else _VIEW_PATH_RE.match(path)
         title = _clean(row.get("title") or row.get("title_attr"))
-        if not match or not title or not url.startswith(("http://", "https://")):
+        if not (legacy or view) or not title or not url.startswith(("http://", "https://")):
             if stats is not None:
                 stats["unusable"] = stats.get("unusable", 0) + 1
             continue
-        posting_id = match.group(1)
+        posting_id = legacy.group(1) if legacy else view.group(2)  # type: ignore[union-attr]
         if posting_id in seen:
             continue
         seen.add(posting_id)
         place = _clean(row.get("location")) or None
         price_text = _clean(row.get("price")) or None
         host = (urlsplit(url).hostname or "").removesuffix(".craigslist.org")
-        extra: dict[str, Any] = {"via": MODE_HTML, "site": host if _SITE_RE.match(host) else ctx.site}
+        site = host if host != "www" and _SITE_RE.match(host) else ctx.site
+        extra: dict[str, Any] = {"via": MODE_HTML, "site": site}
+        if view is not None:
+            extra["posting_key"] = posting_id
         if price_text:
             extra["price_text"] = price_text
         try:
@@ -653,6 +708,8 @@ def parse_search_html(
                 stats["invalid"] = stats.get("invalid", 0) + 1
             continue
         out.append(raw)
+    if not out and parser.rows:
+        raise CraigslistParseError(f"none of {len(parser.rows)} static result rows could be parsed")
     if not out and "cl-static-search-result" not in (page or ""):
         raise CraigslistParseError("no static search results markup in page")
     return out
@@ -780,6 +837,7 @@ class CraigslistIngestor(BaseIngestor):
         self._deferred_block: SourceBlocked | None = None
         self._preferred = MODE_SAPI
         self._fallback_since: float | None = None
+        self._identities: OrderedDict[str, str] = OrderedDict()  # posting token -> first listing id seen
         m = ctx.metrics
         self._m_queries = m.counter("craigslist_queries_total", "Craigslist search requests", ("mode", "outcome"))
         self._m_skipped = m.counter("craigslist_items_skipped_total", "Malformed Craigslist result items", ("reason",))
@@ -935,8 +993,32 @@ class CraigslistIngestor(BaseIngestor):
                 self.log.info("craigslist switching search mode", extra={"source": self.name, "mode": mode})
                 self._preferred = mode
                 self._fallback_since = self._clock() if mode != MODE_SAPI else None
-            return listings
+            return self._stable_identities(listings)
         raise SourceError(f"craigslist search {task.term!r} on {site} failed: {last_error!r}") from last_error
+
+    def _stable_identities(self, listings: list[RawListing]) -> list[RawListing]:
+        """Keep one listing id per posting across modes (numeric id via API, token via HTML).
+
+        The first id a posting token was seen under wins for the life of the process, so
+        change detection and Redis dedup never see the same posting under two keys.
+        """
+        out: list[RawListing] = []
+        for raw in listings:
+            key = raw.extra.get("posting_key")
+            if not isinstance(key, str) or not key:
+                out.append(raw)
+                continue
+            known = self._identities.get(key)
+            if known is None:
+                self._identities[key] = raw.source_id
+                while len(self._identities) > IDENTITY_MAP_SIZE:
+                    self._identities.popitem(last=False)
+            else:
+                self._identities.move_to_end(key)
+                if known != raw.source_id:
+                    raw = raw.model_copy(update={"source_id": known})
+            out.append(raw)
+        return out
 
     def _context(self, site: str, task: SearchTask) -> DecodeContext:
         area = self._areas.get(site)
@@ -1009,7 +1091,7 @@ class CraigslistIngestor(BaseIngestor):
         stats: dict[str, int] = {}
         try:
             listings = await asyncio.to_thread(
-                parse_search_html, body, self._context(site, task), base_url=site_base, stats=stats
+                parse_search_html, body, self._context(site, task), base_url=resp.url or site_base, stats=stats
             )
         except CraigslistParseError:
             reason = detect_block(resp.status, body)
@@ -1040,7 +1122,8 @@ class CraigslistIngestor(BaseIngestor):
                 max_bytes=MAX_BODY_BYTES,
             )
         except HttpStatusError as exc:
-            reason = detect_block(exc.status, exc.body if exc.status in (401, 403, 429) else None)
+            # 503 bodies are inspected too: challenge/captcha walls are often served as 503.
+            reason = detect_block(exc.status, exc.body if exc.status in (401, 403, 429, 503) else None)
             if reason is not None:
                 raise self._blocked(f"craigslist {urlsplit(url).hostname} blocked ({reason})", reason) from exc
             raise

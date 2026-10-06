@@ -238,11 +238,12 @@ filters:
       action: reject
       description: Packaging sold without the product (classic eBay/FB bait)
       patterns:
-        # "box only" / "box-only" - but not "no box only the card", "no original box only card"
-        - '(?<!\bno\s)(?<!\bnot\s)(?<!\bno\soriginal\s)(?<!\bno\sretail\s)\bbox[\s-]*(?:only|alone)\b'
+        # "box only" / "box-only" - but not "no box only the card", "no original box only card".
+        # Look-behinds come AFTER a cheap literal so they only run where "box" occurs.
+        - '\bbox(?<!\bno\sbox)(?<!\bnot\sbox)(?<!\bno\soriginal\sbox)(?<!\bno\sretail\sbox)[\s-]*(?:only|alone)\b'
         - '\bempty\s+(?:retail\s+|original\s+|oem\s+)?box(?:es)?\b'
         # "just the box" / "only the original box" (not "comes with just the box", "only the box is dented")
-        - '(?<!\bwith\s)(?<!\bincludes\s)(?<!\bincluding\s)\b(?:just|only)\s+(?:the\s+)?(?:retail\s+|original\s+|empty\s+)?(?:box|packaging)\b(?!\s+(?:is|was|has|and\s+(?:the\s+)?(?:card|gpu|tv|monitor)))'
+        - '\b(?<!\bwith\s)(?<!\bincludes\s)(?<!\bincluding\s)(?:just|only)\s+(?:the\s+)?(?:retail\s+|original\s+|empty\s+)?(?:box|packaging)\b(?!\s+(?:is|was|has|and\s+(?:the\s+)?(?:card|gpu|tv|monitor)))'
         - '\b(?:box|packaging)\s+(?:and|&|\+)\s+(?:packaging|manuals?|accessories|inserts?|foam|papers|paperwork)\s+only\b'
         - '\bpackaging\s+only\b'
         - '\b(?:box|packaging)\s+(?:for|of)\s+(?:an?\s+|the\s+)?(?:nvidia\s+|geforce\s+)?(?:rtx|gtx|lg\s+(?:oled|c[4-6]|g[4-6])|samsung\s+(?:s90|qn)|alienware|steam\s+deck|sony\s+a7)'
@@ -253,7 +254,7 @@ filters:
       action: reject
       description: '"Picture of an RTX 4090" listings'
       patterns:
-        - '(?<!\bstock\s)(?<!\breference\s)(?<!\bexample\s)(?<!\bsample\s)\b(?:photo|picture|image|pic|print|poster|drawing|jpe?g|png)\s+only\b'
+        - '\b(?<!\bstock\s)(?<!\breference\s)(?<!\bexample\s)(?<!\bsample\s)(?:photo|picture|image|pic|print|poster|drawing|jpe?g|png)\s+only\b'
         - '\b(?:you\s+(?:are|will\s+be|r)\s+(?:buying|purchasing|receiving|getting|bidding\s+on)|you\s+(?:will\s+)?(?:get|receive))\s+(?:a\s+|an\s+|the\s+|one\s+)?(?:photo|picture|image|print|poster|drawing|digital\s+(?:photo|image|file|download))\b'
         - '\bthis\s+(?:listing\s+|auction\s+|sale\s+)?is\s+(?:for\s+)?(?:a\s+|an\s+|the\s+)?(?:photo|picture|image|print|poster|drawing)\s+of\b'
         - '^\W*(?:an?\s+)?(?:photo|picture|image|drawing|painting|print|poster)\s+of\b'
@@ -265,8 +266,9 @@ filters:
       patterns:
         - '\bfor\s+parts\b'
         - '\bparts\s+(?:only|or\s+repair|/\s*repair|and\s+repair|unit)\b'
-        # damage words, unless they describe the box/packaging ("box is damaged", "cracked box", "broken seal")
-        - '(?<!\bbox\s)(?<!\bbox\sis\s)(?<!\bbox\swas\s)(?<!\bbox\sgot\s)(?<!\bbox\sslightly\s)(?<!\bbox\sis\sslightly\s)(?<!\bbox\sa\sbit\s)(?<!\bbox\sis\sa\sbit\s)(?<!\bbox\sis\sa\slittle\s)(?<!\bboxes\s)(?<!\bboxes\sare\s)(?<!\bpackaging\s)(?<!\bpackaging\sis\s)(?<!\bpackaging\swas\s)(?<!\bred\s)\b(?:broken|cracked|shattered|smashed|bricked|dead|defective|faulty|damaged|burnt|burned|melted|fried|busted)\b(?![\s-]+(?:box|boxes|packaging|retail\s+box|seal|tape|bag|shipping\s+box|corner\s+of\s+(?:the\s+)?box|island|space|redemption|cells|by\s+daylight))'
+        # damage words, unless they describe the box/packaging ("box is damaged", "cracked box", "broken seal").
+        # The look-ahead runs first so the packaging look-behinds only run on damage words.
+        - '\b(?=(?:broken|cracked|shattered|smashed|bricked|dead|defective|faulty|damaged|burnt|burned|melted|fried|busted)\b)(?<!\bbox\s)(?<!\bbox\sis\s)(?<!\bbox\swas\s)(?<!\bbox\sgot\s)(?<!\bbox\sslightly\s)(?<!\bbox\sis\sslightly\s)(?<!\bbox\sa\sbit\s)(?<!\bbox\sis\sa\sbit\s)(?<!\bbox\sis\sa\slittle\s)(?<!\bboxes\s)(?<!\bboxes\sare\s)(?<!\bpackaging\s)(?<!\bpackaging\sis\s)(?<!\bpackaging\swas\s)(?<!\bred\s)\b(?:broken|cracked|shattered|smashed|bricked|dead|defective|faulty|damaged|burnt|burned|melted|fried|busted)\b(?![\s-]+(?:box|boxes|packaging|retail\s+box|seal|tape|bag|shipping\s+box|corner\s+of\s+(?:the\s+)?box|island|space|redemption|cells|by\s+daylight))'
         # explicit damaged parts (also catches "open box cracked screen")
         - '\b(?:cracked|broken|shattered|smashed|damaged|dead|stuck|burnt|burned|melted|bent)\s+(?:screen|panel|display|lcd|glass|pcb|board|connector|power\s+connector|12vhpwr|pins?|port|fans?|chip|die|core|pixels?)\b'
         - '\bnot\s+(?:working|functional|functioning|turning\s+on|powering\s+on|posting|booting|detected|recognized|recognised|displaying)\b'
@@ -302,7 +304,7 @@ filters:
         - '^\W*rent\b'
         - '\brent\s+(?:my|our|a|an|this|these|it|out|by|per|one|your|gpus?|cards?|rigs?|servers?|compute)\b'
         # "for rent" - not "money for rent", "pay for rent"
-        - '(?<!\bmoney\s)(?<!\bcash\s)(?<!\bpay\s)(?<!\bpaying\s)\bfor\s+rent\b'
+        - '\bfor(?<!\bmoney\sfor)(?<!\bcash\sfor)(?<!\bpay\sfor)(?<!\bpaying\sfor)\s+rent\b'
         - '\bfor\s+lease\b|\bleasing\b|\blease\s+(?:my|a|an|this|it|out|per)\b'
         - '\$\s*\d[\d,.]*\s*(?:/|per\s+|an?\s+)\s*(?:hr|hrs|hour|day|wk|week)\b'
         # monthly prices are rentals unless they are financing offers ("$108/mo with Affirm")
@@ -385,7 +387,7 @@ filters:
       patterns:
         - '\b(?:text|call|email|e-mail|whats\s?app|telegram|signal|kik|wechat|contact)\s+me\s+(?:at|on|@|via)\b'
         - '\bwhats\s?app\b|\bwechat\b|\bt\.me/'
-        - '(?<=[\w.+-])@(?:gmail|yahoo|hotmail|outlook|icloud|aol|proton(?:mail)?|gmx)\.(?:com|net|org|me|co)\b'
+        - '@(?<=[\w.+-]@)(?:gmail|yahoo|hotmail|outlook|icloud|aol|proton(?:mail)?|gmx)\.(?:com|net|org|me|co)\b'
     phone_number:
       action: risk
       probability: 0.15

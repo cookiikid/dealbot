@@ -1,32 +1,10 @@
 """Deterministic text classification: product identification + scam/noise rules.
 
 The text filter is the first CPU stage after normalisation and runs for *every*
-listing a source emits, so it is built to be fast, explainable and boring:
+listing a source emits, so it is built to be fast, explainable and boring.
 
-* **Compile once.** Every regex from ``config.yaml`` is compiled in ``__init__``.
-  The patterns of a rule group, of a profile's ``any``/``none`` lists and of a
-  variant's ``match`` list are joined into ONE alternation ``(?:p1)|(?:p2)|...``
-  so a single C-level scan replaces N Python-level calls. Patterns that would
-  change meaning when concatenated (numbered back-references, named groups,
-  leading global inline flags) are compiled on their own. ``all`` lists stay
-  separate by definition (every one of them must match).
-* **Case folding instead of IGNORECASE.** Config regexes are case-insensitive by
-  contract, but ``re.IGNORECASE`` disables ``sre``'s literal/charset prefix scan and
-  is 2-8x slower on long descriptions. Each pattern is therefore lower-cased once
-  (escape sequences such as ``\\S``/``\\W``/``\\B`` are left untouched) and matched,
-  without IGNORECASE, against a lower-cased copy of the listing made once per
-  evaluation. Spans are mapped back onto the original text for ``reject_detail``.
-  The few constructs for which this is not equivalent (scoped ``(?-i:...)``,
-  ``\\x``/``\\u``/``\\N`` escapes, the locale flag) keep IGNORECASE on the original text.
-* **Pre-indexed rule groups.** The reject/risk groups applicable to every
-  ``(product category, source kind)`` pair are resolved at start-up, so
-  :meth:`TextFilter.evaluate` never re-checks ``categories``/``source_kinds``.
-* **Pure.** ``evaluate`` reads only the item and immutable compiled state. It has
-  no side effects (no logging, metrics or caches) and is safe to call from any
-  number of pipeline workers.
-
-Evaluation order (the first rejection wins):
-
+Semantics (evaluation order, the first rejection wins)
+-------------------------------------------------------
 1. ``title_too_short`` when the stripped title is shorter than
    ``filters.min_title_length``.
 2. Product identification over the enabled profiles (``match.any/all/none`` on
@@ -34,7 +12,7 @@ Evaluation order (the first rejection wins):
    The winner's first matching variant (``variant.field``) is selected; a
    ``variant_required`` profile without a matching variant yields to the next
    candidate, else ``variant_unknown``. Nothing matched -> ``no_profile_match``.
-3. Condition gates: ``FOR_PARTS`` -> ``for_parts``; condition outside
+3. Condition gates: ``FOR_PARTS`` -> ``for_parts``; a condition outside
    ``profile.conditions`` -> ``condition_not_allowed``.
 4. ``reject`` groups in config order (respecting ``field``, ``categories``,
    ``source_kinds`` and ``negatable``): first match -> ``reject_code=<group>``,
@@ -62,6 +40,33 @@ Negation (``negatable`` groups only) is evaluated per match, not by masking:
   attached to that word and does not negate the match.
 * Form-style answers directly after the match are negations too:
   "Dead pixels: none", "Burn-in: no", "Mining: never".
+
+Performance design
+------------------
+* **Compile once, join per group.** The patterns of a rule group, of a profile's
+  ``any``/``none`` lists and of a variant's ``match`` list are joined into ONE
+  alternation ``(?:p1)|(?:p2)|...``. Patterns that would change meaning when
+  concatenated (numbered back-references, named groups, leading global inline
+  flags) are compiled on their own; ``all`` lists stay separate by definition.
+* **Case folding instead of IGNORECASE.** ``re.IGNORECASE`` disables sre's
+  literal/charset prefix scan and is 2-8x slower. Each pattern is lower-cased once
+  (backslash escapes untouched) and matched without IGNORECASE against a lower-cased
+  copy of the listing; spans map 1:1 back onto the original text. Constructs where
+  that is not equivalent (scoped ``(?-i:...)``, ``\\x``/``\\u``/``\\N`` escapes, the
+  locale flag) keep IGNORECASE on the original text.
+* **Literal anchor gate.** A regex led by ``\\b`` or a look-behind pays ~15 ns per
+  character even on irrelevant text, and descriptions run to 5000 characters. For
+  every pattern set the filter derives, from the regex parse tree and
+  conservatively, literal *anchors*: strings one of which every match must contain
+  ("box only", "not working", "zelle"). All anchors are compiled into greedy trie
+  regexes scanned once per listing; only pattern sets whose anchors occur are run.
+  Anchors that provably start a word are matched with a leading space so the
+  scan only engages at word starts. Pattern sets without a provable anchor always
+  run, so the gate can only skip work, never change a result.
+* **Pre-indexed rule groups.** Applicable reject/risk groups per
+  ``(category, source kind)`` are resolved at start-up.
+* **Pure.** ``evaluate`` reads only the item and immutable compiled state: no I/O,
+  logging, metrics or caches; safe to call from any number of pipeline workers.
 """
 
 from __future__ import annotations
@@ -76,7 +81,7 @@ from deal_radar.config_schema import AppConfig, Profile, RuleGroup
 from deal_radar.core.logs import get_logger
 from deal_radar.engine.types import Condition, DealItem, FilterResult, RiskSignal, SourceKind
 
-try:  # CPython 3.11+: the regex parser used to derive literal anchors (optimisation only)
+try:  # CPython 3.11+: the regex parser used to derive literal anchors (an optimisation only)
     from re import _constants as _sre_c
     from re import _parser as _sre_p
 except ImportError:  # pragma: no cover - other implementations: every pattern set simply runs ungated
@@ -146,7 +151,7 @@ def extract_title_price(text: str) -> float | None:
     return round(value, 2)
 
 
-# --------------------------------------------------------------------------- compiled patterns
+# --------------------------------------------------------------------------- case folding
 
 
 def _lower(text: str) -> str:
@@ -170,40 +175,69 @@ def _fold_pattern(pattern: str) -> str:
     return "".join(out)
 
 
-# --------------------------------------------------------------------------- literal anchor gate
-#
-# A regex led by ``\b`` or a look-behind cannot use sre's prefix scan, so it pays a
-# fixed ~15 ns per character even on text that contains nothing relevant. Most rule
-# patterns, however, can only match where a specific literal occurs ("box only",
-# "not working", "zelle"...). For every pattern set we derive (from the regex parse
-# tree, conservatively) a set of literal *anchors* such that every match must start
-# with one of them, modulo whitespace runs. All anchors of all pattern sets are
-# merged into one greedy trie regex that is scanned once per listing over the
-# lower-cased, whitespace-normalised text; only pattern sets whose anchors occur are
-# then actually run. Anchors need not be prefixes: any literal run that every match
-# must contain qualifies ("rent" in "^\W*rent\b", "x3d" in "\d{4}x3d"). Pattern
-# sets for which no anchor can be proven simply always run.
+def _compile_joined(sources: Sequence[str], flags: int) -> list[re.Pattern[str]]:
+    joinable = [p for p in sources if not _UNJOINABLE.search(p)]
+    regexes: list[re.Pattern[str]] = []
+    if joinable:
+        try:
+            regexes.append(re.compile("|".join(f"(?:{p})" for p in joinable), flags))
+        except re.error:
+            # config_schema compiled each pattern already, so this is defensive: never
+            # let one odd pattern take the whole filter down.
+            regexes.extend(re.compile(p, flags) for p in joinable)
+    regexes.extend(re.compile(p, flags) for p in sources if _UNJOINABLE.search(p))
+    return regexes
 
-_MAX_ANCHORS = 256  # per pattern; beyond this the prefix stops being extended
+
+# --------------------------------------------------------------------------- gate text
+#
+# The gate scans a "gate form" of the lower-cased listing: every non-word character
+# becomes a space, whitespace runs collapse to one space, and the text is padded
+# with a space on both sides. Anchors are mapped through the same function, so an
+# anchor occurring in the text also occurs in its gate form, and a word start in
+# the text is always preceded by a space in the gate form.
+
+_ASCII_NON_WORD = {c: " " for c in range(128) if not (chr(c).isalnum() or chr(c) == "_")}
+_NON_WORD_RUN = re.compile(r"\W+")
 _WS_RUN = re.compile(r"\s+")
+
+
+def _gate_form(text: str) -> str:
+    mapped = text.translate(_ASCII_NON_WORD) if text.isascii() else _NON_WORD_RUN.sub(" ", text)
+    return _WS_RUN.sub(" ", mapped)
+
+
+def _gate_text(low: str) -> str:
+    mapped = low.translate(_ASCII_NON_WORD) if low.isascii() else _NON_WORD_RUN.sub(" ", low)
+    return " " + " ".join(mapped.split()) + " "
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+# --------------------------------------------------------------------------- anchor derivation
+
+_MAX_ANCHORS = 256  # per literal run; beyond this a run is cut and restarted
 
 
 def _anchor_constants() -> dict[str, Any] | None:
     if _sre_c is None or _sre_p is None:
         return None
     names = (
-        "LITERAL", "IN", "RANGE", "CATEGORY", "CATEGORY_SPACE", "SUBPATTERN", "BRANCH", "MAX_REPEAT", "MIN_REPEAT",
-        "AT", "ASSERT", "ASSERT_NOT",
+        "LITERAL", "IN", "RANGE", "CATEGORY", "CATEGORY_SPACE", "CATEGORY_NOT_WORD", "SUBPATTERN", "BRANCH",
+        "AT", "AT_BOUNDARY", "AT_BEGINNING", "AT_BEGINNING_STRING", "ASSERT", "ASSERT_NOT",
     )
     try:
-        found = {name: getattr(_sre_c, name) for name in names}
+        found: dict[str, Any] = {name: getattr(_sre_c, name) for name in names}
     except AttributeError:  # pragma: no cover - unexpected interpreter internals
         return None
     found["REPEATS"] = tuple(
         getattr(_sre_c, n) for n in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT") if hasattr(_sre_c, n)
     )
     found["ATOMIC_GROUP"] = getattr(_sre_c, "ATOMIC_GROUP", object())
-    found["ZERO_WIDTH"] = (found["AT"], found["ASSERT"], found["ASSERT_NOT"])
+    found["ALIGNING_AT"] = (found["AT_BOUNDARY"], found["AT_BEGINNING"], found["AT_BEGINNING_STRING"])
+    found["NON_WORD_CATEGORIES"] = (found["CATEGORY_SPACE"], found["CATEGORY_NOT_WORD"])
     return found
 
 
@@ -215,7 +249,7 @@ def _sub_items(node: Any) -> list[tuple[Any, Any]]:
 
 
 def _class_chars(items: Sequence[tuple[Any, Any]]) -> set[str] | None:
-    """Characters of a small positive class (literals, short ranges, whitespace as " ")."""
+    """Characters of a small positive class; ``\\s``/``\\W`` become " " (gate form)."""
     assert _C is not None
     chars: set[str] = set()
     for op, av in items:
@@ -223,7 +257,7 @@ def _class_chars(items: Sequence[tuple[Any, Any]]) -> set[str] | None:
             chars.add(chr(av))
         elif op is _C["RANGE"] and av[1] - av[0] < 10:
             chars.update(chr(c) for c in range(av[0], av[1] + 1))
-        elif op is _C["CATEGORY"] and av is _C["CATEGORY_SPACE"]:
+        elif op is _C["CATEGORY"] and av in _C["NON_WORD_CATEGORIES"]:
             chars.add(" ")
         else:
             return None
@@ -235,7 +269,7 @@ def _anchor_seq(items: Sequence[tuple[Any, Any]]) -> tuple[set[str], bool]:
     assert _C is not None
     prefixes = {""}
     for op, av in items:
-        if op in _C["ZERO_WIDTH"]:
+        if op is _C["AT"] or op is _C["ASSERT"] or op is _C["ASSERT_NOT"]:
             continue
         step = _anchor_node(op, av)
         if step is None:
@@ -251,6 +285,7 @@ def _anchor_seq(items: Sequence[tuple[Any, Any]]) -> tuple[set[str], bool]:
 
 
 def _anchor_node(op: Any, av: Any) -> tuple[set[str], bool] | None:
+    """Prefix strings of one consuming node (``None`` when it starts with a non-literal)."""
     assert _C is not None
     if op is _C["LITERAL"]:
         return {chr(av)}, True
@@ -274,10 +309,9 @@ def _anchor_node(op: Any, av: Any) -> tuple[set[str], bool] | None:
         return (out, complete) if len(out) <= _MAX_ANCHORS else None
     if op in _C["REPEATS"]:
         low, high, sub = av
-        items = _sub_items(sub)
-        strings, done = _anchor_seq(items)
-        if done and strings and all(not s.strip() for s in strings):  # \s+, \s*, [\s]? ...
-            # The gate text has single spaces, so any whitespace run is exactly " ".
+        strings, done = _anchor_seq(_sub_items(sub))
+        if done and strings and all(not _gate_form(s).strip() for s in strings):
+            # \s+, \W*, [\s.-]? ...: in gate form any such run is exactly one space.
             return ({" "} if low >= 1 and "" not in strings else {"", " "}), True
         if low == 0:
             return ({""} | strings, True) if high == 1 and done else ({""}, False)
@@ -287,89 +321,111 @@ def _anchor_node(op: Any, av: Any) -> tuple[set[str], bool] | None:
     return None
 
 
-def _nested_required(op: Any, av: Any) -> set[str] | None:
+def _nested_required(op: Any, av: Any, aligned: bool) -> set[str] | None:
     """Required literals of a compound node that could not be used as a plain prefix."""
     assert _C is not None
     if op is _C["SUBPATTERN"]:
         _group, add_flags, del_flags, sub = av
-        return None if add_flags or del_flags else _required(_sub_items(sub))
+        return None if add_flags or del_flags else _required(_sub_items(sub), aligned)
     if op is _C["ATOMIC_GROUP"]:
-        return _required(_sub_items(av))
+        return _required(_sub_items(av), aligned)
     if op is _C["BRANCH"]:
         out: set[str] = set()
         for branch in av[1]:
-            found = _required(_sub_items(branch))
+            found = _required(_sub_items(branch), aligned)
             if found is None:
                 return None  # one alternative needs no literal at all
             out |= found
         return out if len(out) <= _MAX_ANCHORS else None
     if op in _C["REPEATS"] and av[0] >= 1:
-        return _required(_sub_items(av[2]))
+        return _required(_sub_items(av[2]), aligned)
     return None
 
 
-def _required(items: Sequence[tuple[Any, Any]]) -> set[str] | None:
-    """Most selective literal set R such that every match contains some member of R.
+def _ends_aligned(strings: set[str], aligned_before: bool) -> bool:
+    """Whether the character after a literal step is known to follow a non-word char."""
+    result = True
+    for s in strings:
+        result = result and (aligned_before if s == "" else not _is_word_char(s[-1]))
+    return result
 
-    Consecutive literal items form *runs* (prefix sets built by :func:`_anchor_node`);
-    a non-literal item (``\\d``, ``\\W*``, ``.*``...) closes the current run. Every run,
-    the required literals of positive look-arounds and of compound nodes are
-    candidates; the one whose shortest member is longest wins. Strings are
-    whitespace-squashed because the gate scans single-spaced text.
+
+def _required(items: Sequence[tuple[Any, Any]], aligned: bool = False) -> set[str] | None:
+    """Most selective gate-form literal set R such that every match contains a member of R.
+
+    Consecutive literal items form *runs* (prefix sets from :func:`_anchor_node`); a
+    non-literal item (``\\d``, ``.*``, ``[^\\n]*``...) closes the current run. Every
+    run, every positive look-around and every compound node is a candidate. A run
+    that starts right after ``\\b``/``^`` or a non-word character is a word start and
+    gets a leading space. ``aligned`` tells whether the first item starts a word.
     """
     assert _C is not None
     candidates: list[set[str]] = []
     run: set[str] = {""}
+    run_aligned = False
 
     def close() -> None:
         nonlocal run
         if run != {""}:
-            candidates.append(run)
+            candidates.append({(" " + s) if run_aligned else s for s in run})
         run = {""}
 
     for op, av in items:
-        if op is _C["ASSERT"]:  # positive look-ahead/behind: its content must be in the text too
-            inner = _required(_sub_items(av[1]))
+        if op is _C["AT"]:
+            if av in _C["ALIGNING_AT"] and run == {""}:
+                aligned = True
+            elif run == {""}:
+                aligned = False
+            continue
+        if op is _C["ASSERT"]:  # positive look-around: its content must be in the text too
+            inner = _required(_sub_items(av[1]), aligned if av[0] == 1 else False)
             if inner:
                 candidates.append(inner)
             continue
-        if op in _C["ZERO_WIDTH"]:
+        if op is _C["ASSERT_NOT"]:
             continue
         node = _anchor_node(op, av)
         if node is None:
             close()
-            nested = _nested_required(op, av)
+            nested = _nested_required(op, av, aligned)
             if nested:
                 candidates.append(nested)
+            aligned = False
             continue
         strings, complete = node
+        if run == {""}:
+            run_aligned = aligned
         combined = {p + s for p in run for s in strings}
         if len(combined) > _MAX_ANCHORS:
             close()
+            run_aligned = aligned
             combined = set(strings)
         run = combined
+        aligned = _ends_aligned(strings, aligned)
         if not complete:
             close()
-            nested = _nested_required(op, av)
+            nested = _nested_required(op, av, run_aligned)
             if nested:
                 candidates.append(nested)
+            aligned = False
     close()
 
     best: set[str] | None = None
     best_key = (0, 0)
     for candidate in candidates:
-        squashed = {_WS_RUN.sub(" ", c) for c in candidate}
-        shortest = min(len(c.strip()) for c in squashed)
-        if shortest == 0:
-            continue  # some match may contain none of these literals
-        key = (shortest, -len(squashed))
+        forms = {_gate_form(c) for c in candidate}
+        if not all(any(_is_word_char(ch) for ch in f) for f in forms):
+            continue  # some match may contain no word character at all here
+        shortest = min(len(f.strip()) for f in forms)
+        # Word-start anchors are both rarer and cheaper to scan for.
+        key = (shortest + (2 if all(f.startswith(" ") for f in forms) else 0), -len(forms))
         if best is None or key > best_key:
-            best, best_key = squashed, key
+            best, best_key = forms, key
     return best
 
 
 def _literal_anchors(pattern: str) -> frozenset[str] | None:
-    """Anchors (lower-case, single-spaced) one of which occurs in every match, else ``None``."""
+    """Gate-form anchors one of which occurs in every match of ``pattern``, else ``None``."""
     if _C is None or _sre_p is None:
         return None
     try:
@@ -408,32 +464,15 @@ def _trie_regex(words: Iterable[str]) -> str:
     return render(trie)
 
 
-def _normalise_for_gate(low: str) -> str:
-    """Single-spaced, padded copy of lower-cased text (only presence matters, not offsets)."""
-    return " " + " ".join(low.split()) + " "
-
-
-def _compile_joined(sources: Sequence[str], flags: int) -> list[re.Pattern[str]]:
-    joinable = [p for p in sources if not _UNJOINABLE.search(p)]
-    regexes: list[re.Pattern[str]] = []
-    if joinable:
-        try:
-            regexes.append(re.compile("|".join(f"(?:{p})" for p in joinable), flags))
-        except re.error:
-            # config_schema compiled each pattern already, so this is defensive: never
-            # let one odd pattern take the whole filter down.
-            regexes.extend(re.compile(p, flags) for p in joinable)
-    regexes.extend(re.compile(p, flags) for p in sources if _UNJOINABLE.search(p))
-    return regexes
+# --------------------------------------------------------------------------- compiled patterns
 
 
 class _PatternSet:
     """Patterns compiled into as few regexes as possible (normally one).
 
-    ``search``/``finditer`` take the original text, its :func:`_lower` copy (match
-    offsets are valid on both because the strings have the same length) and the
-    gate's hit set: a set with literal ``anchors`` that is not in ``hits`` cannot
-    match and is skipped without running any regex.
+    ``search``/``finditer`` take the original text, its :func:`_lower` copy (offsets
+    are valid on both because the strings have the same length) and the gate's hit
+    set: a set with ``anchors`` that is not in ``hits`` cannot match and is skipped.
     """
 
     __slots__ = ("patterns", "anchors", "_folded", "_cased", "_single")
@@ -449,7 +488,7 @@ class _PatternSet:
         )
         self.anchors: frozenset[str] | None = None if unsafe else _set_anchors(safe)
 
-    def search(self, text: str, low: str, hits: frozenset[_PatternSet] | set[_PatternSet]) -> re.Match[str] | None:
+    def search(self, text: str, low: str, hits: set[_PatternSet]) -> re.Match[str] | None:
         """Leftmost match of any pattern."""
         if self.anchors is not None and self not in hits:
             return None
@@ -462,9 +501,7 @@ class _PatternSet:
                 best = m
         return best
 
-    def finditer(
-        self, text: str, low: str, hits: frozenset[_PatternSet] | set[_PatternSet]
-    ) -> Iterator[re.Match[str]]:
+    def finditer(self, text: str, low: str, hits: set[_PatternSet]) -> Iterator[re.Match[str]]:
         """All matches, in text order."""
         if self.anchors is not None and self not in hits:
             return iter(())
@@ -481,49 +518,63 @@ class _PatternSet:
             yield rx, text
 
 
+def _pattern_set(patterns: Sequence[str]) -> _PatternSet | None:
+    return _PatternSet(patterns) if patterns else None
+
+
 class _AnchorGate:
     """One literal scan per listing that tells which anchored pattern sets may match.
 
-    Exactness: the trie regex is greedy, so at a position it reports the longest
-    anchor starting there; every other anchor starting at that position is a prefix
-    of it (prefix closure below), and the scan resumes one character after each hit
-    start so anchors overlapping a hit are still found. ``scan`` therefore returns
-    exactly the pattern sets with at least one anchor present in the text.
+    Exact: each trie regex is greedy, so at a position it reports the LONGEST anchor
+    starting there; every other anchor starting at that position is a prefix of it
+    (prefix closure below), and the scan resumes one character after each hit start
+    so overlapping anchors are found too. ``scan`` therefore returns precisely the
+    pattern sets with at least one anchor present in the gate text. Word-start
+    anchors (leading space) are scanned with a space-prefixed regex, which sre
+    searches with a fast literal-prefix loop.
     """
 
-    __slots__ = ("_regex", "_sets_for")
+    __slots__ = ("_regexes", "_sets_for", "anchor_count")
 
     def __init__(self, pattern_sets: Iterable[_PatternSet]) -> None:
         owners: dict[str, set[_PatternSet]] = {}
         for ps in pattern_sets:
             for anchor in ps.anchors or ():
                 owners.setdefault(anchor, set()).add(ps)
+        self.anchor_count = len(owners)
         self._sets_for: dict[str, frozenset[_PatternSet]] = {}
         for anchor in owners:
             closure: set[_PatternSet] = set()
             for i in range(1, len(anchor) + 1):
                 closure |= owners.get(anchor[:i], set())
             self._sets_for[anchor] = frozenset(closure)
-        self._regex: re.Pattern[str] | None = re.compile(_trie_regex(owners)) if owners else None
+        word_start = [a[1:] for a in owners if a.startswith(" ")]
+        anywhere = [a for a in owners if not a.startswith(" ")]
+        regexes: list[re.Pattern[str]] = []
+        if word_start:
+            regexes.append(re.compile(" (?:" + _trie_regex(word_start) + ")"))
+        if anywhere:
+            regexes.append(re.compile(_trie_regex(anywhere)))
+        self._regexes: tuple[re.Pattern[str], ...] = tuple(regexes)
 
     def scan(self, low: str) -> set[_PatternSet]:
         hits: set[_PatternSet] = set()
-        regex = self._regex
-        if regex is None:
+        if not self._regexes:
             return hits
-        text = _normalise_for_gate(low)
+        text = _gate_text(low)
         sets_for = self._sets_for
-        pos = 0
-        while True:
-            m = regex.search(text, pos)
-            if m is None:
-                return hits
-            hits |= sets_for[m.group()]
-            pos = m.start() + 1
+        for regex in self._regexes:
+            pos = 0
+            while True:
+                m = regex.search(text, pos)
+                if m is None:
+                    break
+                hits |= sets_for[m.group()]
+                pos = m.start() + 1
+        return hits
 
 
-def _pattern_set(patterns: Sequence[str]) -> _PatternSet | None:
-    return _PatternSet(patterns) if patterns else None
+# --------------------------------------------------------------------------- compiled config
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,6 +616,11 @@ class _Profile:
     @property
     def priority(self) -> int:
         return self.profile.priority
+
+    def pattern_sets(self) -> list[_PatternSet]:
+        sets = [ps for ps in (self.any, self.none, *self.all) if ps is not None]
+        sets.extend(v.patterns for v in self.variants)
+        return sets
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,7 +669,7 @@ class TextFilter:
         self._lookback = 40 * (self._window + longest)
         self._trailing_neg: re.Pattern[str] | None = None
         if terms:
-            alts = "|".join(r"\s+".join(re.escape(w) for w in t) for t in terms)
+            alts = "|".join(r"\W+".join(re.escape(w).replace("'", "['’]") for w in t) for t in terms)
             self._trailing_neg = re.compile(rf"\s*[:=]\s*(?:{alts})(?![\w'’])")
 
         self._profiles: tuple[_Profile, ...] = tuple(
@@ -631,10 +687,8 @@ class TextFilter:
 
         pattern_sets = [g.patterns for g in self._groups]
         for cp in self._profiles:
-            pattern_sets.extend(ps for ps in (cp.any, cp.none, *cp.all) if ps is not None)
-            pattern_sets.extend(v.patterns for v in cp.variants)
+            pattern_sets.extend(cp.pattern_sets())
         self._gate = _AnchorGate(pattern_sets)
-        gated = sum(1 for ps in pattern_sets if ps.anchors is not None)
         log.debug(
             "text filter compiled",
             extra={
@@ -642,7 +696,8 @@ class TextFilter:
                 "rule_groups": len(self._groups),
                 "negation_terms": len(terms),
                 "pattern_sets": len(pattern_sets),
-                "gated_pattern_sets": gated,
+                "gated_pattern_sets": sum(1 for ps in pattern_sets if ps.anchors is not None),
+                "anchors": self._gate.anchor_count,
             },
         )
 
@@ -667,7 +722,7 @@ class TextFilter:
             text, text_low = f"{title}\n{item.description}", f"{title_low}\n{_lower(item.description)}"
         else:
             text, text_low = title, title_low
-        # Title rules only look at a prefix of ``text``, so text-level hits are a safe superset.
+        # Title rules only see a prefix of ``text``, so text-level hits are a safe superset.
         hay = _Haystacks(title, title_low, text, text_low, self._gate.scan(text_low))
 
         # 2. product identification -------------------------------------------
@@ -690,7 +745,7 @@ class TextFilter:
             return _finish(started, FilterResult(accepted=False, reject_code="no_profile_match"))
 
         profile = ident.profile.profile
-        base = {
+        base: dict[str, Any] = {
             "profile_id": profile.id,
             "variant_id": ident.variant_id,
             "category": profile.category,

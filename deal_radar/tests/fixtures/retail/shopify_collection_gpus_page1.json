@@ -1,0 +1,104 @@
+{
+  "products": [
+    {
+      "id": 7340901859408,
+      "title": "MSI GeForce RTX 5080 VENTUS 3X OC 16G",
+      "handle": "msi-rtx-5080-ventus-3x-oc",
+      "body_html": "<p>16GB GDDR7, PCIe 5.0.</p>",
+      "published_at": "2026-09-25T16:58:13-07:00",
+      "created_at": "2026-03-27T14:03:50-07:00",
+      "updated_at": "2026-10-05T22:11:20-07:00",
+      "vendor": "MSI",
+      "product_type": "Graphics Cards",
+      "tags": ["gpu", "msi"],
+      "variants": [
+        {
+          "id": 42146889039952,
+          "title": "Default Title",
+          "option1": "Default Title",
+          "option2": null,
+          "option3": null,
+          "sku": "V531-002R",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": null,
+          "available": true,
+          "price": "999.99",
+          "grams": 2100,
+          "compare_at_price": "1199.99",
+          "position": 1,
+          "product_id": 7340901859408,
+          "created_at": "2026-03-27T14:03:50-07:00",
+          "updated_at": "2026-10-05T22:11:20-07:00"
+        }
+      ],
+      "images": [
+        {
+          "id": 36231482212432,
+          "created_at": "2026-03-27T14:19:02-07:00",
+          "position": 1,
+          "updated_at": "2026-03-27T14:19:05-07:00",
+          "product_id": 7340901859408,
+          "variant_ids": [],
+          "src": "https://cdn.shopify.com/s/files/1/1104/4168/files/msi-5080-ventus.png?v=1774646345",
+          "width": 4000,
+          "height": 4000
+        }
+      ],
+      "options": [{"name": "Title", "position": 1, "values": ["Default Title"]}]
+    },
+    {
+      "id": 7340901859409,
+      "title": "Gigabyte Radeon RX 9070 XT Gaming OC",
+      "handle": "gigabyte-rx-9070-xt-gaming-oc",
+      "body_html": "",
+      "published_at": "2026-09-25T16:58:13-07:00",
+      "created_at": "2026-03-27T14:03:50-07:00",
+      "updated_at": "2026-10-05T21:00:00-07:00",
+      "vendor": "Gigabyte",
+      "product_type": "Graphics Cards",
+      "tags": [],
+      "variants": [
+        {
+          "id": 42146889039960,
+          "title": "16GB",
+          "option1": "16GB",
+          "option2": null,
+          "option3": null,
+          "sku": "GV-R9070XTGAMING OC-16GD",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": null,
+          "price": "649.00",
+          "grams": 1800,
+          "compare_at_price": "0.00",
+          "position": 1,
+          "product_id": 7340901859409,
+          "created_at": "2026-03-27T14:03:50-07:00",
+          "updated_at": "2026-10-05T21:00:00-07:00"
+        },
+        {
+          "id": 42146889039961,
+          "title": "16GB Bundle",
+          "option1": "16GB Bundle",
+          "option2": null,
+          "option3": null,
+          "sku": "GV-R9070XT-BUNDLE",
+          "requires_shipping": true,
+          "taxable": true,
+          "featured_image": null,
+          "available": false,
+          "price": "not-a-price",
+          "grams": 1800,
+          "compare_at_price": null,
+          "position": 2,
+          "product_id": 7340901859409,
+          "created_at": "2026-03-27T14:03:50-07:00",
+          "updated_at": "2026-10-05T21:00:00-07:00"
+        }
+      ],
+      "images": [],
+      "options": [{"name": "Memory", "position": 1, "values": ["16GB", "16GB Bundle"]}]
+    }
+  ]
+}

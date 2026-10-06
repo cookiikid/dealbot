@@ -1,0 +1,81 @@
+{
+  "data": {
+    "product_summaries": [
+      {
+        "__typename": "ProductSummary",
+        "tcin": "93954446",
+        "item": {
+          "product_description": {"title": "Nintendo Switch 2 Console &#38; Mario Kart World Bundle"},
+          "enrichment": {
+            "buy_url": "https://www.target.com/p/nintendo-switch-2-console-mario-kart-world-bundle/-/A-93954446",
+            "images": {
+              "primary_image_url": "https://target.scene7.com/is/image/Target/GUEST_6a3b1f6e-0000-4b1a-9a7d-1c2d3e4f5a6b",
+              "alternate_image_urls": [
+                "https://target.scene7.com/is/image/Target/GUEST_0b1c2d3e-0000-4f5a-8b9c-0d1e2f3a4b5c"
+              ]
+            }
+          },
+          "fulfillment": {"is_marketplace": false},
+          "relationship_type_code": "SA"
+        },
+        "price": {
+          "current_retail": 449.99,
+          "reg_retail": 499.99,
+          "formatted_current_price": "$449.99",
+          "formatted_current_price_type": "sale",
+          "formatted_comparison_price": "$499.99"
+        },
+        "fulfillment": {
+          "product_id": "93954446",
+          "is_out_of_stock_in_all_store_locations": false,
+          "shipping_options": {"availability_status": "IN_STOCK", "loyalty_availability_status": "IN_STOCK"},
+          "store_options": [
+            {
+              "location_id": "1375",
+              "location_available_to_promise_quantity": 4.0,
+              "order_pickup": {"availability_status": "IN_STOCK"},
+              "in_store_only": {"availability_status": "IN_STOCK"},
+              "ship_to_store": {"availability_status": "UNAVAILABLE"}
+            }
+          ]
+        }
+      },
+      {
+        "__typename": "ProductSummary",
+        "tcin": "89981234",
+        "item": {
+          "product_description": {"title": "LG 65\" Class OLED evo C5 Series 4K UHD Smart TV"},
+          "enrichment": {"buy_url": "https://www.target.com/p/lg-65-oled-c5/-/A-89981234", "images": {"primary_image_url": "https://target.scene7.com/is/image/Target/GUEST_lg65c5"}},
+          "fulfillment": {"is_marketplace": false}
+        },
+        "price": {
+          "current_retail_min": 1499.99,
+          "current_retail_max": 1599.99,
+          "reg_retail_max": 2499.99,
+          "formatted_current_price": "$1,499.99 - $1,599.99",
+          "formatted_current_price_type": "clearance"
+        },
+        "fulfillment": {
+          "is_out_of_stock_in_all_store_locations": true,
+          "shipping_options": {"availability_status": "OUT_OF_STOCK"},
+          "store_options": [
+            {"location_id": "1375", "order_pickup": {"availability_status": "OUT_OF_STOCK"}, "in_store_only": {"availability_status": "OUT_OF_STOCK"}}
+          ]
+        }
+      },
+      {
+        "__typename": "ProductSummary",
+        "tcin": "12345678",
+        "item": {"product_description": {"title": "Price hidden item"}},
+        "price": {"formatted_current_price": "See price in cart", "formatted_current_price_type": "reg"},
+        "fulfillment": {}
+      },
+      {
+        "__typename": "ProductSummary",
+        "tcin": "87654321",
+        "item": {},
+        "price": {"current_retail": 9.99}
+      }
+    ]
+  }
+}

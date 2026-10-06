@@ -380,6 +380,7 @@ def test_parse_dom_cards() -> None:
         {"id": "4242424242424242", "lines": ["$1", "duplicate"], "img": None, "alt": None},
         {"id": "not-a-number", "lines": ["$5", "bogus"], "img": None, "alt": None},
         {"id": "4747474747474747", "lines": ["$10", "SOLD - Steam Deck"], "img": None, "alt": None},
+        {"id": "4848484848484848", "lines": "not-a-list", "img": None, "alt": None},
     ]
     listings = fb.parse_dom_cards(cards, query="steam deck", profile_hint="steamdeck")
     by_id = {item.source_id: item for item in listings}
@@ -463,6 +464,13 @@ def test_session_cookie_helpers(tmp_path: Path) -> None:
         {"name": "xs", "value": "1", "domain": ".example.com"},
     ]
     assert not fb.has_session_cookie(other_site)
+    lookalike = [{"name": name, "value": "1", "domain": "notfacebook.com"} for name in ("c_user", "xs")]
+    assert not fb.has_session_cookie(lookalike)
+    bare = [
+        {"name": "c_user", "value": "1", "domain": "facebook.com"},
+        {"name": "xs", "value": "1", "domain": "www.facebook.com"},
+    ]
+    assert fb.has_session_cookie(bare)
 
 
 @pytest.mark.parametrize("variant", ["missing", "no_cookies", "expired", "corrupt"])

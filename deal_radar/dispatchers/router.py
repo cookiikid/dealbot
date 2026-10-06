@@ -75,7 +75,6 @@ REASON_NO_ROUTE = "no_route"
 REASON_QUIET_HOURS = "quiet_hours"
 REASON_FLOOD_GUARD = "flood_guard"
 _ERROR_MAX_LEN = 500
-_MINUTES_PER_DAY = 24 * 60
 
 
 def parse_hhmm(value: str) -> int:
@@ -115,7 +114,7 @@ class _Route:
     shed_count: int = 0
 
     @classmethod
-    def build(cls, rule: RouteRule) -> "_Route":
+    def build(cls, rule: RouteRule) -> _Route:
         quiet = None
         if rule.quiet_hours is not None:
             quiet = (parse_hhmm(rule.quiet_hours.start), parse_hhmm(rule.quiet_hours.end), rule.quiet_hours.min_severity)
@@ -141,9 +140,7 @@ class _Route:
             return False
         if self.categories and alert.category not in self.categories:
             return False
-        if self.sources and alert.item.source not in self.sources:
-            return False
-        return True
+        return not self.sources or alert.item.source in self.sources
 
     def quiet_blocks(self, alert: Alert, minute_of_day: int) -> bool:
         if self.quiet is None:
@@ -258,7 +255,7 @@ class AlertRouter:
 
     def _local_minute(self, now: datetime) -> int:
         local = now.astimezone(self._tz)
-        return (local.hour * 60 + local.minute) % _MINUTES_PER_DAY
+        return local.hour * 60 + local.minute
 
     def _note_suppressed(self, route: _Route, reason: str, alert: Alert) -> None:
         self._m_route_suppressed.inc(route=route.name, reason=reason)
@@ -423,11 +420,11 @@ class AlertRouter:
 
 
 __all__ = [
-    "AlertRouter",
     "FLOOD_WINDOW_SECONDS",
     "REASON_FLOOD_GUARD",
     "REASON_NO_ROUTE",
     "REASON_QUIET_HOURS",
+    "AlertRouter",
     "in_window",
     "parse_hhmm",
 ]

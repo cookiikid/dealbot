@@ -438,7 +438,7 @@ def test_quiet_route_targets_kept_when_another_active_route_lists_them() -> None
 
 def test_naive_clock_is_treated_as_utc() -> None:
     config = _quiet_config()
-    router = AlertRouter(config, fakes_for(config), clock=lambda: datetime(2026, 1, 15, 5, 0))  # 00:00 EST
+    router = AlertRouter(config, fakes_for(config), clock=lambda: datetime(2026, 1, 15, 5, 0))  # noqa: DTZ001 - naive on purpose; 00:00 EST
     assert router.targets_for(make_alert(severity=Severity.HIGH))[2] == REASON_QUIET_HOURS
 
 
@@ -553,8 +553,6 @@ async def test_dry_run_routes_everything_to_console_only() -> None:
     router, fakes, _ = router_for(unrouted)
     assert router.targets_for(make_alert()) == (["console"], False, None)
 
-    await router_for(config)[0].notify("t", "m")
-
 
 async def test_dry_run_notices_go_to_console_only() -> None:
     config = make_config([{"name": "a", "targets": ["discord:a"]}], dry_run=True, system_targets=["console", "discord:ops"])
@@ -598,7 +596,7 @@ async def test_route_dispatches_concurrently_and_sets_mention() -> None:
 async def test_timeout_becomes_failed_result_while_others_succeed() -> None:
     config = make_config([{"name": "all", "targets": ["discord:a", "console"]}], timeout=0.05)
     slow = FakeDispatcher("discord:a", delay=5.0)
-    router, fakes, _ = router_for(config, fakes_for(config, discord__a=slow))
+    router, _, _ = router_for(config, fakes_for(config, discord__a=slow))
     started = time.perf_counter()
     report = await router.route(make_alert())
     assert time.perf_counter() - started < 1.0

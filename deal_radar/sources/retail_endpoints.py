@@ -23,9 +23,10 @@ Failure semantics
 * A poll raises only when every due endpoint failed and none returned listings. It
   raises ``SourceBlocked`` if all of them were bot-walled, ``SourceAuthError`` if all
   were credential failures, and ``SourceError`` otherwise.
-* Blocks are status 403 (429 for Best Buy is not used; there 403 means bad key or
-  quota), 429, Target's non-standard 435, an HTML challenge page where JSON was
-  expected, and a PerimeterX ``{"appId", "blockScript"}`` JSON body. A block puts
+* Blocks are HTTP 403, HTTP 429, Target's non-standard HTTP 435, an HTML challenge
+  page where JSON was expected, and a PerimeterX ``{"appId", "blockScript"}`` JSON
+  body. On Best Buy a 403 means a bad key or an exhausted quota (it never sends 429),
+  so it is reported as a credential failure instead. Either one puts
   only that endpoint into an exponential cooldown, starting at ``cooldown_seconds``
   and capped at one hour, or honours ``Retry-After`` when the server sends it. The
   request is never retried at once, and the endpoint's remaining sub-requests in that
@@ -934,10 +935,8 @@ def parse_newegg_realtime(payload: Any, endpoint: NeweggEndpoint, on_skip: SkipF
     if not item or not title:
         on_skip("missing_id_or_title", item)
         return []
-    price = to_float(main.get("FinalPrice"))
-    if not price:
-        price = to_float(main.get("UnitCost"))
-    if price is None:
+    price = to_float(main.get("FinalPrice")) or to_float(main.get("UnitCost"))
+    if not price:  # 0 / missing: price hidden or item data incomplete
         on_skip("no_price", item)
         return []
     regular = max(
@@ -1210,6 +1209,10 @@ class EndpointAdapter(abc.ABC):
                 slots[index] = self._consume(reply, spec, parse)
             except PayloadError as exc:
                 errors.append(RetailEndpointError(self.name, self.redact(f"unusable payload: {exc}"), status=reply.status))
+                return
+            except Exception as exc:  # noqa: BLE001 - a parser bug must not orphan sibling requests
+                self.log.exception("retail parser crashed", extra={"endpoint": self.name, "error": self.redact(repr(exc))})
+                errors.append(RetailEndpointError(self.name, self.redact(f"parser error: {exc!r}"), status=reply.status))
                 return
             succeeded += 1
 

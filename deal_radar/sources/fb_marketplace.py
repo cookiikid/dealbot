@@ -625,8 +625,9 @@ def parse_payloads(
                 if listing is None:
                     stats[reason or "invalid"] += 1
                     if reason in ("sold", "pending") and isinstance(node.get("id"), (str, int)):
-                        excluded.add(str(node["id"]))
-                        found.pop(str(node["id"]), None)
+                        gone = str(node["id"]).strip()
+                        excluded.add(gone)
+                        found.pop(gone, None)
                     continue
                 if listing.source_id in excluded:
                     continue
@@ -661,7 +662,10 @@ def parse_dom_cards(
         listing_id = str(card.get("id") or "")
         if not listing_id.isdigit() or listing_id in seen:
             continue
-        lines = [_clean(line) for line in card.get("lines") or [] if isinstance(line, str) and line.strip()]
+        raw_lines = card.get("lines")
+        if not isinstance(raw_lines, list):
+            raw_lines = []
+        lines = [_clean(line) for line in raw_lines if isinstance(line, str) and line.strip()]
         if any(line.lower() in _STATUS_LINES for line in lines):
             continue
         prices = [line for line in lines if _PRICE_LINE_RE.match(line)]
@@ -699,13 +703,14 @@ def parse_dom_cards(
 # --------------------------------------------------------------------------- session file
 
 
+def _is_facebook_domain(domain: Any) -> bool:
+    host = str(domain or "").lstrip(".").lower()
+    return host == "facebook.com" or host.endswith(".facebook.com")
+
+
 def has_session_cookie(cookies: Iterable[Mapping[str, Any]]) -> bool:
     """True when Facebook's logged-in cookies (``c_user`` + ``xs``) are present."""
-    names = {
-        str(c.get("name"))
-        for c in cookies
-        if str(c.get("domain", "")).lstrip(".").endswith("facebook.com") and c.get("value")
-    }
+    names = {str(c.get("name")) for c in cookies if _is_facebook_domain(c.get("domain")) and c.get("value")}
     return {"c_user", "xs"} <= names
 
 
@@ -718,7 +723,7 @@ def session_problem(state: Any, now: float | None = None) -> str | None:
         return "no Facebook session cookies (c_user/xs) in the storage state"
     current = time.time() if now is None else now
     for cookie in cookies:
-        if cookie.get("name") in ("c_user", "xs") and str(cookie.get("domain", "")).lstrip(".").endswith("facebook.com"):
+        if cookie.get("name") in ("c_user", "xs") and _is_facebook_domain(cookie.get("domain")):
             expires = _to_float(cookie.get("expires"))
             if expires is not None and 0 < expires < current:
                 stamp = datetime.fromtimestamp(expires, tz=timezone.utc).isoformat(timespec="minutes")

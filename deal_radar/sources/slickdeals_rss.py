@@ -278,9 +278,9 @@ _FREE_SHIPPING_THRESHOLD_RE = re.compile(
     r"\bfree\s+(?:standard\s+)?shipping\s+(?:on|with|for)\s+(?:orders?|purchases?)\s+(?:of\s+|over\s+)?" + _MONEY,
     re.I,
 )
-_PAID_SHIPPING_RE = re.compile(
-    r"\+\s*" + _MONEY + r"\s*(?:shipping|ship|s\s*&\s*h|s/h|delivery)\b|\bshipping\s*(?:is|:|costs?)\s*" + _MONEY.replace("amt", "amt2"),
-    re.I,
+_PAID_SHIPPING_RES = (
+    re.compile(r"\+\s*" + _MONEY + r"\s*(?:shipping|ship|s\s*&\s*h|s/h|delivery)\b", re.I),  # "+ $4.99 shipping"
+    re.compile(r"\bshipping\s*(?:is|:|costs?)\s*" + _MONEY, re.I),  # "Shipping is $9.99"
 )
 _IN_STORE_RE = re.compile(r"\bin[\s-]store(?:\s+(?:only|pickup))?\b|\bB&M\b", re.I)
 
@@ -729,11 +729,13 @@ def extract_shipping(title: str, body_text: str = "", price: float | None = None
 
 
 def _paid_shipping(text: str) -> float | None:
-    m = _PAID_SHIPPING_RE.search(text)
-    if m is None:
-        return None
-    value = _amount(m, "amt") if m.group("amt") else _amount(m, "amt2")
-    return round(value, 2) if value is not None else None
+    for regex in _PAID_SHIPPING_RES:
+        m = regex.search(text)
+        if m is not None:
+            value = _amount(m)
+            if value is not None:
+                return round(value, 2)
+    return None
 
 
 # --------------------------------------------------------------------------- retailer / links / images
@@ -1163,11 +1165,8 @@ def parse_feed(data: bytes, content_type: str | None = None) -> Any:
 def parse_feed_listings(data: bytes, feed: FeedTarget, content_type: str | None = None) -> ParsedFeed:
     """Parse a feed body into listings; CPU-bound, run it in a worker thread."""
     parsed = parse_feed(data, content_type)
-    entries = list(parsed.get("entries") or [])
-    if not entries and parsed.get("bozo"):
-        return ParsedFeed(malformed=True, detail=repr(parsed.get("bozo_exception"))[:200])
     result = ParsedFeed()
-    for entry in entries:
+    for entry in parsed.get("entries") or []:
         try:
             result.listings.append(build_listing(entry, feed.name, query=feed.query, profile_hint=feed.profile_hint))
         except EntrySkipped as exc:
@@ -1175,6 +1174,12 @@ def parse_feed_listings(data: bytes, feed: FeedTarget, content_type: str | None 
         except Exception as exc:  # noqa: BLE001 - one malformed entry must not drop the feed
             result.errors += 1
             _log.debug("slickdeals entry failed to parse", extra={"feed": feed.name, "error": repr(exc)[:300]})
+    # feedparser's loose fallback turns a truncated/garbage body into empty or title-less
+    # entries; a not-well-formed document that produced nothing usable is a broken feed.
+    # (Well-formed feeds with zero priced entries are fine.)
+    if parsed.get("bozo") and not result.listings:
+        result.malformed = True
+        result.detail = repr(parsed.get("bozo_exception"))[:200]
     return result
 
 
