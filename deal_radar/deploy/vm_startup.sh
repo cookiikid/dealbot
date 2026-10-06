@@ -10,8 +10,20 @@
 set -Eeuo pipefail
 exec > >(tee -a /var/log/dealradar-bootstrap.log) 2>&1
 
-META=http://metadata.google.internal/computeMetadata/v1/instance/attributes
-md() { curl -fsS -H "Metadata-Flavor: Google" "${META}/$1" 2>/dev/null || true; }
+META=http://metadata.google.internal/computeMetadata/v1
+md() { curl -fsS -H "Metadata-Flavor: Google" "${META}/instance/attributes/$1" 2>/dev/null || true; }
+
+# Read a Secret Manager secret through the REST API with the VM's service-account token.
+# (No dependency on the gcloud CLI being present in the image.)
+getsecret() {
+  local token project
+  token="$(curl -fsS -H "Metadata-Flavor: Google" "${META}/instance/service-accounts/default/token" \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')" || return 1
+  project="$(curl -fsS -H "Metadata-Flavor: Google" "${META}/project/project-id")" || return 1
+  curl -fsS -H "Authorization: Bearer ${token}" \
+    "https://secretmanager.googleapis.com/v1/projects/${project}/secrets/$1/versions/latest:access" \
+    | python3 -c 'import sys,json,base64;sys.stdout.write(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode())'
+}
 
 ENV_SECRET="$(md dealradar-env-secret)"; ENV_SECRET="${ENV_SECRET:-dealradar-env}"
 TS_SECRET="$(md dealradar-tailscale-secret)"; TS_SECRET="${TS_SECRET:-dealradar-tailscale-authkey}"
@@ -63,7 +75,7 @@ SYSCTL
 sysctl --system >/dev/null
 
 # ---------------------------------------------------------------- Tailscale
-if TS_KEY="$(gcloud secrets versions access latest --secret="${TS_SECRET}" 2>/dev/null)" && [[ -n "${TS_KEY}" ]]; then
+if TS_KEY="$(getsecret "${TS_SECRET}" 2>/dev/null)" && [[ -n "${TS_KEY}" ]]; then
   if ! command -v tailscale >/dev/null 2>&1; then
     curl -fsSL https://tailscale.com/install.sh | sh
   fi
@@ -72,17 +84,23 @@ if TS_KEY="$(gcloud secrets versions access latest --secret="${TS_SECRET}" 2>/de
     tailscale up --authkey="${TS_KEY}" --hostname="$(hostname)" --ssh=false
   fi
   echo "[bootstrap] tailscale ip: $(tailscale ip -4 2>/dev/null | head -n1)"
+  # Expose Valkey to the tailnet only (it stays bound to 127.0.0.1 on the host), so the
+  # laptop collector can XADD into the stream. No VPC firewall rule for 6379 ever exists.
+  tailscale serve --bg --tcp=6379 tcp://127.0.0.1:6379 >/dev/null 2>&1 \
+    || echo "[bootstrap] WARN: tailscale serve for Valkey failed (older tailscale?)"
 fi
 
 # ---------------------------------------------------------------- env helper
-cat > /usr/local/bin/dealradar-fetch-env <<HELPER
-#!/usr/bin/env bash
-set -euo pipefail
-umask 077
-mkdir -p ${APP_DIR}
-gcloud secrets versions access latest --secret="${ENV_SECRET}" > ${APP_DIR}/.env.tmp
-mv ${APP_DIR}/.env.tmp ${APP_DIR}/.env
-HELPER
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo "META=${META}"
+  declare -f getsecret
+  echo 'umask 077'
+  echo "mkdir -p ${APP_DIR}"
+  echo "getsecret '${ENV_SECRET}' > '${APP_DIR}/.env.tmp'"
+  echo "mv '${APP_DIR}/.env.tmp' '${APP_DIR}/.env'"
+} > /usr/local/bin/dealradar-fetch-env
 chmod 0755 /usr/local/bin/dealradar-fetch-env
 
 # ---------------------------------------------------------------- (re)start stack after reboots

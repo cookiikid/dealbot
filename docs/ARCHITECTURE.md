@@ -273,7 +273,7 @@ are delivered silently.
 ```
                          Tailscale (WireGuard mesh, no public ports)
    ┌──────────────────────────────────────────┐        ┌───────────────────────────────┐
-   │ GCP VM  us-east4 (Ashburn)  e2-small       │        │ Desktop · RTX 3060 12 GB       │
+   │ GCP VM  us-east1  e2-micro (Always Free)   │        │ Desktop · RTX 3060 12 GB       │
    │  ├ Valkey 8: dedup Lua, Streams bus, leases│◄──────►│  └ Ollama vision API           │
    │  ├ collectors: eBay, Slickdeals, Reddit,   │ HTTP   │     qwen2.5vl:3b (+7b escalate)│
    │  │   retail endpoints                      │        └───────────────────────────────┘
@@ -289,7 +289,7 @@ are delivered silently.
 | Component | Where | Why there |
 |---|---|---|
 | Valkey (dedup, stream, leases) | GCP VM | always on, same host as the processor (sub-ms Lua), single source of truth |
-| API/feed collectors (eBay, Slickdeals, Reddit, retail) | GCP VM | datacenter connectivity, stable egress IP for API keys. us-east4 (Ashburn) is the densest US interconnect hub and ~1-2 ms from AWS us-east-1, where many retail origins and API backends sit. Most traffic is answered by CDN edges anyway, so region choice saves milliseconds, not seconds. |
+| API/feed collectors (eBay, Slickdeals, Reddit, retail) | GCP VM | always on, stable egress IP for official APIs. **Region: us-east1** (Always Free). us-east4/Ashburn is ~10-15 ms closer to AWS us-east-1, but every target answers from a CDN edge 1-10 ms from any US-East region, and server think time (100-500 ms) and poll intervals (seconds) dwarf it. The "RTT < 5 ms to retail origins" goal is not meaningful for edge-served traffic, so the free tier wins. Telegram's Bot API is in Amsterdam (~75-90 ms from US-East) regardless of region. |
 | Processor + history DB | GCP VM | needs every collector's stream; the history model is in-memory with a SQLite (WAL) or Postgres warm start |
 | Vision model (Ollama) | Desktop RTX 3060 12 GB | free inference; 12 GB holds a 3B VLM and a 7B escalation model resident (`OLLAMA_MAX_LOADED_MODELS=2`) |
 | FB Marketplace / OfferUp collectors | Laptop RTX 3080 8 GB | residential IP that matches the logged-in session's history and location |

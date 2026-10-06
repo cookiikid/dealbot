@@ -1667,6 +1667,7 @@ class EndpointState:
 class _Outcome:
     listings: list[RawListing] = field(default_factory=list)
     error: RetailEndpointError | None = None
+    notice: tuple[str, str] | None = None  # operator notice for a fresh block / credential failure
 
 
 class RetailIngestor(BaseIngestor):
@@ -1716,13 +1717,16 @@ class RetailIngestor(BaseIngestor):
         outcomes = await asyncio.gather(*(self._run_endpoint(state) for state in due))
         listings = [listing for outcome in outcomes for listing in outcome.listings]
         errors = [outcome.error for outcome in outcomes if outcome.error is not None]
-        if errors and len(errors) == len(due) and not listings:
+        failed_all = bool(errors) and len(errors) == len(due) and not listings
+        if failed_all and all(e.blocked for e in errors):
+            # The base loop pauses the whole source and sends its own "blocked" notice.
             summary = "; ".join(str(e) for e in errors)[:600]
-            if all(e.blocked for e in errors):
-                raise SourceBlocked(
-                    f"all {len(due)} due retail endpoint(s) blocked: {summary}",
-                    cooldown_seconds=self.next_interval(),
-                )
+            raise SourceBlocked(f"all {len(due)} due retail endpoint(s) blocked: {summary}", cooldown_seconds=self.next_interval())
+        for outcome in outcomes:
+            if outcome.notice is not None:
+                await self._notify(*outcome.notice)
+        if failed_all:
+            summary = "; ".join(str(e) for e in errors)[:600]
             if all(e.auth for e in errors):
                 raise SourceAuthError(f"all {len(due)} due retail endpoint(s) rejected credentials: {summary}")
             raise SourceError(f"all {len(due)} due retail endpoint(s) failed: {summary}")
@@ -1752,11 +1756,12 @@ class RetailIngestor(BaseIngestor):
         state.items = len(listings)
         self._m_endpoint_ms.observe(elapsed_ms, endpoint=state.name)
         self._m_endpoint_items.inc(len(listings), endpoint=state.name)
+        notice: tuple[str, str] | None = None
         if error is None:
             self._on_success(state, started)
         else:
-            await self._on_failure(state, started, error)
-        return _Outcome(list(listings), error)
+            notice = self._on_failure(state, started, error)
+        return _Outcome(list(listings), error, notice)
 
     def _jittered(self, interval: float) -> float:
         jitter = float(self.cfg.jitter_pct)
@@ -1771,7 +1776,9 @@ class RetailIngestor(BaseIngestor):
         state.next_due = started + self._jittered(state.interval)
         self._m_endpoint.inc(endpoint=state.name, outcome="ok")
 
-    async def _on_failure(self, state: EndpointState, started: float, error: RetailEndpointError) -> None:
+    def _on_failure(self, state: EndpointState, started: float, error: RetailEndpointError) -> tuple[str, str] | None:
+        """Back the endpoint off; return an operator notice when it just got blocked."""
+        notice: tuple[str, str] | None = None
         state.failures += 1
         state.last_error = str(error)[:500]
         base = self._jittered(state.interval)
@@ -1791,12 +1798,14 @@ class RetailIngestor(BaseIngestor):
             )
             if state.consecutive_blocks == 1:
                 what = "rejected credentials" if error.auth else "blocked"
-                await self._notify(f"retail endpoint {state.name} {what}", f"{error} - pausing it {delay:.0f}s")
+                notice = (f"retail endpoint {state.name} {what}", f"{error} - pausing it {delay:.0f}s")
         else:
             state.consecutive_failures += 1
             state.state = "error"
             cap = max(state.interval, self.cfg.cooldown_seconds)
             delay = max(base, min(cap, state.interval * 2 ** (state.consecutive_failures - 1)))
+            if error.retry_after is not None:  # e.g. 503 + Retry-After after the in-request retries
+                delay = max(delay, error.retry_after)
             outcome = "error"
             self.log.warning(
                 "retail endpoint failed",
@@ -1804,6 +1813,7 @@ class RetailIngestor(BaseIngestor):
             )
         state.next_due = started + delay
         self._m_endpoint.inc(endpoint=state.name, outcome=outcome)
+        return notice
 
     # ------------------------------------------------------------------ introspection
 
@@ -1823,6 +1833,7 @@ class RetailIngestor(BaseIngestor):
                 "consecutive_blocks": state.consecutive_blocks,
                 "last_items": state.items,
                 "last_ms": state.last_ms,
+                "last_success_age_s": round(now - state.last_success, 1) if state.last_success is not None else None,
                 "last_error": state.last_error,
             }
             for state in self.endpoints

@@ -4,7 +4,7 @@ This guide takes you from a fresh clone to the full three-machine deployment:
 
 | Machine | Role | Runs |
 |---|---|---|
-| **GCP VM** (`e2-small`, us-east4) | primary: collector + processor | Valkey, DealRadar (eBay, Slickdeals, Reddit, retail), dedup, scoring, alerts |
+| **GCP VM** (`e2-micro` Always Free, us-east1) | primary: collector + processor | Valkey, DealRadar (eBay, Slickdeals, Reddit, retail), dedup, scoring, alerts |
 | **Desktop** (RTX 3060 12 GB) | vision API | Ollama with `qwen2.5vl:3b` (+ optional `qwen2.5vl:7b` escalation) |
 | **Laptop** (RTX 3080 8 GB) | local collector + standby | Facebook Marketplace / OfferUp via Playwright on your home IP |
 
@@ -108,22 +108,30 @@ on 12 GB. Any OpenAI-compatible server works too (`VISION_BACKEND=openai`, e.g. 
 
 ## 3. Google Cloud primary on a $200 credit
 
-### 3.1 Cost plan
+### 3.1 Cost plan (list prices verified 2026-10-06)
 
-| Item | Spec | ≈ USD / month |
-|---|---|---|
-| Compute Engine | `e2-small` (2 shared vCPU, 2 GB) in `us-east4` | ≈ 13.5 |
-| Boot disk | 20 GB `pd-balanced` | ≈ 2.2 |
-| External IPv4 | in-use ephemeral address | ≈ 3.65 |
-| Secret Manager | 2 secrets, a few hundred accesses | ≈ 0 (free tier) |
-| Egress | alerts + API polling (mostly ingress) | < 1 |
-| **Total** | | **≈ 20 / month → ~10 months on $200** |
+| Plan | Spec | ≈ USD / month | 12 months |
+|---|---|---|---|
+| **Default** | `e2-micro` in `us-east1`, 30 GB `pd-standard`, STANDARD network tier | **3.65** (only the in-use IPv4; compute + disk are Always Free) | ≈ 44 |
+| `--performance` | `e2-small` in `us-east1`, 30 GB `pd-standard` | 12.23 + 3.65 = 15.88 | ≈ 191 |
+| ✗ us-east4 e2-small + pd-balanced | Ashburn, no free tier | 19.62 | ≈ 235 (over budget) |
+| ✗ Memorystore Valkey / Redis | smallest instance | +23-36 | — |
+| ✗ Cloud Run, always on | 1 vCPU worker pool / instance-billed service | 31-53 | — |
 
-Cheaper: `--free-tier` uses `e2-micro` + 30 GB `pd-standard` in `us-east1`, which is
-covered by the Always Free tier (you still pay ≈ $3.65/month for the IPv4 address).
-1 GB RAM is enough for Valkey + DealRadar without a browser (swap is configured).
-Avoid for this budget: Memorystore (its smallest instance costs more per month than
-the whole VM) and always-on Cloud Run (≈ $45-55/month for one always-allocated vCPU).
+Notes that matter for the bill:
+* Always Free covers **one** `e2-micro` instance-month per billing account, only in
+  `us-east1`/`us-central1`/`us-west1`, only with `pd-standard` (the console defaults to
+  `pd-balanced`). The script passes the right flags.
+* gcloud defaults to the PREMIUM network tier (1 GiB free egress); the script uses
+  STANDARD (200 GiB/month free).
+* An IPv6-only VM would avoid the IPv4 fee, but Discord, Reddit, eBay, Best Buy,
+  Newegg, Craigslist and OfferUp have no AAAA records — not viable.
+* `e2-micro` sustains 0.25 vCPU / 1 GB RAM: fine for Valkey + the API/feed pollers +
+  the processor (swap is added, containers are memory-capped). Chromium and vision
+  run at home, by design.
+* Free-trial credits expire (the standard trial is 90 days). The budgets created by
+  `budget` use `--credit-types-treatment=exclude-all-credits` so alerts show the real
+  burn while credits are paying for it.
 
 ### 3.2 Deploy
 
@@ -138,8 +146,9 @@ export BILLING_ACCOUNT=XXXXXX-XXXXXX-XXXXXX        # gcloud billing accounts lis
 cp deal_radar/deploy/.env.example .env && $EDITOR .env
 
 deal_radar/deploy/gcp_deploy.sh init      # APIs, service account, IAP-only SSH firewall, secrets
-deal_radar/deploy/gcp_deploy.sh budget    # alerts at 25/50/75/90/100 % of $200
-deal_radar/deploy/gcp_deploy.sh create    # VM + bootstrap (Docker, swap, sysctls, Tailscale)
+deal_radar/deploy/gcp_deploy.sh budget    # $15/month + $200/year budgets, real burn (credits excluded)
+deal_radar/deploy/gcp_deploy.sh create    # e2-micro VM + bootstrap (Docker, swap, sysctls, Tailscale)
+                                          # (add --performance for an e2-small)
 deal_radar/deploy/gcp_deploy.sh push      # ship the code + .env, docker compose up -d --build
 deal_radar/deploy/gcp_deploy.sh logs      # follow logs
 deal_radar/deploy/gcp_deploy.sh status    # /status JSON (sources, backlog, dispatch targets)
@@ -156,12 +165,13 @@ What `create` sets up:
 Updating: edit code or `.env`, then `gcp_deploy.sh push` (it uploads a new secret
 version and rebuilds). Tear down: `gcp_deploy.sh destroy`.
 
-### 3.3 Expose Valkey to your tailnet (for the laptop collector)
+### 3.3 Valkey on your tailnet (for the laptop collector)
 
-On the VM: `tailscale ip -4` → e.g. `100.101.102.103`. Put
-`REDIS_BIND=100.101.102.103` in `.env` and `push` again. Valkey then listens only on
-the tailnet interface (plus the compose network); it is password-protected and never
-reachable from the internet.
+Valkey listens on `127.0.0.1` only. When a Tailscale auth key was stored by `init`,
+`vm_startup.sh` joins the tailnet and runs `tailscale serve --tcp=6379`, which
+publishes the port **to tailnet members only**. There is no VPC firewall rule for 6379,
+ever. Find the VM's tailnet address with `tailscale ip -4` (or the admin console) and
+use it in the laptop's `PRIMARY_REDIS_URL`. Valkey is also password-protected.
 
 ---
 

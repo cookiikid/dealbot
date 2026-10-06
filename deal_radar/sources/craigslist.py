@@ -838,6 +838,7 @@ class CraigslistIngestor(BaseIngestor):
         self._preferred = MODE_SAPI
         self._fallback_since: float | None = None
         self._identities: OrderedDict[str, str] = OrderedDict()  # posting token -> first listing id seen
+        self._request_timeout = float(ctx.http.settings.timeout_seconds)
         m = ctx.metrics
         self._m_queries = m.counter("craigslist_queries_total", "Craigslist search requests", ("mode", "outcome"))
         self._m_skipped = m.counter("craigslist_items_skipped_total", "Malformed Craigslist result items", ("reason",))
@@ -1118,6 +1119,9 @@ class CraigslistIngestor(BaseIngestor):
                 accept=accept,
                 parse="text",
                 max_bytes=MAX_BODY_BYTES,
+                # Explicit per-request timeout: HttpClient passes ``timeout=None`` to aiohttp
+                # when none is given, which disables the session's network.timeout_seconds.
+                timeout=self._request_timeout,
             )
         except HttpStatusError as exc:
             # 503 bodies are inspected too: challenge/captcha walls are often served as 503.

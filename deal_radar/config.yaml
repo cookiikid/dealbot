@@ -286,7 +286,7 @@ filters:
         - '\b(?:water|liquid|physical|screen|panel|pcb|board)\s+damage(?:d)?\b'
         - '\bdamage\s+(?:to|on)\s+(?:the\s+)?(?:screen|panel|pcb|board|connector|card|display)\b'
         - '\b(?:hairline\s+)?cracks?\s+(?:in|on|across)\s+(?:the\s+)?(?:screen|panel|display|pcb|board|glass|lcd)\b'
-        - '\bfans?\s+(?:not\s+spinning|(?:do|does|did)\s*(?:n[''’]?t|\s+not)\s+spin|won[''’]?t\s+spin|grinding|rattl\w+)\b'
+        - '\bfans?\s+(?:(?:are|is)\s+)?(?:not\s+spinning|(?:do|does|did)\s*(?:n[''’]?t|\s+not)\s+spin|won[''’]?t\s+spin|grinding|rattl\w+)\b'
         - '\b(?:crash(?:es|ing)?|black\s+screens?)\s+(?:under|in|during|when)\s+(?:load|gaming|games?|benchmarks?)\b'
         - '\b(?:overheats?|overheating)\b'
     counterfeit:
@@ -346,7 +346,7 @@ filters:
         - '^\W*(?:sold|pending|on\s+hold|reserved|closed)\b(?!\s+(?:as[\s-]?is|separately|by|with|in|on|to|out\s+(?:everywhere|at)))'
         - '\b(?:sold|pending|closed)\W*$'
         - '[\[(]\s*(?:sold|pending|closed|on\s+hold|reserved|sale\s+pending|spf)\s*[\])]'
-        - '\bno\s+longer\s+available\b|\bsale\s+pending\b'
+        - '\bno\s+longer\s+available\b|\bsale\s+pending\b|\bpending\s+(?:pick\s*-?\s*up|sale|payment)\b'
     gift_card:
       action: reject
       field: title
@@ -941,7 +941,8 @@ profiles:
         - '\b(?:pulled|removed|taken)\s+(?:out\s+)?(?:from|of)\b'
         - '\btested\s+(?:in|on|with)\s+(?:my\s+|a\s+)?(?:pc|system|rig|build|bench|computer|desktop)\b|\btest\s*bench\b'
         - '^[^\n]*\b(?:gpu|card)\s+only\b'
-        - '\b(?:upgrade|upgradable|upgradeable)\s+to\s+(?:an?\s+)?(?:rtx\s*)?(?:4090|5090)\b'
+        # "RTX 3080 build, upgradable to a 4090" - only when the TITLE names no 4090/5090
+        - '^(?![^\n]*\b(?:4090|5090)\b)[\s\S]*?\b(?:upgrade|upgradable|upgradeable)\s+to\s+(?:an?\s+)?(?:rtx\s*)?(?:4090|5090)\b'
         - '\b(?:optiplex|precision|latitude|vostro|thinkcentre|elitedesk|prodesk)\b'
     variants:
       - id: gpu_5090

@@ -37,15 +37,16 @@ services:
       - --appendfsync
       - everysec
       - --maxmemory
-      - ${VALKEY_MAXMEMORY:-256mb}
+      - ${VALKEY_MAXMEMORY:-160mb}
       - --maxmemory-policy
       - volatile-ttl
       - --requirepass
       - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
     ports:
-      # Bind to loopback by default; set REDIS_BIND to the VM's Tailscale IP (100.x.y.z)
-      # so the laptop collector and other nodes can reach it over the tailnet only.
+      # Loopback only. On the GCP VM, vm_startup.sh publishes it to the tailnet with
+      # `tailscale serve --tcp=6379` so home nodes reach it privately; never 0.0.0.0.
       - "${REDIS_BIND:-127.0.0.1}:6379:6379"
+    mem_limit: ${VALKEY_MEM_LIMIT:-256m}
     volumes:
       - valkey-data:/data
     healthcheck:
@@ -75,6 +76,8 @@ services:
       LOG_JSON: "true"
     ports:
       - "${HTTP_BIND:-127.0.0.1}:8080:8080"
+    # e2-micro has 1 GB RAM (+2 GB swap from vm_startup.sh); keep headroom for Valkey/Docker.
+    mem_limit: ${DEALRADAR_MEM_LIMIT:-640m}
     volumes:
       - dealradar-data:/app/data
 
@@ -93,7 +96,8 @@ services:
       APP_ROLES: collector
       BUS_BACKEND: redis
       # The primary's Valkey over Tailscale, e.g. redis://:pass@100.101.102.103:6379/0
-      REDIS_URL: ${PRIMARY_REDIS_URL:?set PRIMARY_REDIS_URL to the primary Valkey over Tailscale}
+      # Required on the laptop; config validation fails fast with a clear message if empty.
+      REDIS_URL: ${PRIMARY_REDIS_URL:-}
       FB_ENABLED: ${FB_ENABLED:-true}
       FB_NODES: ${LOCAL_NODE_ID:-home-laptop}
       OFFERUP_ENABLED: ${OFFERUP_ENABLED:-false}

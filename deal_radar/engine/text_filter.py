@@ -18,9 +18,10 @@ Semantics (evaluation order, the first rejection wins)
    ``source_kinds`` and ``negatable``): first match -> ``reject_code=<group>``,
    ``reject_detail=<matched text>``.
 5. ``risk`` groups: one :class:`RiskSignal` per matching group (origin ``text``).
-6. Title/price mismatch: the first explicit ``$`` price in the title vs
-   ``item.price``; a ratio outside ``[0.5, 2.0]`` adds ``title_price_mismatch``
-   (origin ``listing``).
+6. Title/price mismatch: the first explicit price in the title
+   (:func:`deal_radar.engine.normalizer.extract_title_price`, which ignores
+   "$50 off"-style amounts) vs ``item.price``; a ratio outside ``[0.5, 2.0]`` adds
+   ``title_price_mismatch`` (origin ``listing``).
 
 ``match_strength`` starts at 1.0, loses 0.15 when the profile has variants but none
 matched and 0.1 when another profile of equal priority also matched; it is clamped
@@ -80,6 +81,7 @@ from typing import Any
 
 from deal_radar.config_schema import AppConfig, Profile, RuleGroup
 from deal_radar.core.logs import get_logger
+from deal_radar.engine.normalizer import extract_title_price
 from deal_radar.engine.types import Condition, DealItem, FilterResult, RiskSignal, SourceKind
 
 try:  # CPython 3.11+: the regex parser used to derive literal anchors (an optimisation only)
@@ -125,31 +127,10 @@ _NEGATION_SCOPE_ENDERS = frozenset(
     }
 )
 
-# First explicit dollar price in a title: "$1,199", "$1199.99", "US$ 900", "$1.2k".
-_TITLE_PRICE = re.compile(r"(?<![\w$])(?:US)?\$\s?(\d{1,3}(?:,\d{3})+|\d+)(\.\d{1,2})?(?:\s?([kK])\b)?")
-
 # Accepted ratio item.price / title price before "title_price_mismatch" fires.
 _TITLE_PRICE_RATIO = (0.5, 2.0)
 
 _TITLE_FIELD = "title"
-
-
-def extract_title_price(text: str) -> float | None:
-    """First explicit ``$`` price in a title (``"... - $1199 ($1599 - $400)"`` -> ``1199.0``).
-
-    Same contract as ``engine.normalizer.extract_title_price``; kept local so the
-    hot path has no import-time dependency on the normalizer module.
-    """
-    if not text or "$" not in text:
-        return None
-    m = _TITLE_PRICE.search(text)
-    if m is None:
-        return None
-    whole, cents, kilo = m.groups()
-    value = float(whole.replace(",", "") + (cents or ""))
-    if kilo:
-        value *= 1000.0
-    return round(value, 2)
 
 
 # --------------------------------------------------------------------------- case folding
@@ -1018,4 +999,4 @@ def _finish(started_ns: int, result: FilterResult) -> FilterResult:
     return result
 
 
-__all__ = ["TextFilter", "extract_title_price"]
+__all__ = ["TextFilter"]

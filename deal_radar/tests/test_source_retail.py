@@ -770,12 +770,37 @@ async def test_target_perimeterx_435_is_blocked_and_cools_down(http: HttpClient)
     assert "435" in str(info.value) and TARGET_KEY not in str(info.value)
     assert info.value.cooldown_seconds == pytest.approx(300)
     assert ingestor.endpoints[0].state == "blocked"
-    assert notices and "blocked" in notices[0][0] and TARGET_KEY not in notices[0][1]
+    assert notices == []  # the whole source is blocked: the base loop sends the one notice
     # Still cooling down 100 s later: the endpoint is skipped, nothing is requested.
     clock.t += 100
     with aioresponses() as m:
         assert await ingestor.poll() == []
         assert not m.requests
+
+
+async def test_newly_blocked_endpoint_notifies_once_while_others_keep_working(http: HttpClient) -> None:
+    config = make_config(
+        [
+            {"name": "tgt", "adapter": "target_redsky", "api_key": TARGET_KEY, "tcins": ["93954446"], "poll_interval_seconds": 20},
+            shop_endpoint(poll_interval_seconds=20),
+        ],
+        cooldown_seconds=30,
+    )
+    clock = FakeClock(0.0)
+    notices: list[tuple[str, str]] = []
+    ingestor = make_ingestor(config, http, clock=clock, notices=notices)
+    with aioresponses() as m:
+        m.get(REDSKY_RE, status=435, payload=load("redsky_block_435.json"), repeat=True)
+        m.get(re.compile(re.escape(STORE) + ".*"), payload=load("shopify_product_rtx5090.js.json"), repeat=True)
+        assert len(await ingestor.poll()) == 2
+        clock.t = 30.0
+        assert len(await ingestor.poll()) == 2
+    states = {s.name: s for s in ingestor.endpoints}
+    assert states["tgt"].consecutive_blocks == 2
+    assert states["tgt"].next_due == pytest.approx(30.0 + 60.0)  # 30 s cooldown doubled
+    assert len(notices) == 1
+    title, message = notices[0]
+    assert title == "retail endpoint tgt blocked" and "435" in message and TARGET_KEY not in message
 
 
 async def test_target_block_json_with_200_and_retired_aggregation(http: HttpClient) -> None:

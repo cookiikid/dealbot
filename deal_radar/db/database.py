@@ -15,10 +15,15 @@ Design decisions
   so several processor nodes can start concurrently against the same database.
 * **Snapshot writes are one transaction**: listings are upserted (merged in Python first
   so a batch never touches the same row twice — PostgreSQL forbids that inside a single
-  ``ON CONFLICT DO UPDATE`` command), then snapshots are bulk-inserted. The upsert is
-  *order independent*: ``last_*``/``title``/``status`` only move forward in time,
-  ``first_*`` only backward, and ``min_price`` is the minimum ever seen, so late or
-  retried batches can never regress a listing.
+  ``ON CONFLICT DO UPDATE`` command — and sorted by primary key so concurrent writers
+  lock rows in one global order and cannot deadlock), then snapshots are bulk-inserted.
+  The upsert is *order independent*: ``last_*``/``title``/``status`` only move forward
+  in time, ``first_*`` only backward, and ``min_price`` is the minimum ever seen, so late
+  or retried batches can never regress a listing.
+* **One bad record must not sink a batch.** Scraped strings are sanitised for every
+  backend (:func:`~deal_radar.db.models.db_text`: NUL bytes, lone surrogates, column
+  widths), JSON documents are coerced by :func:`json_safe` (``\\u0000``, >64-bit ints,
+  NaN), and records with a non-finite price are skipped.
 * **Snapshot ``accepted`` means "valid market observation"**: the text filter accepted the
   item *and* the scorer did not trip a disqualifying hard gate (``above_ceiling`` is not
   disqualifying: the price is real, just too high to alert). This mirrors
@@ -32,25 +37,31 @@ Design decisions
 * **The Recorder keeps the database off the hot path.** ``record()`` is a non-blocking
   ``put_nowait`` onto a bounded queue (overflow is dropped and counted, never awaited); a
   single background task flushes when ``batch_size`` records are waiting or
-  ``flush_seconds`` after the first pending record arrived, retries a failed flush once,
-  and otherwise drops the batch with an error log + metric so a database outage can
-  never stall or crash the pipeline. ``stop()`` drains everything that is queued.
+  ``flush_seconds`` after the first pending record arrived, and retries a failed flush
+  once. If the retry fails too, a *transient* error (outage, lock timeout, deadlock —
+  see :func:`is_transient_error`) drops the batch; any other error is treated as a
+  poison record and the batch is bisected so only the offending records are dropped.
+  Drops are logged once per batch and counted, so a database outage can never stall or
+  crash the pipeline. ``stop()`` drains everything that is queued.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import math
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit, urlunsplit
+from typing import TYPE_CHECKING, Any, TypeVar
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import orjson
 import redis.asyncio as redis_asyncio
 from sqlalchemy import ColumnElement, Select, Table, case, delete, event, func, insert, select, true
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.dialects import postgresql as pg_dialect
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.engine import URL, make_url
@@ -72,7 +83,7 @@ from deal_radar.db.models import (
     Base,
     Listing,
     PriceSnapshot,
-    clip,
+    db_text,
     ensure_utc,
 )
 from deal_radar.engine.types import Alert, DealItem, DispatchReport, FilterResult, ScoreResult, utcnow
@@ -125,28 +136,101 @@ _FIRST_FIELDS = ("first_seen", "first_price")
 
 HistoryRow = tuple[str, str, str, float, datetime, str]
 
+_T = TypeVar("_T")
+
+# orjson's integer range (signed 64-bit minimum .. unsigned 64-bit maximum).
+_JSON_INT_MIN, _JSON_INT_MAX = -(2**63), 2**64 - 1
+
+# SQLSTATE classes that describe the server/connection, not the data: connection
+# exception, transaction rollback (deadlock, serialization failure), insufficient
+# resources, operator intervention, system error.
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "40", "53", "57", "58"})
+
+# Query-string parameters that carry credentials (redis-py reads ``?password=``).
+_SECRET_QUERY_KEYS = frozenset({"password", "pass", "passwd", "pwd", "secret", "token", "auth"})
+
+
+def json_safe(value: Any) -> Any:
+    """Coerce a JSON document into the subset every backend and orjson accept.
+
+    Strings go through :func:`db_text` (no NUL — ``jsonb`` rejects ``\\u0000`` — and no
+    lone surrogates), integers beyond 64 bits become strings, non-finite floats become
+    ``null``, mapping keys become strings, sequences/sets become lists and anything else
+    is stringified. A clean document is returned equal to the input.
+    """
+    if isinstance(value, str):
+        return db_text(value)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value if _JSON_INT_MIN <= value <= _JSON_INT_MAX else str(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {db_text(str(k)): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [json_safe(v) for v in value]
+    return db_text(str(value))
+
 
 def _json_dumps(value: Any) -> str:
-    return orjson.dumps(value, option=orjson.OPT_NON_STR_KEYS).decode("utf-8")
+    try:
+        return orjson.dumps(value, option=orjson.OPT_NON_STR_KEYS).decode("utf-8")
+    except TypeError:  # orjson.JSONEncodeError: >64-bit int, lone surrogate, unknown type
+        return orjson.dumps(json_safe(value), option=orjson.OPT_NON_STR_KEYS).decode("utf-8")
 
 
 def _json_loads(value: str | bytes) -> Any:
     return orjson.loads(value)
 
 
+def _finite(value: float | None) -> float | None:
+    """``value`` as a float, or ``None`` when missing/NaN/infinite (SQLite stores NaN as NULL)."""
+    if value is None:
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
 def redact_url(url: str | URL) -> str:
-    """Render a database/redis URL without its password, for logs."""
+    """Render a database/redis URL without its password (userinfo or query string), for logs."""
     if isinstance(url, URL):
         return url.render_as_string(hide_password=True)
     try:
         parts = urlsplit(url)
+        password = parts.password
     except ValueError:
         return "<unparseable url>"
-    if parts.password is None:
-        return url
-    netloc = parts.netloc.rsplit("@", 1)[1]
-    user = f"{parts.username}:***@" if parts.username else ":***@"
-    return urlunsplit((parts.scheme, user + netloc, parts.path, parts.query, parts.fragment))
+    # Splice the redacted pieces into the original string (urlunsplit would turn
+    # ``unix:///path`` into ``unix:/path``).
+    redacted = url
+    if password is not None:
+        host = parts.netloc.rsplit("@", 1)[1]
+        userinfo = f"{parts.username}:***@" if parts.username else ":***@"
+        redacted = redacted.replace(parts.netloc, userinfo + host, 1)
+    if parts.query:
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+        if any(k.lower() in _SECRET_QUERY_KEYS for k, _ in pairs):
+            query = urlencode([(k, "***" if k.lower() in _SECRET_QUERY_KEYS else v) for k, v in pairs], safe="*")
+            redacted = redacted.replace(f"?{parts.query}", f"?{query}", 1)
+    return redacted
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True when a failed write says nothing about the data (outage, lock, deadlock...).
+
+    Used by the :class:`Recorder` to decide between dropping a batch (the database is
+    unavailable: retrying record by record would only hammer it) and bisecting it to
+    isolate a poison record (constraint/encoding/serialisation errors are per-row).
+    """
+    if isinstance(exc, (OSError, TimeoutError, sa_exc.TimeoutError, sa_exc.DisconnectionError)):
+        return True  # OSError covers ConnectionError/ConnectionRefusedError
+    if isinstance(exc, sa_exc.DBAPIError):
+        if exc.connection_invalidated or isinstance(exc, (sa_exc.OperationalError, sa_exc.InterfaceError)):
+            return True
+        sqlstate = getattr(exc.orig, "sqlstate", None)
+        return isinstance(sqlstate, str) and sqlstate[:2] in _TRANSIENT_SQLSTATE_CLASSES
+    return False
 
 
 # --------------------------------------------------------------------------- records
@@ -196,26 +280,26 @@ def _listing_row(record: SnapshotRecord, observed_at: datetime, status: str) -> 
     price = float(item.total_price)
     return {
         "id": item.fingerprint,
-        "source": clip(item.source, SOURCE_LEN),
-        "source_id": item.source_id,
-        "listing_key": item.listing_key,
-        "url": item.url,
-        "title": item.title,
-        "profile_id": clip(fr.profile_id, PROFILE_LEN) if fr else None,
-        "variant_id": clip(fr.variant_id, PROFILE_LEN) if fr else None,
-        "product_key": clip(fr.product_key, PRODUCT_KEY_LEN) if fr else None,
-        "category": clip(fr.category, CATEGORY_LEN) if fr else None,
-        "condition": clip(item.condition.value, CONDITION_LEN),
-        "retailer": clip(item.retailer, SHORT_TEXT_LEN),
-        "seller_name": clip(item.seller.name, SHORT_TEXT_LEN) if item.seller else None,
-        "location_text": clip(_location_text(item), SHORT_TEXT_LEN),
-        "image_url": item.primary_image,
+        "source": db_text(item.source, SOURCE_LEN),
+        "source_id": db_text(item.source_id),
+        "listing_key": db_text(item.listing_key),
+        "url": db_text(item.url),
+        "title": db_text(item.title),
+        "profile_id": db_text(fr.profile_id, PROFILE_LEN) if fr else None,
+        "variant_id": db_text(fr.variant_id, PROFILE_LEN) if fr else None,
+        "product_key": db_text(fr.product_key, PRODUCT_KEY_LEN) if fr else None,
+        "category": db_text(fr.category, CATEGORY_LEN) if fr else None,
+        "condition": db_text(item.condition.value, CONDITION_LEN),
+        "retailer": db_text(item.retailer, SHORT_TEXT_LEN),
+        "seller_name": db_text(item.seller.name, SHORT_TEXT_LEN) if item.seller else None,
+        "location_text": db_text(_location_text(item), SHORT_TEXT_LEN),
+        "image_url": db_text(item.primary_image),
         "first_seen": observed_at,
         "last_seen": observed_at,
         "first_price": price,
         "last_price": price,
         "min_price": price,
-        "last_score": float(score.score) if score is not None else None,
+        "last_score": _finite(score.score) if score is not None else None,
         "status": status,
     }
 
@@ -237,11 +321,24 @@ def _merge_listing_rows(current: dict[str, Any], new: dict[str, Any]) -> None:
 
 
 def build_snapshot_rows(records: Sequence[SnapshotRecord]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return ``(listing upsert rows (one per listing), snapshot insert rows)``."""
+    """Return ``(listing upsert rows (one per listing, primary-key order), snapshot insert rows)``.
+
+    Records whose price is NaN/infinite are skipped with a warning: they are not market
+    observations, and SQLite would turn NaN into NULL and fail the NOT NULL constraint
+    (aborting the whole batch). Listing rows are sorted by primary key so concurrent
+    writers (several processor nodes) always lock listings in the same order and can
+    never deadlock each other on PostgreSQL.
+    """
     listings: dict[str, dict[str, Any]] = {}
     snapshots: list[dict[str, Any]] = []
     for record in records:
         item, fr, score = record.item, record.filter_result, record.score
+        if not (math.isfinite(item.price) and math.isfinite(item.total_price)):
+            log.warning(
+                "skipping snapshot with a non-finite price",
+                extra={"listing_key": item.listing_key, "price": repr(item.price), "total_price": repr(item.total_price)},
+            )
+            continue
         observed_at = ensure_utc(record.observed_at)
         status, usable, reject_code = classify_record(record)
         row = _listing_row(record, observed_at, status)
@@ -257,40 +354,41 @@ def build_snapshot_rows(records: Sequence[SnapshotRecord]) -> tuple[list[dict[st
                 "condition_class": item.condition.market_class,
                 "source": row["source"],
                 "price": float(item.price),
-                "shipping": float(item.shipping) if item.shipping is not None else None,
+                "shipping": _finite(item.shipping),
                 "total_price": float(item.total_price),
                 "observed_at": observed_at,
                 "accepted": usable,
-                "reject_code": clip(reject_code, REJECT_CODE_LEN),
-                "score": float(score.score) if score is not None else None,
-                "risk": float(score.risk) if score is not None else None,
+                "reject_code": db_text(reject_code, REJECT_CODE_LEN),
+                "score": _finite(score.score) if score is not None else None,
+                "risk": _finite(score.risk) if score is not None else None,
             }
         )
-    return list(listings.values()), snapshots
+    return [listings[key] for key in sorted(listings)], snapshots
 
 
 def build_alert_row(alert: Alert, report: DispatchReport) -> dict[str, Any]:
+    """Alert row; every string and JSON document is sanitised (see :func:`json_safe`)."""
     score = alert.score
     return {
-        "id": alert.alert_id,
+        "id": db_text(alert.alert_id),
         "listing_id": alert.item.fingerprint,
-        "product_key": clip(alert.product_key, PRODUCT_KEY_LEN),
-        "severity": clip(alert.severity.value, SEVERITY_LEN),
+        "product_key": db_text(alert.product_key, PRODUCT_KEY_LEN),
+        "severity": db_text(alert.severity.value, SEVERITY_LEN),
         "score": float(score.score),
         "price": float(alert.item.total_price),
-        "market_price": score.market_price,
-        "discount_pct": score.discount_pct,
+        "market_price": _finite(score.market_price),
+        "discount_pct": _finite(score.discount_pct),
         "is_price_error": score.is_price_error,
         "is_update": alert.is_update,
-        "previous_price": alert.dedup.previous_price,
-        "targets": [r.target for r in report.results],
-        "results": [r.model_dump(mode="json") for r in report.results],
-        "suppressed_reason": clip(report.suppressed_reason, SHORT_TEXT_LEN),
+        "previous_price": _finite(alert.dedup.previous_price),
+        "targets": json_safe([r.target for r in report.results]),
+        "results": json_safe([r.model_dump(mode="json") for r in report.results]),
+        "suppressed_reason": db_text(report.suppressed_reason, SHORT_TEXT_LEN),
         "ok": report.any_ok,
         "created_at": ensure_utc(alert.created_at),
-        "pipeline_ms": float(alert.pipeline_ms),
-        "ingest_lag_ms": alert.ingest_lag_ms,
-        "payload": alert.model_dump(mode="json"),
+        "pipeline_ms": _finite(alert.pipeline_ms) or 0.0,
+        "ingest_lag_ms": _finite(alert.ingest_lag_ms),
+        "payload": json_safe(alert.model_dump(mode="json")),
     }
 
 
@@ -395,7 +493,7 @@ def _apply_sqlite_pragmas(dbapi_connection: Any, connection_record: Any) -> None
 def _sqlite_file_path(url: URL) -> Path | None:
     """Filesystem path of a SQLite URL, or ``None`` for in-memory databases."""
     database = url.database
-    if not database or database == ":memory:":
+    if not database or database == ":memory:" or url.query.get("mode") == "memory":
         return None
     if database.startswith("file:"):
         path_part, _, query = database[len("file:"):].partition("?")
@@ -498,6 +596,8 @@ class Database:
         if not records:
             return
         listing_rows, snapshot_rows = build_snapshot_rows(records)
+        if not snapshot_rows:  # every record was invalid (non-finite price)
+            return
         async with self.engine.begin() as conn:
             await conn.execute(self._listing_upsert, listing_rows)
             await conn.execute(self._snapshot_insert, snapshot_rows)
@@ -761,45 +861,108 @@ class Recorder:
     async def _flush(self, batch: list[_Entry]) -> None:
         snapshots = [e for e in batch if isinstance(e, SnapshotRecord)]
         alerts = [(e.alert, e.report) for e in batch if isinstance(e, _AlertRecord)]
-        # Snapshots first: an alert's listing row then usually exists when the alert lands.
-        if snapshots:
-            await self._write("snapshot", len(snapshots), lambda: self.db.write_snapshots(snapshots))
-        if alerts:
-            await self._write("alert", len(alerts), lambda: self.db.write_alerts(alerts))
-        self._m_depth.set(self._queue.qsize())
-
-    async def _write(self, kind: str, count: int, operation: Callable[[], Awaitable[None]]) -> bool:
-        """Run ``operation``; retry once after ``retry_delay``; drop (log + metric) on a second failure."""
+        # Records of this batch that are neither written nor dropped yet. If the task is
+        # cancelled mid-flush (stop() timeout) they are counted as "cancelled", so no
+        # record ever disappears uncounted (including alerts queued behind snapshots).
+        unresolved = {"snapshot": len(snapshots), "alert": len(alerts)}
         try:
-            for attempt in (1, 2):
-                started = time.perf_counter()
-                try:
-                    await operation()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._m_failures.inc(kind=kind)
-                    if attempt == 1:
-                        log.warning(
-                            "recorder flush failed; retrying once",
-                            extra={"kind": kind, "records": count, "error": repr(exc)},
-                        )
-                        await asyncio.sleep(self.retry_delay)
-                        continue
-                    log.error(
-                        "recorder flush failed twice; dropping batch",
-                        extra={"kind": kind, "records": count, "error": repr(exc)},
-                        exc_info=exc,
-                    )
-                    self._drop(kind, "write_error", count)
-                    return False
-                self._m_flush_ms.observe((time.perf_counter() - started) * 1000.0, kind=kind)
-                self._m_written.inc(count, kind=kind)
-                return True
+            # Snapshots first: an alert's listing row then usually exists when the alert lands.
+            if snapshots:
+                await self._write("snapshot", snapshots, self.db.write_snapshots, unresolved)
+            if alerts:
+                await self._write("alert", alerts, self.db.write_alerts, unresolved)
         except asyncio.CancelledError:
-            self._drop(kind, "cancelled", count)
+            for kind, count in unresolved.items():
+                self._drop(kind, "cancelled", count)
             raise
-        return False  # pragma: no cover - loop always returns
+        finally:
+            self._m_depth.set(self._queue.qsize())
+
+    async def _write(
+        self, kind: str, items: list[_T], writer: Callable[[list[_T]], Awaitable[None]], unresolved: dict[str, int]
+    ) -> None:
+        """Write ``items``; retry once after ``retry_delay``; then drop or isolate.
+
+        After the second failure a transient error (database unavailable) drops the batch,
+        while any other error is assumed to come from one or more poison records and the
+        batch is bisected so that only those records are lost.
+        """
+        error = await self._attempt(kind, items, writer, unresolved)
+        if error is None:
+            return
+        log.warning("recorder flush failed; retrying once", extra={"kind": kind, "records": len(items), "error": repr(error)})
+        await asyncio.sleep(self.retry_delay)
+        error = await self._attempt(kind, items, writer, unresolved)
+        if error is None:
+            return
+        if len(items) > 1 and not is_transient_error(error):
+            await self._isolate(kind, items, writer, unresolved)
+            return
+        self._fail(kind, len(items), unresolved)
+        log.error(
+            "recorder flush failed twice; dropping batch",
+            extra={"kind": kind, "records": len(items), "error": repr(error)},
+            exc_info=error,
+        )
+
+    async def _attempt(
+        self, kind: str, items: list[_T], writer: Callable[[list[_T]], Awaitable[None]], unresolved: dict[str, int]
+    ) -> Exception | None:
+        """One write; returns the error instead of raising (``CancelledError`` propagates)."""
+        started = time.perf_counter()
+        try:
+            await writer(items)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - classified by the caller
+            self._m_failures.inc(kind=kind)
+            return exc
+        self._m_flush_ms.observe((time.perf_counter() - started) * 1000.0, kind=kind)
+        self._m_written.inc(len(items), kind=kind)
+        unresolved[kind] -= len(items)
+        return None
+
+    async def _isolate(
+        self, kind: str, items: list[_T], writer: Callable[[list[_T]], Awaitable[None]], unresolved: dict[str, int]
+    ) -> None:
+        """Bisect a batch that keeps failing with a per-record error, dropping only the culprits.
+
+        Costs at most ``2 * len(items)`` extra writes (one bad record: ~``2 * log2(n)``)
+        and stops at the first transient error, since a database that went away will not
+        accept the remaining halves either.
+        """
+        half = len(items) // 2
+        stack = [items[half:], items[:half]]  # LIFO: first half first, keeps record order
+        written = dropped = 0
+        last_error: Exception | None = None
+        while stack:
+            chunk = stack.pop()
+            error = await self._attempt(kind, chunk, writer, unresolved)
+            if error is None:
+                written += len(chunk)
+                continue
+            last_error = error
+            if is_transient_error(error):
+                lost = len(chunk) + sum(len(rest) for rest in stack)
+                stack.clear()
+                self._fail(kind, lost, unresolved)
+                dropped += lost
+            elif len(chunk) == 1:
+                self._fail(kind, 1, unresolved)
+                dropped += 1
+            else:
+                half = len(chunk) // 2
+                stack.append(chunk[half:])
+                stack.append(chunk[:half])
+        extra = {"kind": kind, "records": len(items), "written": written, "dropped": dropped, "error": repr(last_error)}
+        if dropped:
+            log.error("recorder batch failed twice; isolated and dropped bad records", extra=extra, exc_info=last_error)
+        else:
+            log.warning("recorder batch failed twice but succeeded when split", extra=extra)
+
+    def _fail(self, kind: str, count: int, unresolved: dict[str, int]) -> None:
+        self._drop(kind, "write_error", count)
+        unresolved[kind] -= count
 
     def _on_task_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -816,21 +979,26 @@ async def connect_redis(url: str, *, max_connections: int, socket_timeout: float
     """Create a pooled ``redis.asyncio`` client and verify it with ``PING`` (raises on failure).
 
     Responses stay ``bytes`` (``decode_responses=False``): the dedup Lua script and the
-    stream bus handle raw payloads, and skipping decode saves work on the hot path.
+    stream bus handle raw payloads, and skipping decode saves work on the hot path. TCP
+    keepalive is only requested for ``redis://``/``rediss://``: redis-py's Unix-socket
+    connection class rejects that option, which would break ``unix://`` URLs (allowed
+    by ``storage.redis_url``) on the first command.
     """
-    client: Redis = redis_asyncio.from_url(
-        url,
-        max_connections=max_connections,
-        socket_timeout=socket_timeout,
-        socket_connect_timeout=socket_timeout,
-        socket_keepalive=True,
-        health_check_interval=30,
-        decode_responses=False,
-    )
+    options: dict[str, Any] = {
+        "max_connections": max_connections,
+        "socket_timeout": socket_timeout,
+        "socket_connect_timeout": socket_timeout,
+        "health_check_interval": 30,
+        "decode_responses": False,
+    }
+    if urlsplit(url).scheme.lower() in ("redis", "rediss"):
+        options["socket_keepalive"] = True
+    client: Redis = redis_asyncio.from_url(url, **options)
     try:
         await client.ping()
     except BaseException as exc:
-        await asyncio.shield(client.aclose())
+        with contextlib.suppress(Exception):  # never mask the connection error
+            await asyncio.shield(client.aclose())
         if not isinstance(exc, asyncio.CancelledError):
             log.error("redis connection failed", extra={"redis_url": redact_url(url), "error": repr(exc)})
         raise
@@ -852,6 +1020,8 @@ __all__ = [
     "build_snapshot_rows",
     "classify_record",
     "connect_redis",
+    "is_transient_error",
+    "json_safe",
     "listing_upsert_statement",
     "price_history_query",
     "redact_url",

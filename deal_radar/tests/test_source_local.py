@@ -1498,3 +1498,58 @@ def test_pure_parsers_survive_malformed_payloads() -> None:
         cl.parse_geo(_garbage(rng))
         cl.parse_areas(blob)
         cl.parse_categories(blob)
+
+
+@pytest.fixture
+async def fast_timeout_ctx():
+    settings = NetworkSettings(
+        retry=BackoffPolicy(max_attempts=1, base_delay=0, max_delay=0), trust_env=False, timeout_seconds=0.3
+    )
+    http = HttpClient.create(settings)
+    yield IngestorContext(http=http, metrics=Metrics(), config=make_config(), node_id="test-node")
+    await http.close()
+
+
+async def test_craigslist_request_timeout_falls_back_then_fails_cleanly(
+    upstream: Upstream, fast_timeout_ctx: IngestorContext
+) -> None:
+    import asyncio
+
+    _cl_reference_routes(upstream)
+    state = {"html_slow": False}
+
+    async def slow_sapi(request: web.Request) -> web.Response:
+        await asyncio.sleep(2)
+        return web.json_response(cl_sapi_payload())
+
+    async def html(request: web.Request) -> web.Response:
+        if state["html_slow"]:
+            await asyncio.sleep(2)
+        return web.Response(text=CL_HTML_2026, content_type="text/html")
+
+    upstream.route("GET", cl.SAPI_SEARCH_PATH, slow_sapi)
+    upstream.route("GET", "/site/newyork/search/sss", html)
+    ing = craigslist(fast_timeout_ctx, upstream, profiles=["rtx_4090"])
+    listings = await ing.poll()  # API timed out (not a block) -> static page served the query
+    assert {r.extra["via"] for r in listings} == {"html"}
+    state["html_slow"] = True
+    with pytest.raises(SourceError, match="all 1 craigslist queries failed") as caught:
+        await ing.poll()
+    assert not isinstance(caught.value, SourceBlocked)
+
+
+async def test_offerup_request_timeout_is_a_query_failure_not_a_block(
+    upstream: Upstream, fast_timeout_ctx: IngestorContext
+) -> None:
+    import asyncio
+
+    async def slow(request: web.Request) -> web.Response:
+        await asyncio.sleep(2)
+        return web.Response(text="late", content_type="text/html")
+
+    upstream.route("GET", "/search", slow)
+    upstream.route("POST", "/api/graphql", slow)
+    ing = offerup(fast_timeout_ctx, upstream, profiles=["rtx_4090"])
+    with pytest.raises(SourceError) as caught:
+        await ing.poll()
+    assert not isinstance(caught.value, SourceBlocked)

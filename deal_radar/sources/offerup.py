@@ -686,6 +686,7 @@ class OfferUpIngestor(BaseIngestor):
         )
         self._geocode_retry_at = 0.0
         self._graphql_parked_until = 0.0
+        self._request_timeout = float(ctx.http.settings.timeout_seconds)
         self._session_id = str(uuid.uuid4())
         # Client-minted identifiers the web app sends with every GraphQL call: one anonymous
         # device token per process (sticky, like a browser profile) and a session id.
@@ -931,6 +932,9 @@ class OfferUpIngestor(BaseIngestor):
                 accept=accept,
                 parse="text",
                 max_bytes=MAX_BODY_BYTES,
+                # Explicit per-request timeout: HttpClient passes ``timeout=None`` to aiohttp
+                # when none is given, which disables the session's network.timeout_seconds.
+                timeout=self._request_timeout,
             )
         except HttpStatusError as exc:
             body = exc.body if exc.status in (401, 403, 429, 503) else None  # walls are often 403/503

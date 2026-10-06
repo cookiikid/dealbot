@@ -4,16 +4,21 @@
 #
 #  Primary target: ONE Compute Engine VM running Valkey + DealRadar (docker compose).
 #  A 24/7 polling loop is the worst case for request-billed serverless, so the
-#  cheapest always-on footprint is a small VM:
-#      e2-small (2 vCPU burst, 2 GB) + 20 GB pd-balanced + ephemeral IPv4
-#      ≈ $14 + $2 + $3.65  ≈ $20/month  → ~10 months on a $200 credit.
-#  `--free-tier` uses e2-micro + 30 GB pd-standard in us-east1 (Always Free eligible;
-#  you still pay for the external IPv4 address).
+#  cheapest always-on footprint is a small VM. Prices verified 2026-10-06:
+#
+#    default        e2-micro, us-east1, 30 GB pd-standard, STANDARD network tier
+#                   → Always Free compute + disk; only the in-use IPv4 is billed
+#                   ≈ $3.65/month  (≈ $44/year — the $200 credit lasts years)
+#    --performance  e2-small, us-east1, 30 GB pd-standard   ≈ $15.9/month
+#
+#  us-east4 (Ashburn) is ~10-15 ms closer to AWS us-east-1 but has no free tier and
+#  costs ~12.6 % more; every target sits behind a CDN edge and poll intervals are
+#  seconds, so the region choice is not worth it. Memorystore ($23-36/month) and
+#  always-on Cloud Run (≈ $31-53/month) cost more than the entire VM plan.
 #
 #  Optional: `cloudrun` deploys an extra *collector-only* worker on Cloud Run
 #  (instance-based billing, min=max=1 instance) that publishes into the VM's Valkey
-#  over Direct VPC egress. Always-on Cloud Run costs ≈ $45-55/month — use it only
-#  for redundancy, not as the primary.
+#  over Direct VPC egress (≈ $53/month — redundancy only, not the primary).
 #
 #  Usage (from the repository root, with gcloud authenticated):
 #     export PROJECT_ID=my-project
@@ -28,27 +33,29 @@
 set -Eeuo pipefail
 
 # ------------------------------------------------------------------ settings
-FREE_TIER=false
+PERFORMANCE=false
 ARGS=()
 for arg in "$@"; do
-  if [[ "$arg" == "--free-tier" ]]; then FREE_TIER=true; else ARGS+=("$arg"); fi
+  case "$arg" in
+    --performance) PERFORMANCE=true ;;
+    --free-tier) PERFORMANCE=false ;;  # the default; kept for backwards compatibility
+    *) ARGS+=("$arg") ;;
+  esac
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || true)}"
-if [[ "$FREE_TIER" == true ]]; then
-  REGION="${REGION:-us-east1}"
-  MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
-  DISK_TYPE="${DISK_TYPE:-pd-standard}"
-  DISK_SIZE_GB="${DISK_SIZE_GB:-30}"
-else
-  # us-east4 = Ashburn, VA: the densest interconnect hub in North America and a
-  # sub-2 ms hop to AWS us-east-1, where many retail origins live.
-  REGION="${REGION:-us-east4}"
+# Always Free covers one e2-micro + 30 GB pd-standard in us-east1, us-central1 or us-west1.
+REGION="${REGION:-us-east1}"
+if [[ "$PERFORMANCE" == true ]]; then
   MACHINE_TYPE="${MACHINE_TYPE:-e2-small}"
-  DISK_TYPE="${DISK_TYPE:-pd-balanced}"
-  DISK_SIZE_GB="${DISK_SIZE_GB:-20}"
+else
+  MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 fi
+DISK_TYPE="${DISK_TYPE:-pd-standard}"
+DISK_SIZE_GB="${DISK_SIZE_GB:-30}"
+# STANDARD tier: 200 GiB/month free egress (gcloud defaults to PREMIUM: 1 GiB free).
+NETWORK_TIER="${NETWORK_TIER:-STANDARD}"
 ZONE="${ZONE:-${REGION}-b}"
 VM_NAME="${VM_NAME:-dealradar-primary}"
 NETWORK="${NETWORK:-default}"
@@ -60,6 +67,7 @@ TAILSCALE_SECRET="${TAILSCALE_SECRET:-dealradar-tailscale-authkey}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/dealradar}"
 NET_TAG="${NET_TAG:-dealradar}"
 BUDGET_AMOUNT="${BUDGET_AMOUNT:-200}"
+BUDGET_MONTHLY="${BUDGET_MONTHLY:-15}"
 AR_REPO="${AR_REPO:-dealradar}"
 RUN_SERVICE="${RUN_SERVICE:-dealradar-collector}"
 
@@ -122,6 +130,13 @@ cmd_init() {
       --target-tags "$NET_TAG" >/dev/null
   fi
 
+  if ! gcloud compute firewall-rules describe dealradar-allow-tailscale >/dev/null 2>&1; then
+    log "firewall: Tailscale WireGuard (udp/41641) for direct peer connections"
+    gcloud compute firewall-rules create dealradar-allow-tailscale --network "$NETWORK" \
+      --direction INGRESS --action ALLOW --rules udp:41641 --source-ranges 0.0.0.0/0 \
+      --target-tags "$NET_TAG" >/dev/null
+  fi
+
   [[ -f "$ENV_FILE" ]] || die "missing $ENV_FILE (copy deal_radar/deploy/.env.example to .env and fill it in)"
   grep -q '^REDIS_PASSWORD=..*' "$ENV_FILE" || die "$ENV_FILE must define REDIS_PASSWORD"
   log "storing ${ENV_FILE} in Secret Manager as '${ENV_SECRET}'"
@@ -140,15 +155,30 @@ cmd_init() {
 cmd_budget() {
   preflight
   [[ -n "${BILLING_ACCOUNT:-}" ]] || die "set BILLING_ACCOUNT (gcloud billing accounts list)"
-  log "creating budget of ${BUDGET_AMOUNT} USD with alerts at 25/50/75/90/100%"
+  # exclude-all-credits: alerts reflect real burn even while credits pay the bill.
+  # Budgets only alert — they never stop resources.
+  log "monthly budget ${BUDGET_MONTHLY} USD (alerts 25/50/90 % actual, 100 % forecast)"
   gcloud billing budgets create --billing-account="$BILLING_ACCOUNT" \
-    --display-name="dealradar-credit-guard" \
-    --budget-amount="${BUDGET_AMOUNT}USD" \
+    --display-name="dealradar-monthly" \
+    --budget-amount="${BUDGET_MONTHLY}USD" --calendar-period=month \
+    --credit-types-treatment=exclude-all-credits \
     --filter-projects="projects/${PROJECT_ID}" \
-    --threshold-rule=percent=0.25 --threshold-rule=percent=0.5 \
-    --threshold-rule=percent=0.75 --threshold-rule=percent=0.9 \
-    --threshold-rule=percent=1.0 >/dev/null
-  log "budget created (alerts go to billing admins by email)"
+    --threshold-rule=percent=0.25 --threshold-rule=percent=0.5 --threshold-rule=percent=0.9 \
+    --threshold-rule=percent=1.0,basis=forecasted-spend >/dev/null
+  local start end
+  start="$(date -u +%Y-%m-%d)"
+  end="$(date -u -d '+1 year' +%Y-%m-%d 2>/dev/null || date -u -v+1y +%Y-%m-%d)"
+  log "lifetime budget ${BUDGET_AMOUNT} USD from ${start} to ${end}"
+  if ! gcloud billing budgets create --billing-account="$BILLING_ACCOUNT" \
+      --display-name="dealradar-credit-${BUDGET_AMOUNT}" \
+      --budget-amount="${BUDGET_AMOUNT}USD" --start-date="$start" --end-date="$end" \
+      --credit-types-treatment=exclude-all-credits \
+      --filter-projects="projects/${PROJECT_ID}" \
+      --threshold-rule=percent=0.25 --threshold-rule=percent=0.5 --threshold-rule=percent=0.75 \
+      --threshold-rule=percent=0.9 >/dev/null; then
+    warn "custom-period budget rejected by this gcloud version; the monthly budget is still active"
+  fi
+  log "budgets created (alerts go to billing admins by email)"
 }
 
 cmd_create() {
@@ -163,6 +193,8 @@ cmd_create() {
     --network "$NETWORK" --subnet "$SUBNET" \
     --image-family debian-12 --image-project debian-cloud \
     --boot-disk-size "${DISK_SIZE_GB}GB" --boot-disk-type "$DISK_TYPE" \
+    --network-tier "$NETWORK_TIER" \
+    --labels app=dealradar \
     --service-account "$SA_EMAIL" --scopes cloud-platform \
     --tags "$NET_TAG" \
     --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
@@ -224,7 +256,7 @@ cmd_tunnel() {
 
 cmd_cloudrun() {
   preflight
-  log "optional Cloud Run collector (always-on, ~\$45-55/month)"
+  log "optional Cloud Run collector (always-on, ~\$53/month)"
   gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com >/dev/null
   if ! gcloud artifacts repositories describe "$AR_REPO" --location "$REGION" >/dev/null 2>&1; then
     gcloud artifacts repositories create "$AR_REPO" --repository-format=docker --location "$REGION" >/dev/null
@@ -263,7 +295,7 @@ cmd_destroy() {
   read -r -p "Delete VM ${VM_NAME}, its disk, firewall rules and Cloud Run service? [y/N] " answer
   [[ "$answer" == "y" || "$answer" == "Y" ]] || { log "aborted"; return 0; }
   gcloud compute instances delete "$VM_NAME" --zone "$ZONE" --quiet || true
-  gcloud compute firewall-rules delete dealradar-allow-iap-ssh dealradar-allow-valkey-internal --quiet 2>/dev/null || true
+  gcloud compute firewall-rules delete dealradar-allow-iap-ssh dealradar-allow-tailscale dealradar-allow-valkey-internal --quiet 2>/dev/null || true
   gcloud run services delete "$RUN_SERVICE" --region "$REGION" --quiet 2>/dev/null || true
   log "secrets were kept; delete with: gcloud secrets delete ${ENV_SECRET}"
 }
