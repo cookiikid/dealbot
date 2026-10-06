@@ -175,7 +175,7 @@ def scrub_surrogates(value: Any) -> Any:
         return out if changed else value
     if isinstance(value, (list, tuple)):
         items = [scrub_surrogates(item) for item in value]
-        return items if any(new is not old for new, old in zip(items, value)) else value
+        return items if any(new is not old for new, old in zip(items, value, strict=True)) else value
     return value
 
 
@@ -465,6 +465,7 @@ class DiscordDispatcher(Dispatcher):
         self._blocked_until = 0.0  # monotonic; per-webhook bucket exhausted / 429
         self._requests = self.metrics.counter("discord_requests_total", "Discord webhook requests", ("target", "status"))
         self._rate_limited = self.metrics.counter("discord_rate_limited_total", "Discord 429 responses", ("target",))
+        self._thread_id = (cfg.thread_id or "").strip() or None
         self._secrets = self._secret_forms()
         secret = self._secret()
         if secret is not None and not _valid_url(secret, limit=len(secret)):
@@ -495,7 +496,8 @@ class DiscordDispatcher(Dispatcher):
         return max(0.0, self._blocked_until - time.monotonic())
 
     def _secret(self) -> str | None:
-        return self.cfg.webhook_url.get_secret_value() if self.cfg.webhook_url is not None else None
+        # Stripped: Docker secrets / .env values often end with a newline.
+        return self.cfg.webhook_url.get_secret_value().strip() if self.cfg.webhook_url is not None else None
 
     def _secret_forms(self) -> list[tuple[str, str]]:
         """(needle, replacement) pairs: the URL and its token, raw and percent-encoded."""
@@ -554,6 +556,8 @@ class DiscordDispatcher(Dispatcher):
     async def _deliver(self, payload: dict[str, Any], *, alert_id: str | None) -> DispatchResult:
         started = time.monotonic()
         deadline = started + self.timeout
+        # Scaled down for tiny budgets so the first attempt always goes out.
+        min_attempt = min(MIN_ATTEMPT_SECONDS, self.timeout / 2)
         secret = self._secret()
         if secret is None:
             return DispatchResult(target=self.target, ok=False, error="not configured")
@@ -580,16 +584,16 @@ class DiscordDispatcher(Dispatcher):
         while attempts < MAX_ATTEMPTS:
             wait = self._blocked_until - time.monotonic()
             if wait > 0:
-                if time.monotonic() + wait + MIN_ATTEMPT_SECONDS > deadline:
+                if time.monotonic() + wait + min_attempt > deadline:
                     error = f"rate limited for {wait:.2f}s (exceeds dispatch budget)"
                     break
                 await asyncio.sleep(wait)
             remaining = deadline - time.monotonic()
-            if remaining < MIN_ATTEMPT_SECONDS:
+            if remaining < min_attempt:
                 error = error or "dispatch budget exhausted"
                 break
             attempts += 1
-            url = webhook_url(secret, with_components="components" in attempt.payload, thread_id=self.cfg.thread_id)
+            url = webhook_url(secret, with_components="components" in attempt.payload, thread_id=self._thread_id)
             try:
                 resp = await self.http.post_json(
                     url,
@@ -608,7 +612,7 @@ class DiscordDispatcher(Dispatcher):
                 status = None
                 error = f"connection failed: {exc!r}"
                 delay = SERVER_ERROR_BASE_DELAY * (2 ** (attempts - 1))
-                if time.monotonic() + delay + MIN_ATTEMPT_SECONDS <= deadline:
+                if time.monotonic() + delay + min_attempt <= deadline:
                     await asyncio.sleep(delay)
                     continue
                 break
@@ -671,7 +675,7 @@ class DiscordDispatcher(Dispatcher):
                 server_errors += 1
                 error = f"HTTP {status}: {detail}"
                 delay = SERVER_ERROR_BASE_DELAY * (2 ** (server_errors - 1))
-                if time.monotonic() + delay + MIN_ATTEMPT_SECONDS <= deadline:
+                if time.monotonic() + delay + min_attempt <= deadline:
                     await asyncio.sleep(delay)
                     continue
                 break
@@ -692,6 +696,7 @@ class DiscordDispatcher(Dispatcher):
 
 
 __all__ = [
+    "NOT_SENT_ERRORS",
     "DiscordDispatcher",
     "build_discord_payload",
     "build_embed",
@@ -700,7 +705,10 @@ __all__ = [
     "escape_markdown",
     "link_button_rows",
     "minimal_payload",
+    "scrub_alert",
+    "scrub_surrogates",
     "text_length",
     "truncate",
+    "username_allowed",
     "webhook_url",
 ]

@@ -813,18 +813,24 @@ async def test_quota_interval_for_shipped_config(http: HttpClient) -> None:
     env = {"EBAY_ENABLED": "true", "EBAY_CLIENT_ID": "id", "EBAY_CLIENT_SECRET": "secret", "HOME_ZIP": "19406"}
     config = load_config(CONFIG_PATH, env=env)
     ingestor = make_ingestor(config, http)
-    expected_pairs = sum(
-        len({t.strip() for t in p.search.terms if t.strip()})
-        for p in config.profiles
-        if p.enabled and p.search.terms and (not p.search.sources or "ebay" in p.search.sources)
-    )
-    assert expected_pairs > 0
-    assert ingestor.calls_per_poll() == expected_pairs
     ebay = config.sources.ebay
-    expected = max(ebay.poll_interval_seconds, 86_400 * expected_pairs / (ebay.daily_call_budget * ebay.budget_safety_factor))
+    if ebay.queries:  # coalesced searches replace the per-profile terms
+        distinct = {(q.q.strip(), q.category_id, q.price_min, q.price_max, tuple(q.condition_ids)) for q in ebay.queries}
+        expected_calls = len(distinct)
+    else:
+        expected_calls = sum(
+            len({t.strip() for t in p.search.terms if t.strip()})
+            for p in config.profiles
+            if p.enabled and p.search.terms and (not p.search.sources or "ebay" in p.search.sources)
+        )
+    assert expected_calls > 0
+    assert ingestor.calls_per_poll() == expected_calls
+    expected = max(ebay.poll_interval_seconds, 86_400 * expected_calls / (ebay.daily_call_budget * ebay.budget_safety_factor))
     assert ingestor.quota_interval() == pytest.approx(expected)
     assert all(q.filter.endswith("itemLocationCountry:US,deliveryCountry:US") for q in ingestor.queries)
-    assert all("priceCurrency:USD" in q.filter and "buyingOptions:{FIXED_PRICE|BEST_OFFER}" in q.filter for q in ingestor.queries)
+    assert all("buyingOptions:{FIXED_PRICE|BEST_OFFER}" in q.filter for q in ingestor.queries)
+    assert all("priceCurrency:USD" in q.filter for q in ingestor.queries if "price:[" in q.filter)
+    assert all(len(q.term) <= 100 and len(q.category_ids) <= 1 for q in ingestor.queries)
 
 
 async def test_ledger_stretches_interval_when_usage_runs_ahead_of_plan(http: HttpClient) -> None:

@@ -287,7 +287,7 @@ class TelegramDispatcher(Dispatcher):
         self.target = f"telegram:{name}"
         self.metrics = metrics or Metrics()
         self._token = bot_token
-        self._chat_id: str | None = chat.chat_id
+        self._chat_id: str | None = (chat.chat_id or "").strip() or None  # env values may carry a newline
         self._disabled_reason: str | None = None
         self._blocked_until = 0.0  # monotonic; per-chat flood control
         self._requests = self.metrics.counter(
@@ -309,10 +309,12 @@ class TelegramDispatcher(Dispatcher):
     def chat_id(self) -> str | None:
         return self._chat_id
 
+    def _token_value(self) -> str:
+        # Stripped: Docker secrets / .env values often end with a newline.
+        return self._token.get_secret_value().strip() if self._token is not None else ""
+
     def _redact(self, text: str) -> str:
-        if self._token is None:
-            return text
-        token = self._token.get_secret_value()
+        token = self._token_value()
         return text.replace(token, "<redacted>") if token else text
 
     def _disable(self, status: int, detail: str) -> None:
@@ -387,11 +389,13 @@ class TelegramDispatcher(Dispatcher):
     async def _deliver(self, steps: list[_Step], *, alert_id: str | None) -> DispatchResult:
         started = time.monotonic()
         deadline = started + self.timeout
+        # Scaled down for tiny budgets so the first attempt always goes out.
+        min_attempt = min(MIN_ATTEMPT_SECONDS, self.timeout / 2)
         if self._token is None or self._chat_id is None:
             return DispatchResult(target=self.target, ok=False, error="not configured")
         if self._disabled_reason is not None:
             return DispatchResult(target=self.target, ok=False, error=f"disabled: {self._disabled_reason}")
-        token = self._token.get_secret_value()
+        token = self._token_value()
 
         index = 0
         attempts = 0
@@ -414,12 +418,12 @@ class TelegramDispatcher(Dispatcher):
             step = steps[index]
             wait = self._blocked_until - time.monotonic()
             if wait > 0:
-                if time.monotonic() + wait + MIN_ATTEMPT_SECONDS > deadline:
+                if time.monotonic() + wait + min_attempt > deadline:
                     error = f"rate limited for {wait:.2f}s (exceeds dispatch budget)"
                     break
                 await asyncio.sleep(wait)
             remaining = deadline - time.monotonic()
-            if remaining < MIN_ATTEMPT_SECONDS:
+            if remaining < min_attempt:
                 error = error or "dispatch budget exhausted"
                 break
             attempts += 1
@@ -440,7 +444,7 @@ class TelegramDispatcher(Dispatcher):
                 status = None
                 error = f"connection failed: {type(exc).__name__}: {exc}"
                 delay = SERVER_ERROR_BASE_DELAY * (2 ** (attempts - 1))
-                if time.monotonic() + delay + MIN_ATTEMPT_SECONDS <= deadline:
+                if time.monotonic() + delay + min_attempt <= deadline:
                     await asyncio.sleep(delay)
                     continue
                 break
@@ -502,7 +506,7 @@ class TelegramDispatcher(Dispatcher):
             if status in RETRY_STATUSES:
                 server_errors += 1
                 delay = SERVER_ERROR_BASE_DELAY * (2 ** (server_errors - 1))
-                if time.monotonic() + delay + MIN_ATTEMPT_SECONDS <= deadline:
+                if time.monotonic() + delay + min_attempt <= deadline:
                     await asyncio.sleep(delay)
                     continue
             break

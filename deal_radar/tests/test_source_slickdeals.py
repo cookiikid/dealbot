@@ -888,3 +888,215 @@ async def test_poll_without_feeds_returns_nothing(app_config: AppConfig) -> None
     ingestor = SlickdealsIngestor(SlickdealsSource(enabled=True, search_feeds_from_profiles=False), ctx)
     assert await ingestor.poll() == []
     await ingestor.setup()
+
+
+# --------------------------------------------------------------------------- review regressions
+#
+# ``recorded_live_items.xml`` holds six <item>s copied verbatim from feeds recorded live on
+# 2026-10-06 (an 'oled' Hot Deals search, the frontpage feed and a quoted search), chosen
+# because each one exposed a defect: " - $X" title prices, a third-party seller written as
+# "<seller> via Amazon", multi-store posts whose ASIN belongs to a different store than the
+# primary one, and Amazon's "Shipping is free with Prime or on $35+ orders" phrase.
+
+
+def test_recorded_live_items_extract_dash_prices_and_consistent_stores() -> None:
+    feed = FeedTarget(name="search:oled", url="https://slickdeals.net/rss", query="oled", profile_hint="lg_oled_tv")
+    parsed = parse_feed_listings(fixture_bytes("recorded_live_items.xml"), feed, "text/xml; charset=UTF-8")
+    assert parsed.skipped == {} and parsed.errors == 0 and not parsed.malformed
+    items = by_id(parsed.listings)
+    assert set(items) == {"18554311", "20099271", "20105049", "20105418", "20101683", "20103093"}
+
+    # "... Gaming Monitor - $679.00": the body's "for $749" is the price the poster *cancelled*.
+    assert items["18554311"].price == 679.0
+    lg_c6 = items["20099271"]  # "LG 65\" Class C6 ... - $1499.99 @ Best Buy & Amazon"
+    assert lg_c6.price == 1499.99 and lg_c6.retailer == "Best Buy"
+    assert lg_c6.outbound_url is None  # the ASIN belongs to the secondary (Amazon) link
+    s90h = items["20105049"]  # "Samsung 65\" Class S90H ... - $1499.99 @ Best Buy"
+    assert s90h.price == 1499.99 and s90h.retailer == "Best Buy" and s90h.extra["size_in"] == 65
+    monitor = items["20105418"]  # "LG 45GX900A-B ... OLED Curved Gaming Monitor - $899.99"
+    assert monitor.price == 899.99 and monitor.retailer == "Amazon"
+    assert monitor.outbound_url == "https://www.amazon.com/dp/B0FDC38XGQ"
+    multi = items["20101683"]  # B&H first, then Samsung, then Amazon (with ASIN)
+    assert multi.retailer == "B&H Photo" and multi.outbound_url is None
+    insoles = items["20103093"]  # "WBHzhixin via Amazon has ..." + "Shipping is free with Prime or on $35+"
+    assert insoles.retailer == "Amazon"
+    assert insoles.price == 8.5 and insoles.shipping is None
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ('MSI 49" Curved OLED Display, 144Hz 0.03ms, Gaming Monitor - $679.00', 679.0),
+        ("ASUS ROG Swift 32 4K OLED Gaming Monitor (PG32UCDP) - $999.99", 999.99),
+        ('LG 65" Class C6 Series OLED evo AI 4K Smart webOS TV (2026) - $1499.99 @ Best Buy & Amazon', 1499.99),
+        ("Zotac RTX 5080 Solid OC - Open Box w/2-year warranty - $1124.99 + FS", 1124.99),
+        ('LG Partner Store: 77" LG C6H OLED 4K TV + $300 Rinse Credit - $1619.99', 1619.99),
+        ('YMMV: Dell 32 Plus 32" 4K 120Hz QD-OLED S3225QC -$559.99 @ Amazon', 559.99),
+        ("[S&S] SPAM 25% Less Sodium Canned Meat, 12 Pack, 12-Oz -$27.07 @Amazon", 27.07),
+        ("CyberPowerPC Gaming PC, RTX 5090 32GB, 32GB DDR5, 2TB SSD, SLC8400WST - $4299", 4299.0),
+        # A minus right after another amount is still a discount, not the price.
+        ("MSI RTX 4090 Suprim $1,099.99 -$100 w/ code", 1099.99),
+        ("Insoles $26.98 - $18.49 off", 26.98),
+    ],
+)
+def test_extract_price_dash_separated_titles(title: str, expected: float) -> None:
+    assert extract_price(title) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # data-store-slug values observed live (hyphenated multi-word slugs).
+        ("bh-photo-video", "B&H Photo"),
+        ("micro-center", "Micro Center"),
+        ("the-home-depot", "Home Depot"),
+        ("costco-wholesale", "Costco"),
+        ("hp-small-medium-business", "HP"),
+        ("dicks-sporting-goods", "Dick's Sporting Goods"),
+        ("origin-pc", "Origin PC"),
+        ("ace-hardware", "Ace Hardware"),
+        # Third-party sellers on a marketplace: the marketplace is the store.
+        ("WBHzhixin via Amazon", "Amazon"),
+        ("Gamechest via Walmart", "Walmart"),
+        ("adidas via eBay", "eBay"),
+    ],
+)
+def test_normalize_store_live_slugs_and_via_sellers(raw: str, expected: str) -> None:
+    assert normalize_store(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("title", "body_text", "price", "expected"),
+    [
+        ("Insoles $8.50", "Shipping is free with Prime or on $35+ orders.", 8.5, None),
+        ("Blender $59.84", "Shipping is free with Prime or on $35+ orders.", 59.84, 0.0),
+        ("28L DSG Sport Backpack (White) $8.97 + Free Shipping on $49+", "", 8.97, None),
+        ("Rugged Shark Clog Sandals $2.65 + Free Shipping w/ Walmart+ or on $35+", "", 2.65, None),
+        ("Fiskars Scissors $10.36 + Free Shipping w/ Prime or on $35+", "", 10.36, None),
+        ("LG C5 OLED $1,499.99 + Free Shipping w/ Prime or on $35+", "", 1499.99, 0.0),
+        ("Atkins Protein Bars $3.90 + Free S&H w/ Prime", "", 3.9, 0.0),
+    ],
+)
+def test_extract_shipping_threshold_phrases(title: str, body_text: str, price: float, expected: float | None) -> None:
+    assert extract_shipping(title, body_text, price) == expected
+
+
+def test_extract_outbound_url_asin_only_for_amazon_retailer() -> None:
+    body = (
+        '<a href="https://slickdeals.net/click?lno=1" data-store-slug="best-buy" data-product-exitWebsite="bestbuy.com">Best Buy</a> '
+        '<a href="https://slickdeals.net/click?lno=2" data-store-slug="amazon" data-aps-asin="B0GRK5D3RW">Amazon</a>'
+    )
+    assert extract_outbound_url(body) == "https://www.amazon.com/dp/B0GRK5D3RW"  # no retailer known: keep
+    assert extract_outbound_url(body, retailer="Amazon") == "https://www.amazon.com/dp/B0GRK5D3RW"
+    assert extract_outbound_url(body, retailer="Best Buy") is None
+
+
+def test_regexes_stay_linear_on_pathological_bodies() -> None:
+    # Unbounded ".*?" spans used to make these quadratic: ~15 s for 300 KB of anchors.
+    anchors = '<a href="x">Store</a> <span class="e">' * 8000
+    started = time.perf_counter()
+    assert extract_retailer("Thing $5", anchors) is None
+    assert html_to_text("<script>" * 20000 + "tail") == ""
+    assert extract_list_price("Thing $5", "", "<s>" * 20000, 5.0) is None
+    assert time.perf_counter() - started < 2.0
+
+
+def _fixed_clock(start: float = 1000.0) -> tuple[list[float], Callable[[], float]]:
+    now = [start]
+    return now, lambda: now[0]
+
+
+def test_feed_interval_seconds_is_honoured(app_config: AppConfig) -> None:
+    ctx = IngestorContext(http=None, metrics=Metrics(), config=app_config, node_id="test")  # type: ignore[arg-type]
+    cfg = SlickdealsSource(
+        enabled=True,
+        poll_interval_seconds=30,
+        search_feeds_from_profiles=False,
+        feeds=[
+            FeedSpec(name="hot_deals_forum", url="https://slickdeals.net/newsearch.php?searchin=first&forumchoice%5B%5D=9&rss=1"),
+            FeedSpec(name="frontpage", url="https://slickdeals.net/newsearch.php?mode=frontpage&rss=1", interval_seconds=180),
+            FeedSpec(name="popular", url="https://slickdeals.net/newsearch.php?mode=popdeals&rss=1", interval_seconds=300),
+        ],
+    )
+    ingestor = SlickdealsIngestor(cfg, ctx)
+    now, ingestor.clock = _fixed_clock()
+
+    def names() -> list[str]:
+        return [f.name for f in ingestor.feeds_for_poll()]
+
+    assert names() == ["hot_deals_forum", "frontpage", "popular"]  # everything is due at start
+    schedule: list[list[str]] = []
+    for _ in range(12):  # 12 polls, 30 s apart
+        now[0] += 30
+        schedule.append(names())
+    assert all(polled[0] == "hot_deals_forum" for polled in schedule)
+    assert sum("frontpage" in polled for polled in schedule) == 2  # t=180, 360
+    assert sum("popular" in polled for polled in schedule) == 1  # t=300
+    assert "frontpage" in schedule[5] and "popular" in schedule[9]
+
+
+async def test_poll_skips_feeds_that_are_not_due(upstream: FakeSlickdeals, http: HttpClient, app_config: AppConfig) -> None:
+    upstream.responses.update({"frontpage": rss("frontpage.xml"), "forum": rss("hot_deals_forum.xml")})
+    ingestor = make_ingestor(upstream, http, app_config, feeds=[])
+    ingestor.static_feeds = [
+        FeedTarget(name="hot_deals_forum", url=upstream.forum_url()),
+        FeedTarget(name="frontpage", url=upstream.frontpage_url(), interval_seconds=180),
+    ]
+    now, ingestor.clock = _fixed_clock()
+    assert len(await ingestor.poll()) == 7
+    now[0] += 30
+    second = await ingestor.poll()
+    assert {raw.source_id for raw in second} == {"20105590", "20105512", "20105477", "20104987", "20105488"}
+    assert upstream.keys() == ["forum", "frontpage", "forum"] or sorted(upstream.keys()) == ["forum", "forum", "frontpage"]
+
+
+async def test_poll_with_nothing_due_is_a_quiet_success(app_config: AppConfig) -> None:
+    ctx = IngestorContext(http=None, metrics=Metrics(), config=app_config, node_id="test")  # type: ignore[arg-type]
+    cfg = SlickdealsSource(
+        enabled=True,
+        search_feeds_from_profiles=False,
+        feeds=[FeedSpec(name="frontpage", url="https://slickdeals.net/newsearch.php?mode=frontpage&rss=1", interval_seconds=180)],
+    )
+    ingestor = SlickdealsIngestor(cfg, ctx)
+    now, ingestor.clock = _fixed_clock()
+    ingestor.feeds_for_poll()  # consumes the frontpage slot
+    now[0] += 30
+    assert await ingestor.poll() == []
+    assert ingestor._warned_no_feeds is False  # not the "no feeds configured" warning
+
+
+async def test_block_burns_the_browser_identity(upstream: FakeSlickdeals, http: HttpClient, app_config: AppConfig) -> None:
+    upstream.responses.update({"frontpage": challenge(403), "forum": challenge(200)})
+    burned: list[str] = []
+    http.identities.burn = burned.append  # type: ignore[method-assign]
+    ingestor = make_ingestor(upstream, http, app_config)
+    with pytest.raises(SourceBlocked):
+        await ingestor.poll()
+    host = upstream.base.split("://", 1)[1].split(":", 1)[0]
+    assert burned == [host, host]
+
+
+async def test_poll_cancellation_propagates(upstream: FakeSlickdeals, http: HttpClient, app_config: AppConfig) -> None:
+    arrived = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(request: web.Request) -> web.Response:
+        arrived.set()
+        await release.wait()
+        return web.Response(body=fixture_bytes("frontpage.xml"), headers=RSS_HEADERS)
+
+    upstream_app_handler = upstream.handle
+
+    async def handle(request: web.Request) -> web.Response:
+        if FakeSlickdeals.feed_key(request) == "frontpage":
+            return await slow(request)
+        return await upstream_app_handler(request)
+
+    upstream.handle = handle  # type: ignore[method-assign]
+    ingestor = make_ingestor(upstream, http, app_config, feeds=["frontpage"])
+    task = asyncio.create_task(ingestor.poll())
+    await asyncio.wait_for(arrived.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()

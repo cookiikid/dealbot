@@ -50,10 +50,11 @@ term) pairs, or the number of ``sources.ebay.queries``)::
     allowed_polls_per_day  = daily_call_budget * budget_safety_factor / Q
     interval               = max(poll_interval_seconds, 86_400 / allowed_polls_per_day)  ± jitter_pct
 
-Example: the shipped config has 21 (profile, term) pairs, so 5000 x 0.85 / 21 = 202
-polls/day, or one poll every ~427 s. Faster detection on eBay needs fewer, broader
-queries (eBay's ``(a, b)`` OR-syntax in ``q``) or a quota increase through eBay's
-free Application Growth Check.
+Example: one search per profile term of the shipped profiles would be 21 calls, so
+5000 x 0.85 / 21 = 202 polls/day, or one poll every ~427 s. The shipped config
+instead coalesces them into 9 ``sources.ebay.queries`` with eBay's ``(a, b)``
+OR-syntax: 472 polls/day, one every ~183 s. Going faster needs even broader queries
+or a quota increase through eBay's free Application Growth Check.
 
 A daily **ledger** (kept in Redis when ``storage.redis_url`` is set, so every node and
 restart counts against the same total) checks the plan against what was actually
