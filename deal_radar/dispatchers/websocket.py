@@ -113,7 +113,7 @@ class WebSocketHub(Dispatcher):
 
     def attach(self, app: web.Application) -> None:
         """Register ``GET cfg.path`` and a shutdown hook on the ops server app."""
-        app.router.add_get(self.cfg.path, self.handle)
+        app.router.add_get(self.cfg.path, self.handle, allow_head=False)
         app.on_shutdown.append(self._on_shutdown)
 
     @property
@@ -322,7 +322,10 @@ class WebSocketHub(Dispatcher):
         self._recent.append(body)
         delivered, dropped = await self._broadcast(_frame("alert", body), "alert")
         if dropped:
-            log.debug("websocket broadcast dropped clients", extra={"alert_id": alert.alert_id, "delivered": delivered, "dropped": dropped})
+            log.debug(
+                "websocket broadcast dropped clients",
+                extra={"alert_id": alert.alert_id, "delivered": delivered, "dropped": dropped},
+            )
         return DispatchResult(
             target=self.target,
             ok=True,

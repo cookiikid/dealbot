@@ -97,6 +97,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import aiohttp
 from PIL import Image, ImageOps
@@ -190,6 +191,16 @@ BREAKER_RECOVERY_SECONDS = 30.0
 BREAKER_MAX_SECONDS = 300.0
 COLD_LOAD_LOG_MS = 1000.0
 
+# Failures of the health / warmup probes (never raised to the caller).
+_PROBE_ERRORS: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    HttpStatusError,
+    RetryExhausted,
+    ResponseTooLarge,
+    aiohttp.ClientError,
+    OSError,
+    ValueError,
+)
 _GENERIC_BINARY_TYPES = frozenset({"", "application/octet-stream", "binary/octet-stream", "application/binary"})
 _NON_RASTER_IMAGE_TYPES = frozenset({"image/svg+xml"})
 
@@ -544,7 +555,7 @@ class ImageAnswer:
     parse_error: str | None = None
 
     @classmethod
-    def from_fields(cls, url: str, model: str, fields: Mapping[str, Any], **extra: Any) -> "ImageAnswer":
+    def from_fields(cls, url: str, model: str, fields: Mapping[str, Any], **extra: Any) -> ImageAnswer:
         verdict, confidence = verdict_for(fields)
         return cls(
             url=url,
@@ -570,7 +581,7 @@ class ImageAnswer:
         }
 
     @classmethod
-    def from_cache(cls, url: str, model: str, data: Any) -> "ImageAnswer | None":
+    def from_cache(cls, url: str, model: str, data: Any) -> ImageAnswer | None:
         if not isinstance(data, Mapping):
             return None
         try:
@@ -720,6 +731,34 @@ def prepare_image(data: bytes, *, max_side: int, quality: int) -> PreparedImage:
     )
 
 
+def _site(host: str) -> str:
+    """Approximate registrable domain (last two labels) for Sec-Fetch-Site."""
+    labels = [part for part in host.lower().split(".") if part]
+    return ".".join(labels[-2:])
+
+
+def image_request_headers(image_url: str, page_url: str | None) -> dict[str, str]:
+    """Headers a browser sends when a listing page loads one of its photos via ``<img>``.
+
+    Combined with ``fetch_mode="no-cors"`` (which drops the navigation-only headers),
+    this mirrors a real subresource load: ``Sec-Fetch-Dest: image``, the
+    same-site/cross-site relation to the listing page and an origin-only ``Referer``
+    (the default ``strict-origin-when-cross-origin`` policy).
+    """
+    image_host = urlsplit(image_url).hostname or ""
+    page = urlsplit(page_url) if page_url else None
+    page_host = page.hostname if page is not None else None
+    if not page_host or page is None or page.scheme not in ("http", "https"):
+        return {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "cross-site"}
+    if page_host == image_host:
+        relation = "same-origin"
+    elif _site(page_host) == _site(image_host):
+        relation = "same-site"
+    else:
+        relation = "cross-site"
+    return {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": relation, "Referer": f"{page.scheme}://{page.netloc}/"}
+
+
 def candidate_urls(urls: Sequence[str]) -> list[str]:
     """Unique http(s) image URLs in listing order."""
     seen: set[str] = set()
@@ -854,7 +893,7 @@ class VisionFilter:
         http: HttpClient,
         *,
         metrics: Metrics | None = None,
-        redis: "Redis | None" = None,
+        redis: Redis | None = None,
         breaker: CircuitBreaker | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -940,7 +979,7 @@ class VisionFilter:
             )
         except asyncio.CancelledError:
             raise
-        except (HttpStatusError, RetryExhausted, ResponseTooLarge, asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+        except _PROBE_ERRORS as exc:
             log.warning("vision backend unreachable", extra={"url": self._models_url, "error": _short(repr(exc))})
             return False
         names = _model_names(resp.data)
@@ -979,7 +1018,7 @@ class VisionFilter:
                 )
             except asyncio.CancelledError:
                 raise
-            except (HttpStatusError, RetryExhausted, ResponseTooLarge, asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+            except _PROBE_ERRORS as exc:
                 log.warning("vision warmup failed", extra={"vision_model": model, "error": _short(repr(exc))})
                 ok = False
         return ok
@@ -1002,7 +1041,7 @@ class VisionFilter:
             return self._result(VisionVerdict.SKIPPED, started, error="no images")
 
         prompt = build_prompt(profile)
-        images = _ImageStore(self._fetch_image)
+        images = _ImageStore(lambda url: self._fetch_image(url, item.url))
         primary = await self._run_pass(
             cfg.model, profile, prompt, urls[: cfg.max_images + EXTRA_IMAGE_CANDIDATES], images, want=cfg.max_images
         )
@@ -1066,7 +1105,7 @@ class VisionFilter:
         while queue and len(result.answers) < want and not result.errors:
             batch, queue = queue[: want - len(result.answers)], queue[want - len(result.answers) :]
             outcomes = await asyncio.gather(*(self._answer(model, profile, prompt, url, images) for url in batch))
-            for url, outcome in zip(batch, outcomes):
+            for url, outcome in zip(batch, outcomes, strict=True):
                 if isinstance(outcome, ImageAnswer):
                     result.answers.append(outcome)
                 elif isinstance(outcome, _Skip):
@@ -1098,13 +1137,15 @@ class VisionFilter:
             await self._cache_put(key, answer)
         return answer
 
-    async def _fetch_image(self, url: str) -> PreparedImage:
+    async def _fetch_image(self, url: str, page_url: str | None = None) -> PreparedImage:
         cfg = self.cfg
         try:
             resp = await self.http.get_bytes(
                 url,
                 max_bytes=cfg.max_image_bytes,
                 browser_identity=True,
+                fetch_mode="no-cors",  # an <img> subresource load, not a navigation
+                headers=image_request_headers(url, page_url),
                 accept=IMAGE_ACCEPT,
                 policy=IMAGE_FETCH_POLICY,
                 timeout=IMAGE_FETCH_TIMEOUT_SECONDS,
@@ -1117,7 +1158,7 @@ class VisionFilter:
         except HttpStatusError as exc:
             self._m_images.inc(outcome="http_error")
             raise ImageRejected(f"http_{exc.status}", _short(exc.body)) from exc
-        except (RetryExhausted, asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+        except (TimeoutError, RetryExhausted, aiohttp.ClientError, OSError, ValueError) as exc:
             self._m_images.inc(outcome="fetch_error")
             raise ImageRejected("fetch_error", f"{type(exc).__name__}: {_short(exc)}") from exc
         content_type = str(resp.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
@@ -1250,7 +1291,7 @@ class VisionFilter:
                     self.breaker.record_failure()  # never leave a half-open trial dangling
                     self._sync_circuit()
                 raise
-            except asyncio.TimeoutError as exc:  # before OSError: TimeoutError subclasses it
+            except TimeoutError as exc:  # before OSError: TimeoutError subclasses it
                 raise self._fail(model, "timeout", f"timeout after {cfg.timeout_seconds:g}s", started) from exc
             except HttpStatusError as exc:
                 raise self._fail(model, "http_error", f"HTTP {exc.status}: {_short(exc.body)}", started) from exc
@@ -1300,7 +1341,10 @@ class VisionFilter:
             if is_open:
                 log.warning(
                     "vision circuit opened",
-                    extra={"retry_in_s": round(self.breaker.seconds_until_retry(), 1), "failures": self.breaker.consecutive_failures},
+                    extra={
+                        "retry_in_s": round(self.breaker.seconds_until_retry(), 1),
+                        "failures": self.breaker.consecutive_failures,
+                    },
                 )
             elif state == CircuitBreaker.CLOSED:
                 log.info("vision circuit closed")
@@ -1309,7 +1353,7 @@ class VisionFilter:
     # ------------------------------------------------------------------ cache
 
     def _cache_key(self, model: str, profile_id: str, url: str) -> str:
-        return hashlib.sha1(f"{PROMPT_VERSION}\x1f{model}\x1f{profile_id}\x1f{url}".encode("utf-8")).hexdigest()
+        return hashlib.sha1(f"{PROMPT_VERSION}\x1f{model}\x1f{profile_id}\x1f{url}".encode()).hexdigest()
 
     async def _cache_get(self, key: str, url: str, model: str) -> ImageAnswer | None:
         ttl = self.cfg.cache_ttl_seconds
@@ -1359,7 +1403,7 @@ class VisionFilter:
             return None
         except asyncio.CancelledError:
             raise
-        except (RedisError, asyncio.TimeoutError, OSError) as exc:
+        except (TimeoutError, RedisError, OSError) as exc:
             self._redis_retry_at = self._clock() + REDIS_BACKOFF_SECONDS
             self._m_cache.inc(layer="redis", result="error")
             log.warning("vision cache redis error; bypassing redis", extra={"op": op, "error": _short(repr(exc))})
@@ -1393,17 +1437,18 @@ class VisionFilter:
 
 __all__ = [
     "CATEGORY_VERDICTS",
+    "VISION_CATEGORIES",
+    "VISION_SCHEMA",
     "ImageAnswer",
     "ImageRejected",
     "PreparedImage",
-    "VISION_CATEGORIES",
-    "VISION_SCHEMA",
     "VisionFilter",
     "aggregate_answers",
     "build_prompt",
     "candidate_urls",
     "coerce_confidence",
     "extract_json_object",
+    "image_request_headers",
     "interpret_answer",
     "normalize_category",
     "prepare_image",

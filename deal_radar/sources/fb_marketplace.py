@@ -74,7 +74,7 @@ from pydantic import ValidationError
 
 from deal_radar.config_schema import AppConfig, ConfigError, FbMarketplaceSource, GeoPin, load_config, load_dotenv
 from deal_radar.core.http import json_loads
-from deal_radar.core.logs import configure_logging, get_logger
+from deal_radar.core.logs import configure_logging
 from deal_radar.engine.types import Location, RawListing, SellerInfo, SourceKind
 from deal_radar.sources.base import BaseIngestor, IngestorContext, SourceAuthError, SourceBlocked, SourceError
 from deal_radar.sources.stealth import (
@@ -89,8 +89,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from playwright.async_api import Browser, BrowserContext, Page, Playwright, Response
 
     from deal_radar.config_schema import Profile
-
-log = get_logger("sources.fb_marketplace")
 
 FB_BASE_URL = "https://www.facebook.com"
 SOURCE_NAME = "fb_marketplace"
@@ -110,9 +108,13 @@ POLL_BUDGET_FRACTION = 0.8
 DEFAULT_QUERY_ESTIMATE_S = 12.0
 
 LOGIN_COMMAND = "python -m deal_radar.sources.fb_marketplace --config <config.yaml> --login"
+#: CLI: seconds to let Facebook finish setting cookies after login / page load.
+LOGIN_SETTLE_SECONDS = 3.0
+CHECK_SETTLE_SECONDS = 2.0
+#: CLI: seconds between cookie checks while waiting for the operator to log in.
+LOGIN_POLL_SECONDS = 2.0
 
 _ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
-_ITEM_HREF_RE = re.compile(r"/marketplace/item/(\d+)")
 _DECIMAL_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*$")
 _SOLD_TITLE_RE = re.compile(r"^\s*(?:\[\s*sold\s*\]|\(\s*sold\s*\)|sold\s*[-–—:!|]|sold\s*$)", re.IGNORECASE)
 _PRICE_LINE_RE = re.compile(
@@ -179,7 +181,6 @@ _DOM_CARDS_JS = """([selector, limit]) => {
     const img = a.querySelector('img');
     out.push({
       id: m[1],
-      href: a.href,
       lines: (a.innerText || '').split('\\n').map((s) => s.trim()).filter(Boolean),
       img: img ? (img.currentSrc || img.src || null) : null,
       alt: img ? (img.getAttribute('alt') || null) : null,
@@ -714,7 +715,9 @@ class FbMarketplaceIngestor(BaseIngestor):
         self._pending: set[asyncio.Task[None]] = set()
         self._cursor = 0
         self._query_estimate_s = DEFAULT_QUERY_ESTIMATE_S
-        self._polled_ok = False
+        # True once a poll succeeded, False again after a wall: only a session that
+        # demonstrably works is written back over the saved one.
+        self._session_ok = False
         m = ctx.metrics
         self._m_payloads = m.counter("fb_payloads_total", "Facebook JSON payloads captured", ("kind",))
         self._m_skipped = m.counter("fb_listings_skipped_total", "Facebook listing nodes skipped", ("reason",))
@@ -781,7 +784,7 @@ class FbMarketplaceIngestor(BaseIngestor):
     async def teardown(self) -> None:
         """Save cookies (if the session worked) and close everything; safe after a failed setup."""
         try:
-            if self._context is not None and self._polled_ok and not self._needs_restart:
+            if self._context is not None and self._session_ok and not self._needs_restart:
                 await self._save_state()
         finally:
             await self._close_browser()
@@ -848,9 +851,9 @@ class FbMarketplaceIngestor(BaseIngestor):
         jobs = self._jobs()
         if not jobs:
             return []
-        page = await self._ensure_page()
         loop = asyncio.get_running_loop()
-        started = loop.time()
+        started = loop.time()  # browser (re)start time counts against the budget too
+        page = await self._ensure_page()
         budget = self.cfg.poll_timeout_seconds * POLL_BUDGET_FRACTION
         browser_cfg = self.cfg.browser
         between = (browser_cfg.min_action_delay_seconds * 2.0, browser_cfg.max_action_delay_seconds * 2.0)
@@ -897,7 +900,7 @@ class FbMarketplaceIngestor(BaseIngestor):
                     results.append(raw)
         if completed == 0 and failed:
             raise SourceError(f"all {failed} Facebook searches failed: {last_error}") from last_error
-        self._polled_ok = True
+        self._session_ok = True
         await self._save_state()
         return results
 
@@ -981,6 +984,7 @@ class FbMarketplaceIngestor(BaseIngestor):
             reason = "rate_limited"
         if reason is None:
             return
+        self._session_ok = False
         self._m_blocks.inc(reason=reason)
         where = urlsplit(page.url).path or "/"
         raise SourceBlocked(
@@ -1054,6 +1058,10 @@ def _cli_source(config: AppConfig) -> tuple[FbMarketplaceSource, GeoPin]:
     return cfg, cfg.location
 
 
+def _duration(seconds: float) -> str:
+    return f"{seconds / 60:.0f} minutes" if seconds >= 90 else f"{seconds:.0f} seconds"
+
+
 async def _page_probe(page: "Page") -> dict[str, Any]:
     try:
         probe = await page.evaluate(_PROBE_JS)
@@ -1062,12 +1070,26 @@ async def _page_probe(page: "Page") -> dict[str, Any]:
     return probe if isinstance(probe, dict) else {}
 
 
-async def run_login(config: AppConfig, *, timeout_seconds: float = 600.0, base_url: str = FB_BASE_URL) -> int:
-    """Open a headed browser on the login page and save the session once the operator is in."""
+async def run_login(
+    config: AppConfig,
+    *,
+    timeout_seconds: float = 600.0,
+    base_url: str = FB_BASE_URL,
+    headless: bool = False,
+) -> int:
+    """Open a browser window on the login page and save the session once the operator is in.
+
+    The operator types their own credentials and completes any 2FA/security check in
+    the window; this function only watches for the session cookies and for the page to
+    leave the login/checkpoint flow. The window uses the same device identity
+    (:func:`new_stealth_context`) the collector will use, so the session's cookies are
+    issued to the fingerprint that will later present them. ``headless`` exists for
+    tests only.
+    """
     from playwright.async_api import async_playwright
 
     cfg, geo = _cli_source(config)
-    browser_cfg = cfg.browser.model_copy(update={"headless": False})
+    browser_cfg = cfg.browser.model_copy(update={"headless": headless})
     state_path = Path(browser_cfg.storage_state_path).expanduser()
     async with async_playwright() as playwright:
         try:
@@ -1081,7 +1103,7 @@ async def run_login(config: AppConfig, *, timeout_seconds: float = 600.0, base_u
             print(
                 "A browser window is open on facebook.com/login.\n"
                 "Log in with YOUR account (complete any 2FA / security check in the window).\n"
-                f"Waiting up to {timeout_seconds / 60:.0f} minutes; the session is saved automatically."
+                f"Waiting up to {_duration(timeout_seconds)}; the session is saved automatically."
             )
             deadline = time.monotonic() + timeout_seconds
             logged_in = False
@@ -1089,18 +1111,18 @@ async def run_login(config: AppConfig, *, timeout_seconds: float = 600.0, base_u
                 if page.is_closed():
                     print("The browser window was closed before the login finished.")
                     return 1
-                cookies = await context.cookies(base_url)
+                cookies = await context.cookies()
                 if has_session_cookie(cookies) and detect_block(page.url) not in ("checkpoint", "login_required"):
                     logged_in = True
                     break
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(LOGIN_POLL_SECONDS)
             if not logged_in:
                 print("Timed out waiting for the login; nothing was saved.")
                 return 1
-            await asyncio.sleep(3.0)  # let Facebook finish setting the remaining session cookies
+            await asyncio.sleep(LOGIN_SETTLE_SECONDS)  # let Facebook finish setting the remaining cookies
             with contextlib.suppress(PlaywrightError):
                 await page.goto(f"{base_url}/marketplace/", wait_until="domcontentloaded")
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(CHECK_SETTLE_SECONDS)
             saved = await save_storage_state(context, state_path)
             print(f"Logged in. Session saved to {saved} (permissions 0600). Keep this file private.")
             return 0
@@ -1135,7 +1157,7 @@ async def run_check(config: AppConfig, *, base_url: str = FB_BASE_URL) -> int:
         try:
             page = await context.new_page()
             await page.goto(f"{base_url}/marketplace/", wait_until="domcontentloaded")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(CHECK_SETTLE_SECONDS)
             probe = await _page_probe(page)
             reason = detect_block(
                 page.url,
@@ -1143,7 +1165,7 @@ async def run_check(config: AppConfig, *, base_url: str = FB_BASE_URL) -> int:
                 text=str(probe.get("text") or ""),
                 has_login_form=bool(probe.get("loginForm")),
             )
-            cookies = await context.cookies(base_url)
+            cookies = await context.cookies()
             if reason is None and has_session_cookie(cookies):
                 await save_storage_state(context, state_path)
                 print(f"Logged in: Marketplace loaded at {urlsplit(page.url).path}. Session refreshed in {state_path}.")

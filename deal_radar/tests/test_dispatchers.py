@@ -139,7 +139,10 @@ def make_alert(
         severity=severity,
         score=score,
         vision=vision,
-        dedup=DedupDecision(status=DedupStatus.PRICE_DROP if update else DedupStatus.NEW, previous_price=1199.0 if update else None),
+        dedup=DedupDecision(
+            status=DedupStatus.PRICE_DROP if update else DedupStatus.NEW,
+            previous_price=1199.0 if update else None,
+        ),
         created_at=T0,
         pipeline_ms=11.7,
         ingest_lag_ms=4200.0,
@@ -443,7 +446,8 @@ async def test_discord_429_beyond_budget_fails_fast_and_blocks_webhook(discord_a
 
 
 async def test_discord_bucket_exhausted_headers_delay_next_send(discord_api: FakeAPI, http: HttpClient) -> None:
-    discord_api.queue(200, {"id": "1"}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset-After": "0.3", "X-RateLimit-Limit": "5"})
+    exhausted = {"X-RateLimit-Limit": "5", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset-After": "0.3"}
+    discord_api.queue(200, {"id": "1"}, exhausted)
     dispatcher = DiscordDispatcher("gpu", _discord_cfg(discord_api), http, timeout=3.0)
     assert (await dispatcher.send(make_alert())).ok
     second = await dispatcher.send(make_alert())
@@ -559,7 +563,7 @@ def test_telegram_message_html_escaping() -> None:
     assert_wellformed(msg)
     first_line = msg.split("\n", 1)[0]
     assert first_line.startswith("<b>") and first_line.endswith("</b>")
-    assert "&lt;Super&gt; &amp; \"Ti\" &lt;script&gt;alert(1)&lt;/script&gt; 5 &gt; 4" in first_line
+    assert '&lt;Super&gt; &amp; "Ti" &lt;script&gt;alert(1)&lt;/script&gt; 5 &gt; 4' in first_line
     assert "<script>" not in msg
     assert "<b>Seller:</b> &lt;b&gt;bob&lt;/b&gt; &amp; co (3)" in msg
     assert "⚠️ <b>Risk:</b> payment_red_flag 0.40" in msg
@@ -603,7 +607,12 @@ def test_telegram_fit_escaped_and_plain_variant() -> None:
 
 
 def test_telegram_inline_keyboard_two_per_row() -> None:
-    item = make_item(source="slickdeals", source_kind=SourceKind.AGGREGATOR, outbound_url="https://www.bestbuy.com/site/1.p", url="https://slickdeals.net/f/1")
+    item = make_item(
+        source="slickdeals",
+        source_kind=SourceKind.AGGREGATOR,
+        outbound_url="https://www.bestbuy.com/site/1.p",
+        url="https://slickdeals.net/f/1",
+    )
     alert = make_alert(item)
     keyboard = build_inline_keyboard(alert)
     assert [len(row) for row in keyboard] == [2, 2]
@@ -627,7 +636,9 @@ def test_telegram_silent_logic() -> None:
 # --------------------------------------------------------------------------- Telegram: delivery
 
 
-def _telegram(fake: FakeAPI | None, http: HttpClient, *, timeout: float = 3.0, token: str | None = TELEGRAM_TOKEN, **chat: Any) -> TelegramDispatcher:
+def _telegram(
+    fake: FakeAPI | None, http: HttpClient, *, timeout: float = 3.0, token: str | None = TELEGRAM_TOKEN, **chat: Any
+) -> TelegramDispatcher:
     data: dict[str, Any] = {"chat_id": "-100123"}
     data.update(chat)
     api_base = fake.url("/") if fake else f"http://127.0.0.1:{_free_port()}"
@@ -655,7 +666,8 @@ async def test_telegram_send_photo_with_caption(telegram_api: FakeAPI, http: Htt
 
 
 async def test_telegram_photo_400_falls_back_to_send_message(telegram_api: FakeAPI, http: HttpClient) -> None:
-    telegram_api.queue(400, {"ok": False, "error_code": 400, "description": "Bad Request: wrong file identifier/HTTP URL specified"})
+    bad_photo = "Bad Request: wrong file identifier/HTTP URL specified"
+    telegram_api.queue(400, {"ok": False, "error_code": 400, "description": bad_photo})
     dispatcher = _telegram(telegram_api, http)
     alert = make_alert(severity=Severity.CRITICAL)
     result = await dispatcher.send(alert)
@@ -701,7 +713,8 @@ async def test_telegram_429_retry_after_then_success(telegram_api: FakeAPI, http
 
 async def test_telegram_429_beyond_budget_fails_fast(telegram_api: FakeAPI, http: HttpClient) -> None:
     telegram_api.queue(
-        429, {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 40", "parameters": {"retry_after": 40}}
+        429,
+        {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 40", "parameters": {"retry_after": 40}},
     )
     dispatcher = _telegram(telegram_api, http, timeout=1.0, send_photos=False)
     started = time.monotonic()
@@ -712,7 +725,8 @@ async def test_telegram_429_beyond_budget_fails_fast(telegram_api: FakeAPI, http
 
 
 async def test_telegram_parse_error_falls_back_to_plain_text(telegram_api: FakeAPI, http: HttpClient) -> None:
-    telegram_api.queue(400, {"ok": False, "error_code": 400, "description": "Bad Request: can't parse entities: unsupported start tag"})
+    parse_error = "Bad Request: can't parse entities: unsupported start tag at byte offset 12"
+    telegram_api.queue(400, {"ok": False, "error_code": 400, "description": parse_error})
     dispatcher = _telegram(telegram_api, http, send_photos=False)
     alert = make_alert()
     result = await dispatcher.send(alert)
@@ -742,7 +756,12 @@ async def test_telegram_follows_supergroup_migration(telegram_api: FakeAPI, http
 
 @pytest.mark.parametrize(
     ("status", "description"),
-    [(401, "Unauthorized"), (403, "Forbidden: bot was blocked by the user"), (404, "Not Found"), (400, "Bad Request: chat not found")],
+    [
+        (401, "Unauthorized"),
+        (403, "Forbidden: bot was blocked by the user"),
+        (404, "Not Found"),
+        (400, "Bad Request: chat not found"),
+    ],
 )
 async def test_telegram_dead_target_disabled(telegram_api: FakeAPI, http: HttpClient, status: int, description: str) -> None:
     telegram_api.queue(status, {"ok": False, "error_code": status, "description": description})

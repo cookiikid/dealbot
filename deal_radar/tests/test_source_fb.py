@@ -968,3 +968,97 @@ def test_cli_check_without_session_file(tmp_path: Path, monkeypatch: pytest.Monk
 
     with pytest.raises(SystemExit):
         fb.main(["--config", str(config_path)])  # --login or --check is required
+
+
+class FakeFacebookAuth:
+    """Local stand-in for the login page / marketplace landing used by the CLI flows."""
+
+    def __init__(self, *, login_redirects: bool, logged_in: bool) -> None:
+        self.login_redirects = login_redirects
+        self.logged_in = logged_in
+
+    def app(self) -> web.Application:
+        app = web.Application()
+        app.router.add_get("/login/", self.login)
+        app.router.add_get("/home/", self.home)
+        app.router.add_get("/marketplace/", self.marketplace)
+        return app
+
+    async def login(self, request: web.Request) -> web.Response:
+        # A logged-in browser is bounced away from /login/ once the operator finished.
+        script = "<script>setTimeout(() => { location.href = '/home/'; }, 150)</script>" if self.login_redirects else ""
+        form = "<form id='login_form'><input name='email'><input type='password' name='pass'></form>"
+        return web.Response(text=_HTML_HEAD + form + script + _HTML_TAIL, content_type="text/html")
+
+    async def home(self, request: web.Request) -> web.Response:
+        return web.Response(text=_HTML_HEAD + "<div role='main'>Feed</div>" + _HTML_TAIL, content_type="text/html")
+
+    async def marketplace(self, request: web.Request) -> web.Response:
+        if not self.logged_in:
+            raise web.HTTPFound("/login/?next=%2Fmarketplace%2F")
+        return web.Response(text=_HTML_HEAD + "<h1>Marketplace</h1>" + _HTML_TAIL, content_type="text/html")
+
+
+def _cli_config(tmp_path: Path, exe: str | None) -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "sources": {
+                "fb_marketplace": {
+                    "location": _geo().model_dump(),
+                    "browser": {"headless": True, "executable_path": exe, "storage_state_path": str(tmp_path / "cli_state.json")},
+                }
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize("finishes", [True, False])
+async def test_run_login_waits_for_session_and_saves_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], finishes: bool
+) -> None:
+    exe = await _require_chromium("full")
+    monkeypatch.setattr(fb, "LOGIN_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(fb, "CHECK_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(fb, "LOGIN_POLL_SECONDS", 0.1)
+    config = _cli_config(tmp_path, exe)
+    state_path = Path(config.sources.fb_marketplace.browser.storage_state_path)
+    _write_state(state_path)  # stands in for the cookies the operator's manual login produces
+    state_path.chmod(0o644)
+    auth = FakeFacebookAuth(login_redirects=finishes, logged_in=True)
+    server = TestServer(auth.app(), host="127.0.0.1")
+    await server.start_server()
+    try:
+        code = await fb.run_login(
+            config, timeout_seconds=10.0 if finishes else 0.5, base_url=str(server.make_url("/")).rstrip("/"), headless=True
+        )
+    finally:
+        await server.close()
+    out = capsys.readouterr().out
+    if finishes:
+        assert code == 0 and "Session saved" in out
+        assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+        assert fb.has_session_cookie(json.loads(state_path.read_text())["cookies"])
+    else:
+        assert code == 1 and "Timed out" in out
+        assert stat.S_IMODE(state_path.stat().st_mode) == 0o644  # untouched
+
+
+@pytest.mark.parametrize("logged_in", [True, False])
+async def test_run_check_reports_session_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], logged_in: bool
+) -> None:
+    exe = await _require_chromium("full")
+    monkeypatch.setattr(fb, "CHECK_SETTLE_SECONDS", 0.0)
+    config = _cli_config(tmp_path, exe)
+    _write_state(Path(config.sources.fb_marketplace.browser.storage_state_path))
+    server = TestServer(FakeFacebookAuth(login_redirects=False, logged_in=logged_in).app(), host="127.0.0.1")
+    await server.start_server()
+    try:
+        code = await fb.run_check(config, base_url=str(server.make_url("/")).rstrip("/"))
+    finally:
+        await server.close()
+    out = capsys.readouterr().out
+    if logged_in:
+        assert code == 0 and out.startswith("Logged in")
+    else:
+        assert code == 1 and "NOT logged in (login_required)" in out

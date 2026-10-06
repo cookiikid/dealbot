@@ -581,7 +581,13 @@ class DiscordDispatcher(Dispatcher):
 
         log.warning(
             "discord delivery failed",
-            extra={"target": self.target, "alert_id": alert_id, "status": status, "attempts": attempts, "error": self._redact(error or "")[:300]},
+            extra={
+                "target": self.target,
+                "alert_id": alert_id,
+                "status": status,
+                "attempts": attempts,
+                "error": self._redact(error or "")[:300],
+            },
         )
         return _result(False)
 

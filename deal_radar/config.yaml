@@ -219,131 +219,196 @@ sources:
 #                     by a negation term are ignored ("no cracks", "never mined")
 # -----------------------------------------------------------------------------
 filters:
-  negation_terms: ["no", "not", "never", "zero", "without", "nothing", "isn't", "wasn't", "free of", "none", "0"]
-  negation_window_words: 3
+  # Negation applies to `negatable` groups only: a match is ignored when one of these
+  # terms ends within the previous `negation_window_words` words of the same clause
+  # ("no dead pixels", "never been mined", "w/o burn-in", "isn't cracked"), or when
+  # the match is answered form-style ("Dead pixels: none"). Scope enders such as
+  # "box"/"returns" detach a negation from what follows ("no box cracked screen").
+  negation_terms: ["no", "not", "never", "zero", "without", "w/o", "nothing", "isn't", "wasn't", "hasn't",
+                   "haven't", "doesn't", "didn't", "free of", "none", "0", "non"]
+  negation_window_words: 4
   min_title_length: 6
   allowed_currencies: [USD]
+  # Groups run in this order; the first matching `reject` group wins.
+  # Matching is case-insensitive. Patterns are written so that every match starts
+  # with a literal word where possible: the filter derives literal "anchors" from
+  # them and skips groups whose anchors do not occur in the listing at all.
   rules:
     box_only:
       action: reject
       description: Packaging sold without the product (classic eBay/FB bait)
       patterns:
-        - '(?<!no\s)(?<!not\s)\bbox\s*(?:only|alone)\b'
-        - '\bempty\s+(?:retail\s+|original\s+)?box(?:es)?\b'
-        - '\b(?:just|only)\s+(?:the\s+)?(?:retail\s+|original\s+|empty\s+)?(?:box|packaging)\b(?!\s+(?:is|was|has)\b)'
-        - '\b(?:box|packaging)\s+(?:and|&|\+)\s+(?:packaging|manuals?|accessories|inserts?|foam)\s+only\b'
+        # "box only" / "box-only" - but not "no box only the card", "no original box only card"
+        - '(?<!\bno\s)(?<!\bnot\s)(?<!\bno\soriginal\s)(?<!\bno\sretail\s)\bbox[\s-]*(?:only|alone)\b'
+        - '\bempty\s+(?:retail\s+|original\s+|oem\s+)?box(?:es)?\b'
+        # "just the box" / "only the original box" (not "comes with just the box", "only the box is dented")
+        - '(?<!\bwith\s)(?<!\bincludes\s)(?<!\bincluding\s)\b(?:just|only)\s+(?:the\s+)?(?:retail\s+|original\s+|empty\s+)?(?:box|packaging)\b(?!\s+(?:is|was|has|and\s+(?:the\s+)?(?:card|gpu|tv|monitor)))'
+        - '\b(?:box|packaging)\s+(?:and|&|\+)\s+(?:packaging|manuals?|accessories|inserts?|foam|papers|paperwork)\s+only\b'
         - '\bpackaging\s+only\b'
-        - '\b(?:gpu|card|graphics\s+card|tv|monitor|item|unit)\s+(?:is\s+)?not\s+included\b'
-        - '\bno\s+(?:gpu|graphics\s+card|tv|monitor)\s+(?:is\s+)?included\b'
-        - '\bdoes\s+not\s+(?:include|come\s+with)\s+(?:the\s+|a\s+)?(?:gpu|card|graphics\s+card|tv|monitor)\b'
+        - '\b(?:box|packaging)\s+(?:for|of)\s+(?:an?\s+|the\s+)?(?:nvidia\s+|geforce\s+)?(?:rtx|gtx|lg\s+(?:oled|c[4-6]|g[4-6])|samsung\s+(?:s90|qn)|alienware|steam\s+deck|sony\s+a7)'
+        - '\b(?:gpu|card|graphics\s+card|tv|television|monitor|console|camera|item|unit)\s+(?:is\s+)?not\s+included\b'
+        - '\bno\s+(?:gpu|graphics\s+card|card|tv|television|monitor|camera|console)\s+(?:is\s+)?included\b'
+        - '\bdoes\s*(?:n[''’]?t|\s+not)\s+(?:include|come\s+with)\s+(?:the\s+|a\s+|an\s+)?(?:gpu|card|graphics\s+card|tv|television|monitor|camera|console)\b'
     photo_only:
       action: reject
       description: '"Picture of an RTX 4090" listings'
       patterns:
-        - '\b(?:photo|picture|image|pic|print|poster)\s+only\b'
-        - '\b(?:you\s+(?:are|will\s+be)\s+(?:buying|purchasing|receiving)|you\s+(?:will\s+)?(?:get|receive))\s+(?:a\s+|an\s+|the\s+)?(?:photo|picture|image|print|digital\s+(?:photo|image|file))\b'
-        - '\bthis\s+(?:listing\s+)?is\s+(?:for\s+)?(?:a\s+)?(?:photo|picture|image|print)\s+of\b'
-        - '\bnot\s+(?:an?\s+)?(?:actual|real|physical|working)\s+(?:gpu|graphics\s+card|card|item|product|tv|monitor)\b'
+        - '(?<!\bstock\s)(?<!\breference\s)(?<!\bexample\s)(?<!\bsample\s)\b(?:photo|picture|image|pic|print|poster|drawing|jpe?g|png)\s+only\b'
+        - '\b(?:you\s+(?:are|will\s+be|r)\s+(?:buying|purchasing|receiving|getting|bidding\s+on)|you\s+(?:will\s+)?(?:get|receive))\s+(?:a\s+|an\s+|the\s+|one\s+)?(?:photo|picture|image|print|poster|drawing|digital\s+(?:photo|image|file|download))\b'
+        - '\bthis\s+(?:listing\s+|auction\s+|sale\s+)?is\s+(?:for\s+)?(?:a\s+|an\s+|the\s+)?(?:photo|picture|image|print|poster|drawing)\s+of\b'
+        - '^\W*(?:an?\s+)?(?:photo|picture|image|drawing|painting|print|poster)\s+of\b'
+        - '\bnot\s+(?:an?\s+)?(?:actual|real|physical)\s+(?:gpu|graphics\s+card|card|item|product|tv|television|monitor|camera|console|deck)\b'
     damaged:
       action: reject
       negatable: true
       description: Broken / for-parts / non-functional items (not packaging damage)
       patterns:
         - '\bfor\s+parts\b'
-        - '\bparts\s+(?:only|or\s+repair)\b'
-        - '\b(?:broken|cracked|shattered|smashed|bricked|dead|defective|faulty|damaged|burnt|burned|melted)\b(?!\s+(?:box|packaging|seal|tape|bag|corner\s+of\s+(?:the\s+)?box))'
-        - '\bnot\s+(?:working|functional|functioning|turning\s+on|powering\s+on|posting|detected|recognized)\b'
-        - '\b(?:does|did|do)\s*(?:n[''’]?t|\s+not)\s+(?:work|power|post|turn\s+on|display|boot)\b'
-        - '\b(?:won[''’]?t|will\s+not|can[''’]?t|cannot)\s+(?:power|post|turn\s+on|boot|display)\b'
-        - '\bno\s+(?:display|signal|video\s+output|post)\b'
-        - '\b(?:vertical|horizontal)\s+lines?\b'
-        - '\bdead\s+pixels?\b'
-        - '\bburn[\s-]?in\b'
+        - '\bparts\s+(?:only|or\s+repair|/\s*repair|and\s+repair|unit)\b'
+        # damage words, unless they describe the box/packaging ("box is damaged", "cracked box", "broken seal")
+        - '(?<!\bbox\s)(?<!\bbox\sis\s)(?<!\bbox\swas\s)(?<!\bbox\sgot\s)(?<!\bbox\sslightly\s)(?<!\bbox\sis\sslightly\s)(?<!\bbox\sa\sbit\s)(?<!\bbox\sis\sa\sbit\s)(?<!\bbox\sis\sa\slittle\s)(?<!\bboxes\s)(?<!\bboxes\sare\s)(?<!\bpackaging\s)(?<!\bpackaging\sis\s)(?<!\bpackaging\swas\s)(?<!\bred\s)\b(?:broken|cracked|shattered|smashed|bricked|dead|defective|faulty|damaged|burnt|burned|melted|fried|busted)\b(?![\s-]+(?:box|boxes|packaging|retail\s+box|seal|tape|bag|shipping\s+box|corner\s+of\s+(?:the\s+)?box|island|space|redemption|cells|by\s+daylight))'
+        # explicit damaged parts (also catches "open box cracked screen")
+        - '\b(?:cracked|broken|shattered|smashed|damaged|dead|stuck|burnt|burned|melted|bent)\s+(?:screen|panel|display|lcd|glass|pcb|board|connector|power\s+connector|12vhpwr|pins?|port|fans?|chip|die|core|pixels?)\b'
+        - '\bnot\s+(?:working|functional|functioning|turning\s+on|powering\s+on|posting|booting|detected|recognized|recognised|displaying)\b'
+        - '\bnon[\s-]?(?:working|functional|functioning)\b'
+        - '\b(?:does|did|do)\s*(?:n[''’]?t|\s+not)\s+(?:work|post|boot|turn\s+on|power\s+on|power\s+up|power(?!\s+(?:off|down|cycle|throttle|limit))|display(?!\s+(?:any|artifacts?|lines?|issues?|problems?|signs?|dead|flicker\w*|burn)))\b'
+        - '\b(?:won[''’]?t|will\s+not|can[''’]?t|cannot|could\s*n[''’]?t|unable\s+to)\s+(?:power\s+on|power\s+up|post|turn\s+on|boot|display\s+(?:anything|an?\s+image|a\s+picture|video))\b'
+        - '\bno\s+(?:display|signal|video\s+(?:output|signal)|power|post)\b(?![\s-]+(?:issues?|problems?|defects?|artifacts?|dead|lines?|burn|scratch\w*|damage|marks?|flicker\w*|stuck|retention|cables?|cords?|adapters?|supply|brick|port|included))(?!-)'
+        - '\b(?:vertical|horizontal)\s+(?:lines?|bands?|stripes?)\b'
+        - '\blines?\s+(?:on|across|in)\s+(?:the\s+)?(?:screen|panel|display)\b'
+        - '\b(?:stuck|bright|hot)\s+pixels?\b'
+        - '\bburn(?:ed|t)?[\s-]?in\b(?![\s-]*(?:test|tested|testing|stress|period))'
+        - '\bscreen\s+burn\b'
         - '\bartifact(?:s|ing)\b'
-        - '\b(?:needs|need)\s+(?:repair|fixing|a\s+new\s+(?:panel|screen|board))\b'
-        - '\bwater\s+damage\b'
+        - '\b(?:needs?|requires?)\s+(?:a\s+)?(?:repair|fixing|fix|new\s+(?:panel|screen|board|fan|fans))\b'
+        - '\b(?:water|liquid|physical|screen|panel|pcb|board)\s+damage(?:d)?\b'
+        - '\bdamage\s+(?:to|on)\s+(?:the\s+)?(?:screen|panel|pcb|board|connector|card|display)\b'
+        - '\b(?:hairline\s+)?cracks?\s+(?:in|on|across)\s+(?:the\s+)?(?:screen|panel|display|pcb|board|glass|lcd)\b'
+        - '\bfans?\s+(?:not\s+spinning|(?:do|does|did)\s*(?:n[''’]?t|\s+not)\s+spin|won[''’]?t\s+spin|grinding|rattl\w+)\b'
+        - '\b(?:crash(?:es|ing)?|black\s+screens?)\s+(?:under|in|during|when)\s+(?:load|gaming|games?|benchmarks?)\b'
+        - '\b(?:overheats?|overheating)\b'
+    counterfeit:
+      action: reject
+      negatable: true
+      description: Fake / relabelled hardware
+      patterns:
+        - '\b(?:fake|counterfeit|clone|knock-?off|relabell?ed|re-?branded)\s+(?:nvidia\s+|geforce\s+)?(?:rtx|gtx|gpu|graphics\s+card|card|tv|monitor|camera)\b'
+        - '\b(?:rtx|gpu|card)\s+is\s+(?:a\s+)?(?:fake|counterfeit|clone|relabell?ed)\b'
     rental:
       action: reject
       description: GPU/compute rentals, hosting, mining contracts
       patterns:
-        - '\brent(?:al|als|ing)?\b'
-        - '\bfor\s+lease\b|\bleasing\b'
-        - '\$\s*\d+(?:[.,]\d+)?\s*(?:/|per\s+|a\s+)\s*(?:hr|hrs|hour|day|wk|week|mo|mon|month|yr|year)\b'
-        - '\b(?:cloud|remote|hosted|virtual)\s+(?:gpu|compute|server|access|instance)s?\b'
-        - '\bgpu\s+(?:hosting|cloud|server\s+access|time|hours)\b'
-        - '\bmining\s+(?:contract|hosting|pool\s+share)\b'
+        - '\brent(?:al|als|ing)\b'
+        - '^\W*rent\b'
+        - '\brent\s+(?:my|our|a|an|this|these|it|out|by|per|one|your|gpus?|cards?|rigs?|servers?|compute)\b'
+        # "for rent" - not "money for rent", "pay for rent"
+        - '(?<!\bmoney\s)(?<!\bcash\s)(?<!\bpay\s)(?<!\bpaying\s)\bfor\s+rent\b'
+        - '\bfor\s+lease\b|\bleasing\b|\blease\s+(?:my|a|an|this|it|out|per)\b'
+        - '\$\s*\d[\d,.]*\s*(?:/|per\s+|an?\s+)\s*(?:hr|hrs|hour|day|wk|week)\b'
+        # monthly prices are rentals unless they are financing offers ("$108/mo with Affirm")
+        - '\$\s*\d[\d,.]*\s*(?:/|per\s+|an?\s+)\s*(?:mo|month)\b(?![^\n.]{0,48}\b(?:financ\w*|affirm|klarna|afterpay|apr|installments?|payments?|months?|mos)\b)'
+        - '\b(?:per|by\s+the)\s+hour\b|\bhourly\s+(?:rate|rental|basis)\b'
+        - '\b(?:cloud|hosted)\s+(?:gpus?|compute|servers?|access|instances?)\b'
+        - '\b(?:remote|virtual|dedicated)\s+(?:gpus?|compute|gpu\s+servers?|instances?)\b'
+        - '\bgpu\s+(?:hosting|cloud|server\s+access|time|hours|rental|instances?)\b'
+        - '\b(?:mining|compute)\s+(?:contract|hosting|pool\s+share|rental)\b'
         - '\bhash\s*(?:rate|power)\s+(?:rental|contract|for\s+sale)\b'
         - '\b(?:vast\.ai|runpod|tensordock|lambda\s+labs?|salad\.com|paperspace)\b'
     wanted:
       action: reject
       field: title
-      description: Buy requests, not offers
+      description: Buy / trade requests, not offers
       patterns:
-        - '^\W*(?:wtb|iso|lf|lfm|looking\s+for|in\s+search\s+of|want(?:ed)?(?:\s+to\s+buy)?|buying|need)\b'
-        - '\b(?:wtb|iso)\b'
-        - '\bpaying\s+(?:top|cash|good)\b'
+        - '^\W*(?:wtb|wtt|iso|lf|lfm|looking\s+(?:for|to\s+buy)|in\s+search\s+of|searching\s+for|seeking|want(?:ed|ing)?\s+to\s+buy|wanted\b(?!\s+gone)|want\b(?!\s+(?:to\s+sell|gone|it\s+gone))|buying\b|need\b(?!\s+(?:gone|it\s+gone|cash|money|to\s+sell|sold)))'
+        - '\b(?:wtb|iso)\b(?!\s*:?\s*\d)'
+        - '\blooking\s+to\s+buy\b|\bpaying\s+(?:top|cash|good|fair)\b'
+        # r/hardwareswap: [H] money [W] item, or [W] a GPU
+        - '\[\s*h\s*\]\s*(?:pay\s*pal|paypal|cash|local\s+cash|venmo|zelle|money|\$)'
+        - '\[\s*w\s*\]\s*(?:an?\s+)?(?:nvidia\s+)?(?:rtx|gtx|geforce|rx|radeon|lg|oled|sony|steam\s+deck)\b'
     accessory:
       action: reject
       field: title
       description: Accessories/parts for the product rather than the product
       patterns:
-        - '\b(?:for|fits|compatible\s+with|designed\s+for)\s+(?:an?\s+|the\s+|your\s+)?(?:nvidia\s+|geforce\s+|asus\s+|msi\s+|gigabyte\s+|zotac\s+|lg\s+|samsung\s+|alienware\s+|sony\s+)?(?:rtx|gtx|rx|oled|c[1-6]|g[1-6]|aw\d|a7)'
-        - '\b(?:water\s*block|waterblock|backplate|shroud|heat\s*sink|cooler|fans?|bracket|riser|cables?|adapters?|thermal\s+pads?|stand|base|mount|remote|power\s+(?:supply|board)|psu|t-?con(?:\s+board)?|main\s*board|motherboard|screen\s+protector|case|battery|grip|charger)\s+(?:only|for)\b'
-        - '\b(?:replacement|spare)\s+(?:fans?|shroud|cooler|heat\s*sink|stand|remote|board|t-?con|power\s+board|main\s*board|panel|screen|lcd|battery|charger)\b'
-        - '\b(?:replica|dummy|mock[\s-]?up|prop|toy|keychain|sticker|decal|skin|poster|t-?shirt|mug|figurine|3d[\s-]?print(?:ed)?)\b'
+        - '\b(?:for|fits|compatible\s+with|designed\s+for|made\s+for)\s+(?:an?\s+|the\s+|your\s+)?(?:nvidia\s+|geforce\s+|asus\s+|msi\s+|gigabyte\s+|zotac\s+|evga\s+|pny\s+|lg\s+|samsung\s+|alienware\s+|dell\s+|sony\s+|valve\s+)?(?:rtx|gtx|rx\s*\d|oled|c[1-6]\b|g[1-6]\b|aw\d|a7|alpha\s*7|steam\s+deck|pg\d{2}|s9\d[df])'
+        - '\b(?:water\s*block|waterblock|backplate|back\s+plate|shroud|heat\s*sink|cooler|fans?|bracket|riser|cables?|adapters?|thermal\s+pads?|stand|base|mount|remote|power\s+(?:supply|board|cable)|psu|t-?con(?:\s+board)?|main\s*board|motherboard|screen\s+protector|case|skin|decal|sticker|battery|grip|charger|dock|lens\s+cap|body\s+cap)\s+(?:only|for)\b'
+        - '\b(?:replacement|spare)\s+(?:fans?|shroud|cooler|heat\s*sink|stand|remote|board|t-?con|power\s+board|main\s*board|panel|screen|lcd|battery|charger|backplate|bracket|cables?|joysticks?|thumbsticks?)\b'
+        - '\b(?:replica|dummy|mock[\s-]?up|prop|toy|keychain|key\s+chain|figurine|t-?shirt|mug|miniature|scale\s+model)\b'
+        # a title that ENDS with a part name and lists nothing else ("RTX 4090 FE shroud")
+        - '^(?!.*(?:\bwith\b|\bw/|\bincl|\band\b|\bplus\b|\binstalled\b|[+&,]))[^\n]*\b(?:shroud|backplate|back\s*plate|heat\s*sink|t-?con(?:\s+board)?|main\s*board|power\s+board)\W*$'
     sold_marker:
       action: reject
       field: title
       description: Listing already sold / pending
       patterns:
-        - '^\W*(?:sold|pending|on\s+hold|reserved)\b'
-        - '\b(?:sold|pending)\W*$'
-        - '\bno\s+longer\s+available\b'
+        - '^\W*(?:sold|pending|on\s+hold|reserved|closed)\b(?!\s+(?:as[\s-]?is|separately|by|with|in|on|to|out\s+(?:everywhere|at)))'
+        - '\b(?:sold|pending|closed)\W*$'
+        - '[\[(]\s*(?:sold|pending|closed|on\s+hold|reserved|sale\s+pending|spf)\s*[\])]'
+        - '\bno\s+longer\s+available\b|\bsale\s+pending\b'
     gift_card:
       action: reject
       field: title
+      description: Gift cards / coupons (not a bundled gift card promo)
       patterns:
-        - '\bgift\s*cards?\b'
-        - '\b(?:voucher|coupon|promo\s+code|e-?gift)\b'
+        - '^\W*(?:\$?\d[\d,.]*\s*(?:usd\s+)?)?(?:[\w&''-]+\s+){0,3}(?:e-?)?gift\s*cards?\b'
+        - '\bgift\s*cards?\s+(?:only|for\s+sale|code|balance)\b'
+        - '^\W*(?:\$?\d[\d,.]*\s*%?\s*(?:off\s+)?)?(?:[\w&''-]+\s+){0,2}(?:voucher|coupon|promo\s+code|discount\s+code|e-?gift)\b'
     payment_only_red_flag:
       action: risk
       probability: 0.6
       description: Irreversible payment demanded
       patterns:
-        - '\b(?:zelle|cash\s*app|cashapp|venmo(?:\s+friends(?:\s+and|\s*&)\s+family)?|wire(?:\s+transfer)?|western\s+union|moneygram|bitcoin|btc|crypto|usdt|gift\s*cards?|paypal\s+(?:friends|f&f|ff))\s+only\b'
-        - '\bonly\s+(?:accept(?:ing)?\s+)?(?:zelle|cash\s*app|venmo|wire|crypto|bitcoin|gift\s*cards?)\b'
-        - '\bpaypal\s+(?:friends\s+(?:and|&)\s+family|f&f|ff|g&s\s+not\s+accepted)\b'
+        - '\b(?:zelle|cash\s*app|cashapp|venmo(?:\s+(?:friends\s+(?:and|&)\s+family|f&f|ff))?|apple\s+pay|wire(?:\s+transfer)?|western\s+union|moneygram|bitcoin|btc|crypto|usdt|gift\s*cards?|paypal\s+(?:friends\s+(?:and|&)\s+family|f&f|ff))\s+only\b'
+        - '\bonly\s+(?:accept(?:ing)?\s+|take\s+|taking\s+)?(?:zelle|cash\s*app|cashapp|venmo|apple\s+pay|wire|crypto|bitcoin|btc|usdt|gift\s*cards?|paypal\s+(?:f&f|ff|friends))\b'
+        - '\bpaypal\s+(?:friends\s+(?:and|&)\s+family|f\s*&\s*f|ff)\b'
+        - '\b(?:no|not\s+accepting|don[''’]?t\s+accept)\s+(?:paypal\s+)?(?:g\s*&\s*s|goods\s+(?:and|&)\s+services)\b'
     payment_mention:
       action: risk
       probability: 0.12
       source_kinds: [local]
+      description: Irreversible payment method mentioned on a local listing
       patterns:
         - '\b(?:zelle|cash\s*app|cashapp|western\s+union|moneygram|bitcoin|crypto)\b'
     deposit_request:
       action: risk
       probability: 0.55
+      negatable: true
+      description: Deposit / holding fee before seeing the item ("no deposits" is fine)
       patterns:
-        - '\b(?:deposit|down\s+payment|holding\s+fee)\b'
-        - '\bhold\s+(?:it|the\s+item)\s+(?:for\s+you\s+)?(?:with|for)\s+(?:a\s+)?(?:\$|payment)\b'
+        - '\b(?:deposits?|down\s+payment|holding\s+fee|hold\s+fee)\b'
+        - '\b(?:pay|send)\s+(?:a\s+|the\s+)?(?:deposit|half|50\s*%)\s+(?:first|upfront|up\s+front|before)\b'
+        - '\bhold\s+(?:it|the\s+item|for\s+you)\s+(?:for\s+you\s+)?(?:with|for)\s+(?:a\s+)?(?:\$|payment|deposit)'
     off_platform_contact:
       action: risk
       probability: 0.35
+      description: Pushes the conversation off the platform
       patterns:
-        - '\b(?:text|call|email|whats\s?app|telegram|signal|kik)\s+me\s+(?:at|on|@)\b'
-        - '\bwhats\s?app\b'
-        - '\b\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b'
-        - '\b[\w.+-]+@(?:gmail|yahoo|hotmail|outlook|icloud|aol|proton(?:mail)?)\.\w+\b'
+        - '\b(?:text|call|email|e-mail|whats\s?app|telegram|signal|kik|wechat|contact)\s+me\s+(?:at|on|@|via)\b'
+        - '\bwhats\s?app\b|\bwechat\b|\bt\.me/'
+        - '(?<=[\w.+-])@(?:gmail|yahoo|hotmail|outlook|icloud|aol|proton(?:mail)?|gmx)\.(?:com|net|org|me|co)\b'
+    phone_number:
+      action: risk
+      probability: 0.15
+      description: Phone number in the listing text (off-platform contact)
+      patterns:
+        - '\(\d{3}\)\s?\d{3}[\s.-]\d{4}(?!\d)'
+        # first digit, then a look-behind asserting it is not preceded by another digit
+        - '\d(?<!\d\d)\d{2}[\s.-]\d{3}[\s.-]\d{4}(?!\d)'
     scam_story:
       action: risk
       probability: 0.35
       source_kinds: [local, marketplace]
+      description: Classic remote-seller scam narratives
       patterns:
-        - '\b(?:out\s+of\s+(?:town|state|the\s+country)|deployed|military\s+(?:deployment|base)|moving\s+(?:overseas|abroad)|relocat(?:ed|ing)\s+(?:overseas|abroad))\b'
+        - '\b(?:out\s+of\s+(?:town|state|the\s+country)|deployed|military\s+(?:deployment|base)|(?:moving|relocat(?:ed|ing))\s+(?:overseas|abroad|out\s+of\s+(?:state|the\s+country)))\b'
         - '\b(?:shipping|ship)\s+only\b|\bno\s+local\s+pick\s*-?\s*up\b|\b(?:will|can)\s+only\s+ship\b'
-        - '\b(?:shipped|delivered)\s+by\s+(?:fedex|ups|usps|dhl)\s+(?:agent|company)\b'
+        - '\b(?:shipped|delivered|sent)\s+(?:by|via|through)\s+(?:fedex|ups|usps|dhl)\s+(?:agent|company|courier\s+service)\b'
+        - '\b(?:my|the)\s+(?:shipping\s+)?(?:agent|courier)\s+will\b'
+        - '\b(?:late|deceased)\s+(?:husband|son|father|dad|wife|brother)\b|\bpassed\s+away\b'
     read_description:
       action: risk
-      probability: 0.3
+      probability: 0.2
+      description: '"Read the description" - typical of box/photo bait (weak on its own)'
       patterns:
         - '\b(?:please\s+)?read\s+(?:the\s+)?(?:full\s+|entire\s+|whole\s+)?(?:description|listing|details|post)\b'
         - '\bsee\s+(?:the\s+)?description\b'
@@ -351,29 +416,39 @@ filters:
       action: risk
       probability: 0.4
       negatable: true
+      description: Seller cannot or will not vouch that it works
       patterns:
-        - '\buntested\b'
-        - '\b(?:unable|not\s+able)\s+to\s+test\b|\bcan[''’]?t\s+test\b|\bhaven[''’]?t\s+tested\b'
-        - '\bas[\s-]is\b|\bsold\s+as\s+is\b'
-        - '\bno\s+returns?\b'
+        - '\buntested\b|\bnot\s+tested\b'
+        - '\b(?:unable|not\s+able)\s+to\s+test\b|\bcan[''’]?t\s+test\b|\bcannot\s+test\b|\bhaven[''’]?t\s+tested\b|\bno\s+way\s+to\s+test\b'
+        - '\bsold\s+as[\s-]?is\b|\bas[\s-]is\b(?![\s,]+(?:new|in\s+new|brand))'
+    no_returns:
+      action: risk
+      probability: 0.08
+      source_kinds: [marketplace]
+      description: No-returns policy on a marketplace listing (weak)
+      patterns:
+        - '\bno\s+returns?\b|\breturns?\s+not\s+accepted\b|\ball\s+sales\s+final\b'
     repaired_modified:
       action: risk
       probability: 0.25
       negatable: true
+      description: Repaired, reworked or modified hardware
       patterns:
-        - '\b(?:repaired|reflowed|reballed|re-?soldered|replaced\s+(?:connector|vram|memory|chip|panel))\b'
+        - '\b(?:repaired|reflowed|reballed|re-?soldered|replaced\s+(?:connector|vram|memory|chip|panel|power\s+connector))\b'
         - '\b(?:bios\s+(?:flashed|modded|mod)|modded\s+bios|shunt\s+mod(?:ded)?|x-?flashed)\b'
     mining_history:
       action: risk
       probability: 0.08
       negatable: true
       categories: [gpu, workstation_gpu]
+      description: Used for crypto mining (mild wear signal)
       patterns:
         - '\bmin(?:ed|ing)\b'
         - '\b(?:ex|former)[\s-]?miner\b'
     urgency:
       action: risk
       probability: 0.1
+      description: Pressure to pay quickly
       patterns:
         - '\b(?:must\s+(?:sell|go)\s+(?:today|asap|now|tonight)|urgent(?:ly)?\s+(?:sale|selling)|need\s+(?:gone|cash)\s+(?:today|asap|fast))\b'
 
@@ -521,13 +596,19 @@ profiles:
     category: gpu
     priority: 0
     match:
+      # bare model numbers count too ("[H] 4090 FE", "Looking for 3090"), but not
+      # prices/part numbers ("$4,090", "HL-4090") or units ("5090mAh")
       any:
         - '\brtx\s*-?\s*5090\b'
-        - '\bgeforce\s+5090\b'
-        - '(?<![\w.$])5090\s*(?:fe|founders|32\s*gb|gaming|oc|astral|tuf|suprim|vanguard|ventus|gaming\s*trio|aorus|master|windforce|solid|amp|gamerock|phantom|zotac|ichill|x3)\b'
+        - '\bgeforce\s+(?:rtx\s*)?5090\b'
+        - '(?<![\w.$/#,-])5090(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
+        - '(?<![\w.$/#,-])5090\s*(?:fe|founders|32\s*gb|gaming|oc|astral|tuf|suprim|vanguard|ventus|gaming\s*trio|aorus|master|windforce|solid|amp|gamerock|phantom|ichill|x3|liquid|prime|inspire)\b'
       none:
-        - '\b5090\s*-?\s*d\b|\b5090\s*dd\b'
+        - '\b5090\s*-?\s*d(?:d|\s*v2)?\b'
         - '\b(?:laptop|notebook|mobile|zephyrus|legion|scar\s*1[68]|razer\s+blade|alienware\s+(?:m|x)\d+|msi\s+(?:raider|titan|stealth|vector)|predator\s+helios|omen\s+max)\b'
+        - '\b(?:optiplex|precision|latitude|vostro|inspiron|thinkcentre|thinkpad|elitedesk|prodesk|elitebook|probook)\b'
+        # a different GPU model named in the same title -> ambiguous (comparisons, trades, upgrades)
+        - '\b(?:rtx|gtx|geforce|rx|radeon|arc)\s*-?\s*(?!5090\b)[a-z]?\d{3,4}\b'
     price:
       reference_new: 2399
       reference_used: 2150
@@ -544,13 +625,19 @@ profiles:
     name: NVIDIA GeForce RTX 4090 24GB
     category: gpu
     match:
+      # bare model numbers count too ("[H] 4090 FE", "Looking for 3090"), but not
+      # prices/part numbers ("$4,090", "HL-4090") or units ("5090mAh")
       any:
         - '\brtx\s*-?\s*4090\b'
-        - '\bgeforce\s+4090\b'
-        - '(?<![\w.$])4090\s*(?:fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|gamerock|phantom|windforce|aero|master|ichill|x3|ventus|amp|xlr8|verto)\b'
+        - '\bgeforce\s+(?:rtx\s*)?4090\b'
+        - '(?<![\w.$/#,-])4090(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
+        - '(?<![\w.$/#,-])4090\s*(?:fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|gamerock|phantom|windforce|aero|master|ichill|x3|ventus|amp|xlr8|verto)\b'
       none:
-        - '\b4090\s*-?\s*d\b'
-        - '\b(?:laptop|notebook|mobile|zephyrus|legion|scar\s*1[68]|razer\s+blade|alienware\s+(?:m|x)\d+|msi\s+(?:raider|titan|stealth|vector)|predator\s+helios)\b'
+        - '\b4090\s*-?\s*d(?:d|\s*v2)?\b'
+        - '\b(?:laptop|notebook|mobile|zephyrus|legion|scar\s*1[68]|razer\s+blade|alienware\s+(?:m|x)\d+|msi\s+(?:raider|titan|stealth|vector)|predator\s+helios|omen\s+max)\b'
+        - '\b(?:optiplex|precision|latitude|vostro|inspiron|thinkcentre|thinkpad|elitedesk|prodesk|elitebook|probook)\b'
+        # a different GPU model named in the same title -> ambiguous (comparisons, trades, upgrades)
+        - '\b(?:rtx|gtx|geforce|rx|radeon|arc)\s*-?\s*(?!4090\b)[a-z]?\d{3,4}\b'
     price:
       reference_new: 2199
       reference_used: 1750
@@ -567,12 +654,20 @@ profiles:
     name: NVIDIA GeForce RTX 3090 / 3090 Ti 24GB
     category: gpu
     match:
+      # bare model numbers count too ("[H] 4090 FE", "Looking for 3090"), but not
+      # prices/part numbers ("$4,090", "HL-4090") or units ("5090mAh")
       any:
         - '\brtx\s*-?\s*3090\b'
-        - '\bgeforce\s+3090\b'
-        - '(?<![\w.$])3090\s*(?:ti\b|fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|ftw3|xc3|ventus|eagle|vision|master|zotac)\b'
+        - '\bgeforce\s+(?:rtx\s*)?3090\b'
+        - '(?<![\w.$/#,-])3090(?!\w|\.\d|[\s-]*(?:mah|mhz|ghz|w|watts?|rpm|mm|cm|lm|lumens?|lbs?|kg|miles|mi|hrs?|hours|dollars|usd|bucks|sq)\b)'
+        - '(?<![\w.$/#,-])3090\s*(?:ti|fe|founders|24\s*gb|gaming|oc|strix|tuf|suprim|trinity|ftw3|xc3|ventus|eagle|vision|master|zotac|kingpin|hydro)\b'
+        - '\b(?:rtx\s*-?\s*)?3090\s*-?\s*ti\b'
       none:
-        - '\b(?:laptop|notebook|mobile)\b'
+        - '\b3090\s*-?\s*d(?:d|\s*v2)?\b'
+        - '\b(?:laptop|notebook|mobile|zephyrus|legion|scar\s*1[68]|razer\s+blade|alienware\s+(?:m|x)\d+|msi\s+(?:raider|titan|stealth|vector)|predator\s+helios|omen\s+max)\b'
+        - '\b(?:optiplex|precision|latitude|vostro|inspiron|thinkcentre|thinkpad|elitedesk|prodesk|elitebook|probook)\b'
+        # a different GPU model named in the same title -> ambiguous (comparisons, trades, upgrades)
+        - '\b(?:rtx|gtx|geforce|rx|radeon|arc)\s*-?\s*(?!3090\b)[a-z]?\d{3,4}\b'
     variants:
       - id: ti
         match: ['\b3090\s*-?\s*ti\b']
@@ -596,7 +691,7 @@ profiles:
     match:
       any:
         - '\brtx\s*pro\s*6000\b'
-        - '\bpro\s*6000\s*blackwell\b'
+        - '\bpro\s*6000\s*(?:blackwell|96\s*gb|max-?q|server)\b'
         - '\bblackwell\b.*\b6000\b.*\b96\s*gb\b'
       none:
         - '\b(?:laptop|notebook|mobile)\b'
@@ -618,8 +713,8 @@ profiles:
     priority: 4
     match:
       any:
-        - '\brtx\s*6000\s*ada\b'
-        - '\b6000\s*ada\b'
+        - '\brtx\s*a?6000\s*ada\b'
+        - '\ba?6000\s*ada\b'
         - '\bada\s+(?:lovelace\s+)?(?:generation\s+)?(?:rtx\s*)?6000\b'
       none:
         - '\bpro\s*6000\b|\bblackwell\b'
@@ -648,6 +743,8 @@ profiles:
       none:
         - '\bada\b|\bpro\s*6000\b|\bblackwell\b'
         - '\b(?:laptop|notebook|mobile)\b'
+        # Sony's a6000 camera shares the name
+        - '\b(?:sony|alpha|ilce|mirrorless|camera|lens|megapixels?)\b'
     price:
       reference_new: 4600
       reference_used: 3900
@@ -672,6 +769,8 @@ profiles:
       none:
         - '\bada\b'
         - '\b(?:laptop|notebook|mobile|precision\s+77\d0|zbook)\b'
+        # Sony's a5000 camera shares the name
+        - '\b(?:sony|alpha|ilce|mirrorless|camera|lens|megapixels?)\b'
     price:
       reference_new: 2300
       reference_used: 1350
@@ -696,7 +795,7 @@ profiles:
         - '\bg80sd\b|\bg81sf\b|\bls32dg80\w*|\bodyssey\s+oled\s+g8\b'
         - '\bmpg\s*321\s*urx\b|\bmpg\s*272\s*urx\b|\b321urx\b|\b272urx\b'
       none:
-        - '\b(?:stand|mount|arm)\s+only\b'
+        - '\b(?:stand|mount|arm|base|cable|power\s+(?:supply|brick|adapter))\s+only\b'
     variants:
       - id: aw3225qf
         match: ['\baw3225qf\b']
@@ -714,7 +813,7 @@ profiles:
         match: ['\bpg27ucdm\b']
         price: { reference_new: 999, reference_used: 760, floor: 220, target: 700, ceiling: 950 }
       - id: g80sd
-        match: ['\bg80sd\b|\bls32dg80\w*|\bodyssey\s+oled\s+g8\b.*\b32\b']
+        match: ['\bg80sd\b|\bls32dg80\w*', '\bodyssey\s+oled\s+g8\b.*\b32(?:\s*-?\s*in(?:ch(?:es)?)?|["”])?(?!\w)']
         price: { reference_new: 899, reference_used: 680, floor: 200, target: 620, ceiling: 880 }
       - id: g81sf
         match: ['\bg81sf\b']
@@ -745,34 +844,41 @@ profiles:
       any:
         - '\blg\b.*\b(?:oled|evo)\b'
         - '\boled\d{2}[cg][4-6]\w*'
+        # "LG C4 65" without the word OLED (C4/C5 are OLED-only lines)
+        - '\blg\b.*\bc[4-6](?:[a-z]{2,4})?\b'
+        # "LG G4 65" - G-series needs a TV size (LG G4/G5 are also old phones)
+        - '\blg\b.*\bg[4-6]\b.*\b(?:55|65|77|83|97)(?!\w)'
       all:
-        - '\b(?:c[4-6]|g[4-6])\b|\boled\d{2}[cg][4-6]'
+        - '\b[cg][4-6](?:[a-z]{2,4})?\b|\boled\d{2}[cg][4-6]'
       none:
-        - '\b(?:stand|mount|remote|t-?con|power\s+board)\s+only\b'
+        - '\b(?:stand|mount|remote|t-?con|power\s+board|main\s*board|panel)\s+only\b'
+        - '\b(?:phone|smartphone|unlocked|verizon|t-?mobile|at&t|sprint|cricket|ultragear|soundbar|sound\s+bar|projector)\b'
+        # a title that ends with a part and lists nothing else ("LG OLED65C4PUA main board")
+        - '^(?!.*(?:\bwith\b|\bw/|\bincl|\band\b|\bplus\b|[+&,]))[^\n]*\b(?:stand|remote|t-?con(?:\s+board)?|main\s*board|power\s+board|wall\s+mount|feet|legs)\W*$'
     variants:
       - id: c4_55
-        match: ['oled55c4|(?=.*\bc4\b)(?=.*\b55\b)']
+        match: ['oled55c4', '^(?=.*\bc4(?:[a-z]{2,4})?\b)(?=.*\b55(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 1199, reference_used: 850, floor: 250, target: 850, ceiling: 1150 }
       - id: c4_65
-        match: ['oled65c4|(?=.*\bc4\b)(?=.*\b65\b)']
+        match: ['oled65c4', '^(?=.*\bc4(?:[a-z]{2,4})?\b)(?=.*\b65(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 1599, reference_used: 1150, floor: 350, target: 1100, ceiling: 1500 }
       - id: c4_77
-        match: ['oled77c4|(?=.*\bc4\b)(?=.*\b77\b)']
+        match: ['oled77c4', '^(?=.*\bc4(?:[a-z]{2,4})?\b)(?=.*\b77(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 2399, reference_used: 1750, floor: 500, target: 1700, ceiling: 2300 }
       - id: c5_55
-        match: ['oled55c5|(?=.*\bc5\b)(?=.*\b55\b)']
+        match: ['oled55c5', '^(?=.*\bc5(?:[a-z]{2,4})?\b)(?=.*\b55(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 1299, reference_used: 950, floor: 280, target: 950, ceiling: 1250 }
       - id: c5_65
-        match: ['oled65c5|(?=.*\bc5\b)(?=.*\b65\b)']
+        match: ['oled65c5', '^(?=.*\bc5(?:[a-z]{2,4})?\b)(?=.*\b65(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 1699, reference_used: 1250, floor: 380, target: 1200, ceiling: 1600 }
       - id: c5_77
-        match: ['oled77c5|(?=.*\bc5\b)(?=.*\b77\b)']
+        match: ['oled77c5', '^(?=.*\bc5(?:[a-z]{2,4})?\b)(?=.*\b77(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 2599, reference_used: 1900, floor: 550, target: 1850, ceiling: 2500 }
       - id: g4_65
-        match: ['oled65g4|(?=.*\bg4\b)(?=.*\b65\b)']
+        match: ['oled65g4', '^(?=.*\bg4(?:[a-z]{2,4})?\b)(?=.*\b65(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 2299, reference_used: 1700, floor: 500, target: 1600, ceiling: 2200 }
       - id: g5_65
-        match: ['oled65g5|(?=.*\bg5\b)(?=.*\b65\b)']
+        match: ['oled65g5', '^(?=.*\bg5(?:[a-z]{2,4})?\b)(?=.*\b65(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 2599, reference_used: 1950, floor: 550, target: 1850, ceiling: 2500 }
     price:
       reference_new: 1699
@@ -792,15 +898,16 @@ profiles:
     variant_required: true
     match:
       any:
-        - '\bs90[df]\b|\bqn\d{2}s90[df]\w*'
+        - '\bs90[df]\w*\b|\bqn\d{2}s90[df]\w*'
       none:
-        - '\b(?:stand|mount|remote|t-?con|power\s+board)\s+only\b'
+        - '\b(?:stand|mount|remote|t-?con|power\s+board|main\s*board|panel)\s+only\b'
+        - '^(?!.*(?:\bwith\b|\bw/|\bincl|\band\b|\bplus\b|[+&,]))[^\n]*\b(?:stand|remote|t-?con(?:\s+board)?|main\s*board|power\s+board|wall\s+mount|feet|legs)\W*$'
     variants:
       - id: s90d_65
-        match: ['qn65s90d|(?=.*\bs90d\b)(?=.*\b65\b)']
+        match: ['qn65s90d', '^(?=.*\bs90d\w*\b)(?=.*\b65(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 1399, reference_used: 1000, floor: 300, target: 950, ceiling: 1300 }
       - id: s90f_65
-        match: ['qn65s90f|(?=.*\bs90f\b)(?=.*\b65\b)']
+        match: ['qn65s90f', '^(?=.*\bs90f\w*\b)(?=.*\b65(?:\s*-?\s*in(?:ch(?:es)?)?)?(?!\w))']
         price: { reference_new: 1599, reference_used: 1150, floor: 350, target: 1100, ceiling: 1500 }
     price:
       reference_new: 1499
@@ -823,19 +930,25 @@ profiles:
     match:
       field: text
       all:
-        - '\b(?:rtx\s*)?(?:4090|5090)\b'
-        - '\b(?:gaming\s+(?:pc|computer|desktop|rig)|pc|desktop|computer|tower|prebuilt|pre-built|workstation|full\s+(?:build|system)|custom\s+build)\b'
-        - '\b(?:i[579][\s-]?\d{4,5}[a-z]{0,2}|core\s+(?:ultra\s+)?[579]\s*\d{3,5}[a-z]{0,2}|ryzen\s+[579]\s*\d{4}x?3?d?|\d{4}x3d|threadripper|\d{2,3}\s*gb\s*(?:of\s+)?(?:ddr[45]|ram|memory))\b'
+        - '\b(?:rtx\s*-?\s*|geforce\s+)?(?:4090|5090)\b'
+        # the PC-ness must be in the TITLE: a GPU listing that mentions its test system is not a prebuilt
+        - '^[^\n]*\b(?:gaming\s+(?:pc|computer|desktop|rig|tower|system)|pc|desktop|computer|tower|prebuilt|pre-built|workstation|full\s+(?:build|system|setup)|custom\s+(?:build|pc|rig))\b'
+        - '\b(?:i[3579][\s-]?\d{4,5}[a-z]{0,3}|core\s+(?:ultra\s+)?[3579]\s*-?\s*\d{3,5}[a-z]{0,3}|ryzen\s+[3579]\s*\d{4}x?3?d?|\d{4}x3d|threadripper|xeon|\d{2,3}\s*gb\s*(?:of\s+)?(?:ddr[45]|ram|system\s+memory))\b'
       none:
         - '\b(?:laptop|notebook)\b'
+        - '\b(?:pulled|removed|taken)\s+(?:out\s+)?(?:from|of)\b'
+        - '\btested\s+(?:in|on|with)\s+(?:my\s+|a\s+)?(?:pc|system|rig|build|bench|computer|desktop)\b|\btest\s*bench\b'
+        - '^[^\n]*\b(?:gpu|card)\s+only\b'
+        - '\b(?:upgrade|upgradable|upgradeable)\s+to\s+(?:an?\s+)?(?:rtx\s*)?(?:4090|5090)\b'
+        - '\b(?:optiplex|precision|latitude|vostro|thinkcentre|elitedesk|prodesk)\b'
     variants:
       - id: gpu_5090
         field: text
-        match: ['\b(?:rtx\s*)?5090\b']
+        match: ['^[^\n]*\b(?:rtx\s*-?\s*)?5090\b', '^(?![^\n]*\b4090\b)[\s\S]*?\b(?:rtx\s*-?\s*)?5090\b']
         price: { reference_new: 4300, reference_used: 3500, floor: 900, target: 3000, ceiling: 4200 }
       - id: gpu_4090
         field: text
-        match: ['\b(?:rtx\s*)?4090\b']
+        match: ['\b(?:rtx\s*-?\s*)?4090\b']
         price: { reference_new: 3300, reference_used: 2600, floor: 700, target: 2200, ceiling: 3100 }
     price:
       reference_new: 3300
@@ -855,11 +968,15 @@ profiles:
     category: camera
     match:
       any:
-        - '\b(?:sony\s+)?(?:alpha\s+)?a7\s*(?:iv|4|m4|mark\s*(?:iv|4))\b'
+        - '\b(?:sony\s+)?(?:alpha\s+)?a7\s*-?\s*(?:iv|4|m4|mark\s*(?:iv|4)|mk\s*(?:iv|4))\b'
+        - '\balpha\s*7\s*(?:iv|4|m4|mark\s*(?:iv|4))\b'
         - '\bilce-?7m4\w*'
       none:
-        - '\ba7\s*(?:r|s|c)\b|\ba7r|\ba7s|\ba7c'
-        - '\b(?:battery|grip|cage|strap|charger|screen\s+protector|lens\s+only|body\s+cap)\b'
+        - '\ba7\s*-?\s*(?:r|s|c|cr)\b|\ba7(?:r|s|c)'
+        - '\b(?:battery|batteries|grip|cage|strap|charger|screen\s+protector|lens|body\s+cap|eyecup|l-?bracket)\s+(?:only|for)\b'
+        # accessory-first titles ("NP-FZ100 battery Sony a7 IV") and accessory-last titles with nothing else
+        - '^\W*(?:[\w-]+\s+){0,2}(?:battery|batteries|grip|cage|strap|charger|screen\s+protector|body\s+cap|eyecup|l-?bracket|dummy\s+battery)\b'
+        - '^(?!.*(?:\bwith\b|\bw/|\bincl|\band\b|\bplus\b|[+&,]))[^\n]*\b(?:battery|batteries|grip|cage|strap|charger|screen\s+protector|body\s+cap|eyecup|l-?bracket)\W*$'
     price:
       reference_new: 2199
       reference_used: 1650
@@ -880,7 +997,9 @@ profiles:
         - '\bsteam\s*deck\b'
         - '\boled\b'
       none:
-        - '\b(?:case|dock|skin|screen\s+protector|grip)\s+(?:only|for)\b'
+        - '\b(?:case|dock|skin|screen\s+protector|grip|charger|stand)\s+(?:only|for)\b'
+        - '^(?!.*(?:\bwith\b|\bw/|\bincl|\band\b|\bplus\b|[+&,]))[^\n]*\b(?:case|carrying\s+case|dock|docking\s+station|skin|screen\s+protector|grip|grips|charger|stand)\W*$'
+        - '\blcd\b'
     variants:
       - id: tb1
         match: ['\b1\s*tb\b']

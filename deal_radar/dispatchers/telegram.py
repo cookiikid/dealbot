@@ -141,19 +141,15 @@ class _Line:
 
 
 def _candidate_lines(alert: Alert, *, markup: bool) -> list[_Line]:
-    esc = escape if markup else (lambda s: s)
     lines: list[_Line] = []
     order = 1
     for index, fact in enumerate(facts(alert)):
-        if markup:
-            text = f"<b>{escape(fact.name)}:</b> {escape(fact.value)}"
-        else:
-            text = f"{fact.name}: {fact.value}"
+        text = f"<b>{escape(fact.name)}:</b> {escape(fact.value)}" if markup else f"{fact.name}: {fact.value}"
         lines.append(_Line(order, 1 if index < KEY_FACTS else 3, text))
         order += 1
     risk = risk_summary(alert)
     if risk:
-        lines.append(_Line(order, 2, f"⚠️ <b>Risk:</b> {esc(risk)}" if markup else f"⚠️ Risk: {risk}"))
+        lines.append(_Line(order, 2, f"⚠️ <b>Risk:</b> {escape(risk)}" if markup else f"⚠️ Risk: {risk}"))
         order += 1
     pairs = [(label, url) for label, url in links(alert) if _valid_url(url)]
     if pairs:
@@ -287,7 +283,9 @@ class TelegramDispatcher(Dispatcher):
         self._chat_id: str | None = chat.chat_id
         self._disabled_reason: str | None = None
         self._blocked_until = 0.0  # monotonic; per-chat flood control
-        self._requests = self.metrics.counter("telegram_requests_total", "Telegram Bot API requests", ("target", "method", "status"))
+        self._requests = self.metrics.counter(
+            "telegram_requests_total", "Telegram Bot API requests", ("target", "method", "status")
+        )
         self._fallbacks = self.metrics.counter("telegram_fallbacks_total", "Telegram degraded deliveries", ("target", "kind"))
 
     # ------------------------------------------------------------------ state
@@ -459,7 +457,10 @@ class TelegramDispatcher(Dispatcher):
                 message_id = result.get("message_id") if isinstance(result, dict) else None
                 if step.label != steps[0].label:
                     self._fallbacks.inc(target=self.target, kind=step.label)
-                    log.info("telegram delivered via fallback", extra={"target": self.target, "alert_id": alert_id, "via": step.label})
+                    log.info(
+                        "telegram delivered via fallback",
+                        extra={"target": self.target, "alert_id": alert_id, "via": step.label},
+                    )
                 return _result(True, str(message_id) if message_id is not None else None)
 
             detail = _description(body, resp.data)
@@ -499,7 +500,13 @@ class TelegramDispatcher(Dispatcher):
 
         log.warning(
             "telegram delivery failed",
-            extra={"target": self.target, "alert_id": alert_id, "status": status, "attempts": attempts, "error": self._redact(error or "")[:300]},
+            extra={
+                "target": self.target,
+                "alert_id": alert_id,
+                "status": status,
+                "attempts": attempts,
+                "error": self._redact(error or "")[:300],
+            },
         )
         return _result(False)
 

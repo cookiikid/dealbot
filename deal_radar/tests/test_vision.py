@@ -44,6 +44,7 @@ from deal_radar.engine.vision_filter import (
     candidate_urls,
     coerce_confidence,
     extract_json_object,
+    image_request_headers,
     interpret_answer,
     normalize_category,
     prepare_image,
@@ -78,7 +79,7 @@ def nearest_color(b64: str) -> tuple[str, tuple[int, int], str]:
     with Image.open(io.BytesIO(base64.b64decode(b64))) as img:
         size, fmt = img.size, img.format
         mean = img.convert("RGB").resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
-    name = min(PALETTE, key=lambda n: sum((a - b) ** 2 for a, b in zip(PALETTE[n], mean)))
+    name = min(PALETTE, key=lambda n: sum((a - b) ** 2 for a, b in zip(PALETTE[n], mean, strict=True)))
     return name, size, fmt or ""
 
 
@@ -186,7 +187,12 @@ async def backend() -> AsyncIterator[tuple[TestServer, Backend]]:
 
     async def ollama_tags(request: web.Request) -> web.Response:
         return web.json_response(
-            {"models": [{"name": t, "model": t, "size": 3_200_000_000, "digest": "abc", "details": {"format": "gguf"}} for t in state.tags]}
+            {
+                "models": [
+                    {"name": t, "model": t, "size": 3_200_000_000, "digest": "abc", "details": {"format": "gguf"}}
+                    for t in state.tags
+                ]
+            }
         )
 
     async def openai_chat(request: web.Request) -> web.Response:
@@ -210,7 +216,8 @@ async def backend() -> AsyncIterator[tuple[TestServer, Backend]]:
         )
 
     async def openai_models(request: web.Request) -> web.Response:
-        return web.json_response({"object": "list", "data": [{"id": t, "object": "model", "owned_by": "local"} for t in state.tags]})
+        models = [{"id": t, "object": "model", "owned_by": "local"} for t in state.tags]
+        return web.json_response({"object": "list", "data": models})
 
     app = web.Application()
     app.router.add_get("/img/{name}", image)
@@ -250,7 +257,9 @@ def configure(base: AppConfig, server: TestServer, **vision: Any) -> AppConfig:
     return base.model_copy(update={"vision": VisionSection(**settings)})
 
 
-def make_item(server: TestServer | None, *images: str, kind: SourceKind = SourceKind.LOCAL, source: str = "fb_marketplace") -> DealItem:
+def make_item(
+    server: TestServer | None, *images: str, kind: SourceKind = SourceKind.LOCAL, source: str = "fb_marketplace"
+) -> DealItem:
     urls = [str(server.make_url(f"/img/{name}")) for name in images] if server is not None else list(images)
     return DealItem(
         source=source,
@@ -336,7 +345,10 @@ def test_prompt_kind_keyword_fallback() -> None:
         ('Answer: {"category": "genuine", "reason": "fan {left} and } ok", "confidence": 0.8} -- done', "genuine"),
         ("{'item_visible': False, 'category': 'box_only', 'confidence': '90%'}", "box_only"),
         ('{"category": "damaged", "confidence": 0.7,}', "damaged"),
-        ('{"item_visible": true, "category": "damaged", "damage_visible": true, "confidence": 0.82, "reason": "crack across the', "damaged"),
+        (  # truncated by num_predict
+            '{"item_visible": true, "category": "damaged", "damage_visible": true, "confidence": 0.82, "reason": "crack across',
+            "damaged",
+        ),
         ("```\n{\"category\": \"screenshot\"}\n```", "screenshot"),
         ('{"note": "x"} then {"category": "receipt", "confidence": 0.9}', "receipt"),
     ],
@@ -453,6 +465,16 @@ def test_aggregate_answers_rules() -> None:
     verdict, conf, decisive = aggregate_answers([_ans(B, 0.4)], 0.6)
     assert verdict is VisionVerdict.UNCERTAIN and conf == 0.4 and decisive is not None
     assert aggregate_answers([_ans(D, 0.5), _ans(G, 0.3)], 0.6)[0] is G
+
+
+def test_image_request_headers() -> None:
+    fb = image_request_headers("https://scontent-lax3-1.xx.fbcdn.net/v/t45/123.jpg?oe=1", "https://www.facebook.com/marketplace/item/1/")
+    assert fb == {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "cross-site", "Referer": "https://www.facebook.com/"}
+    cl = image_request_headers("https://images.craigslist.org/00a_abc_600x450.jpg", "https://sfbay.craigslist.org/sfc/sys/d/1.html")
+    assert cl["Sec-Fetch-Site"] == "same-site" and cl["Referer"] == "https://sfbay.craigslist.org/"
+    same = image_request_headers("https://example.com/a.jpg", "https://example.com/item/1")
+    assert same["Sec-Fetch-Site"] == "same-origin"
+    assert image_request_headers("https://cdn.example.com/a.jpg", None) == {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "cross-site"}
 
 
 def test_candidate_urls_dedupes_and_filters() -> None:
@@ -582,10 +604,16 @@ async def test_ollama_genuine_and_request_shape(backend, http: HttpClient, base_
     assert len(message["images"]) == 1 and not message["images"][0].startswith("data:")
     # the model received the downscaled re-encoded JPEG, not the 1600x1200 original
     assert call["color"] == "red" and call["size"] == (672, 504) and call["format"] == "JPEG"
-    # image fetched once, with a coherent browser identity
+    # image fetched once, looking like an <img> load from the listing page
     assert state.image_hits == {"red.jpg": 1}
-    assert "Mozilla/5.0" in state.image_headers[0]["User-Agent"]
-    assert "image/" in state.image_headers[0]["Accept"]
+    sent = state.image_headers[0]
+    assert "Mozilla/5.0" in sent["User-Agent"]
+    assert "image/" in sent["Accept"]
+    if "Sec-Fetch-Dest" in sent:  # Chromium / Firefox / Safari identities all send Fetch Metadata
+        assert sent["Sec-Fetch-Dest"] == "image" and sent["Sec-Fetch-Mode"] == "no-cors"
+        assert sent["Sec-Fetch-Site"] == "cross-site"
+    assert sent["Referer"] == "https://www.facebook.com/"
+    assert "Upgrade-Insecure-Requests" not in sent and "Sec-Fetch-User" not in sent
 
     assert metrics.counter("vision_checks_total", labelnames=("verdict",)).value(verdict="genuine") == 1
     assert metrics.counter("vision_model_calls_total", labelnames=("model", "outcome")).value(model=SMALL, outcome="ok") == 1
@@ -925,7 +953,7 @@ async def test_unusable_images_are_skipped_without_model_calls(backend, http: Ht
 
 
 async def test_svg_is_not_a_photo(backend, http: HttpClient, base_config: AppConfig) -> None:
-    server, state = backend
+    server, _state = backend
     vf = VisionFilter(configure(base_config, server), http)
     result = await vf.check(make_item(server, "icon.svg"), gpu_profile(base_config))
     assert result.verdict is VisionVerdict.SKIPPED
@@ -1042,7 +1070,7 @@ def _free_port() -> int:
 
 
 async def test_unreachable_backend(http: HttpClient, base_config: AppConfig, backend) -> None:
-    server, state = backend
+    server, _state = backend
     dead = f"http://127.0.0.1:{_free_port()}"
     config = base_config.model_copy(update={"vision": VisionSection(enabled=True, base_url=dead, model=SMALL)})
     vf = VisionFilter(config, http)
@@ -1094,7 +1122,7 @@ async def test_close_and_internal_errors_never_raise(backend, http: HttpClient, 
 
 
 async def test_malformed_backend_response_counts_as_failure(backend, http: HttpClient, base_config: AppConfig) -> None:
-    server, state = backend
+    server, _state = backend
     config = configure(base_config, server, backend="openai")
     vf = VisionFilter(config, http)
 
