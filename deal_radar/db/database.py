@@ -703,7 +703,11 @@ class Database:
         total = 0
         while True:
             ids = select(id_col).where(condition).limit(chunk_size)
-            stmt = delete(table).where(id_col.in_(ids))
+            # ``condition`` is repeated on the outer DELETE: when PostgreSQL has to wait for
+            # a row a concurrent writer just refreshed (e.g. an expired listing observed
+            # again), it re-evaluates only the outer WHERE on the new row version, so the
+            # live row is skipped instead of being deleted (and cascading its snapshots).
+            stmt = delete(table).where(id_col.in_(ids), condition)
             async with self.engine.begin() as conn:
                 result = await conn.execute(stmt)
             deleted = max(int(result.rowcount or 0), 0)

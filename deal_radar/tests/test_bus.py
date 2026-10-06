@@ -357,39 +357,54 @@ def _ping(port: int) -> bool:
         return False
 
 
+def _redis_binary() -> str | None:
+    return str(REDIS_SERVER) if REDIS_SERVER.exists() else shutil.which("redis-server")
+
+
+def _spawn_redis(binary: str, port: int) -> subprocess.Popen[bytes] | None:
+    """Start a throw-away, persistence-free redis-server; None if it does not come up."""
+    proc = subprocess.Popen(
+        [
+            binary, "--port", str(port), "--bind", "127.0.0.1", "--save", "", "--appendonly", "no",
+            "--protected-mode", "no", "--daemonize", "no", "--loglevel", "warning",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and proc.poll() is None and not _ping(port):
+        time.sleep(0.02)
+    if proc.poll() is None and _ping(port):
+        return proc
+    _stop_redis(proc)
+    return None
+
+
+def _stop_redis(proc: subprocess.Popen[bytes]) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 @pytest.fixture(scope="module")
 def redis_port() -> Iterator[int]:
-    binary = str(REDIS_SERVER) if REDIS_SERVER.exists() else shutil.which("redis-server")
+    binary = _redis_binary()
     if not binary:
         pytest.skip("redis-server binary not available")
     for _ in range(3):
         port = _free_port()
-        proc = subprocess.Popen(
-            [
-                binary, "--port", str(port), "--bind", "127.0.0.1", "--save", "", "--appendonly", "no",
-                "--protected-mode", "no", "--daemonize", "no", "--loglevel", "warning",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and proc.poll() is None and not _ping(port):
-            time.sleep(0.02)
-        if proc.poll() is None and _ping(port):
+        proc = _spawn_redis(binary, port)
+        if proc is not None:
             break
-        proc.kill()
-        proc.wait()
     else:
         pytest.skip("could not start redis-server")
     try:
         yield port
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        _stop_redis(proc)
 
 
 @pytest.fixture
