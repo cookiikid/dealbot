@@ -12,8 +12,16 @@ documented by several open-source clients (validated 2025-2026):
 2. **GraphQL** (fallback) – ``POST https://offerup.com/api/graphql`` with operation
    ``GetModularFeed`` and ``searchParams`` ``[{key, value}]`` (string values; keys
    ``q``, ``sort``, ``radius``, ``price_min``, ``price_max``, ``lat``, ``lon``,
-   ``limit``). Unknown keys are silently ignored upstream, so only keys confirmed by
-   the server's own filter echo are sent.
+   ``zipcode``, ``limit``). Unknown keys are silently ignored upstream, so only keys
+   confirmed by the server's own filter echo are sent. Results live in
+   ``modularFeed.looseTiles[].listing`` and ``modularFeed.modules[].grid.tiles[].listing``.
+   Requests carry the headers the web app mints client-side (``x-ou-operation-name``,
+   a sticky ``x-ou-d-token`` device id ``web-<56 hex>``, ``ou-session-id``
+   ``<token>@<epoch ms>``, ``x-request-id``); no login or server-issued token is used.
+   The endpoint is token-gated for some anonymous clients: a bare 401/403 *without* a
+   challenge wall therefore parks GraphQL for :data:`BLOCK_COOLDOWN_SECONDS` instead of
+   pausing the whole source (a real IP block also walls the SSR page, which then raises
+   :class:`SourceBlocked`).
 
 Location: OfferUp geolocates anonymous visitors by IP and keeps the choice in an
 ``ou.location`` cookie (URL-encoded JSON ``{latitude, longitude, zipCode, source}``).
@@ -34,14 +42,19 @@ Politeness: requests go through the shared :class:`HttpClient` (host token bucke
 ``offerup.com`` in config, coherent sticky browser identity, retries). A poll runs
 queries sequentially inside a time budget (80 % of ``poll_timeout_seconds``) and
 rotates its starting query between polls, so a slow host never makes the poll time
-out and every query still gets its turn. Block walls (HTTP 403/429, Cloudflare /
-PerimeterX challenge pages) raise :class:`SourceBlocked` – never retried, never
-solved; listings already gathered in that poll are returned and the block is raised
-at the start of the next poll so the base loop applies its cooldown.
+out and every query still gets its turn. Block walls (HTTP 403/429 on the page,
+Cloudflare / PerimeterX / hCaptcha challenge pages, also when served as 503) raise
+:class:`SourceBlocked` – never retried, never solved; listings already gathered in
+that poll are returned and the block is raised at the start of the next poll so the
+base loop applies its cooldown. The ZIP geocode is an optimisation: its failures
+(including a gated GraphQL) only back off geocoding; the ZIP cookie still scopes
+the page search.
 
-Known gaps (upstream does not expose them in the feed): posting time, description
-and seller data are only on item-detail pages, which are deliberately not fetched
-(one extra request per listing would multiply load ~50x).
+Known gaps (upstream does not expose them in the feed): posting time, description,
+seller data and ``state``/``isRemoved`` are only on item-detail objects, which are
+deliberately not fetched (one extra request per listing would multiply load ~50x);
+when such fields do appear (Apollo state), ``isRemoved: true`` maps to
+``in_stock=False`` so the scorer gates the listing as unavailable.
 """
 
 from __future__ import annotations
@@ -51,6 +64,7 @@ import html as html_lib
 import json
 import math
 import re
+import secrets
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -91,6 +105,23 @@ FEED_QUERY = """query GetModularFeed($searchParams: [SearchParam], $debug: Boole
         tileType
         listing {
           ...feedListing
+        }
+      }
+    }
+    modules {
+      __typename
+      ... on ModularFeedModuleGrid {
+        grid {
+          tiles {
+            __typename
+            ... on ModularFeedTileListing {
+              tileId
+              tileType
+              listing {
+                ...feedListing
+              }
+            }
+          }
         }
       }
     }
@@ -135,12 +166,13 @@ _BLOCK_RE = re.compile(
     r"cf-chl|challenge-platform|cf-turnstile|cf-browser-verification|checking your browser"
     r"|just a moment\.\.\.|attention required!? \| cloudflare|px-captcha|captcha-delivery"
     r"|access to this page has been denied|verify you are (?:a )?human|<title>\s*access denied\s*</title>"
-    r"|\bcaptcha\b",  # word-bounded: a page that merely loads reCAPTCHA is not a wall
+    r"|\bh-?captcha\b|\bcaptcha\b",  # word-bounded: a page that merely loads reCAPTCHA is not a wall
     re.I,
 )
 _LISTING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _PLAIN_PRICE_RE = re.compile(r"^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?$")
-_AD_TYPENAME_RE = re.compile(r"Tile\w*Ad$")
+# Promoted (SellerAd), display ads and job tiles are not local for-sale listings.
+_AD_TYPENAME_RE = re.compile(r"Tile\w*Ad$|TileJob$")
 _FEED_KEYS = ("searchFeedResponse", "initialSearchFeedResponse", "feedData")
 _POSTED_KEYS = ("postDate", "postedDate", "listingDate", "createdDate", "listedAt", "createdAt")
 _SKIP_SCAN_BYTES = 200_000
@@ -148,6 +180,10 @@ _SKIP_SCAN_BYTES = 200_000
 
 class OfferUpParseError(SourceError):
     """The response did not contain a recognisable search feed."""
+
+
+class OfferUpGraphQLUnavailable(SourceError):
+    """GraphQL answered 401/403 without a challenge wall (token gating, not an IP block)."""
 
 
 # --------------------------------------------------------------------------- pure helpers
@@ -315,6 +351,8 @@ def _image_urls(obj: Mapping[str, Any]) -> list[str]:
     def add(candidate: Any) -> None:
         if isinstance(candidate, Mapping):
             candidate = candidate.get("url")
+        if isinstance(candidate, str) and candidate.startswith("//"):
+            candidate = "https:" + candidate
         if isinstance(candidate, str) and candidate.startswith(("http://", "https://")) and candidate not in urls:
             urls.append(candidate)
 
@@ -412,6 +450,10 @@ def parse_listing(
         extra["price_text"] = obj["price"]
     if strategy:
         extra["via"] = strategy
+    state = obj.get("state")
+    if isinstance(state, str) and state.strip():
+        extra["state"] = state.strip()
+    removed = obj.get("isRemoved")
     description = _clean(obj.get("description"))
     original = coerce_price(obj.get("originalPrice"))
     return RawListing(
@@ -429,6 +471,7 @@ def parse_listing(
         location=_location(obj),
         image_urls=_image_urls(obj),
         posted_at=posted_at,
+        in_stock=False if removed is True else None,
         query=query,
         profile_hint=profile_hint,
         extra=extra,
@@ -590,6 +633,7 @@ def graphql_search_params(
     limit: int,
     coordinates: tuple[float, float] | None,
     session_id: str,
+    zip_code: str | None = None,
 ) -> list[dict[str, str]]:
     params = [
         {"key": "q", "value": task.term},
@@ -602,6 +646,9 @@ def graphql_search_params(
     if coordinates is not None:
         params.append({"key": "lat", "value": f"{coordinates[0]:.6f}"})
         params.append({"key": "lon", "value": f"{coordinates[1]:.6f}"})
+    zip_code = (zip_code or "").strip()[:5]
+    if zip_code.isdigit() and len(zip_code) == 5:
+        params.append({"key": "zipcode", "value": zip_code})
     if task.price_min is not None:
         params.append({"key": "price_min", "value": str(task.price_min)})
     if task.price_max is not None:

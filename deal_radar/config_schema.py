@@ -198,6 +198,23 @@ class SourceCommon(Strict):
     lease_ttl_seconds: OptFloat = None  # enable Redis active/passive fail-over
 
 
+class EbayQuery(Strict):
+    """One explicit, coalesced Browse search.
+
+    eBay's ``q`` supports OR groups — ``rtx (5090, 4090, 3090)`` means "rtx" AND any of
+    the three — so a single call can cover several profiles. Every result still goes
+    through the text filter, which assigns the real profile. Fewer calls per poll means
+    a shorter quota-derived interval (see docs/ARCHITECTURE.md §2.2).
+    """
+
+    q: str = Field(min_length=1, max_length=100)
+    category_id: OptStr = None
+    price_min: OptFloat = Field(default=None, ge=0)
+    price_max: OptFloat = Field(default=None, gt=0)
+    condition_ids: list[int] = Field(default_factory=list)
+    profile_hint: OptStr = None
+
+
 class EbaySource(SourceCommon):
     reliability: float = Field(default=0.95, ge=0, le=1)
     poll_interval_seconds: float = Field(default=60.0, gt=0)
@@ -216,6 +233,7 @@ class EbaySource(SourceCommon):
         default_factory=lambda: ["FIXED_PRICE", "BEST_OFFER"]
     )
     max_concurrency: int = Field(default=4, ge=1, le=32)
+    queries: list[EbayQuery] = Field(default_factory=list)  # non-empty => replaces per-profile term searches
 
     @model_validator(mode="after")
     def _creds(self) -> "EbaySource":
@@ -1068,6 +1086,7 @@ __all__ = [
     "DedupSection",
     "DiscordTarget",
     "DispatchSection",
+    "EbayQuery",
     "EbaySource",
     "FbMarketplaceSource",
     "FieldMap",
