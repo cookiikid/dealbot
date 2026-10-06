@@ -225,7 +225,7 @@ class DealRadarApp:
             source_weights=sc.source_history_weights,
         )
         since = utcnow() - timedelta(days=sc.history_window_days)
-        rows = await self.db.load_price_history(since, max_per_key=sc.history_max_samples)
+        rows = await self.db.load_price_history(since, max_per_key=sc.history_max_samples, max_risk=sc.history_max_risk)
         loaded = history.load(
             (history_key(product_key, condition_class), listing_key, price, observed_at, source)
             for product_key, condition_class, listing_key, price, observed_at, source in rows

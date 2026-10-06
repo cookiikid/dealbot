@@ -573,6 +573,7 @@ __all__ = [
     "HttpStatusError",
     "IdentityRotator",
     "NetworkSettings",
+    "RETRYABLE_STATUSES",
     "ResponseTooLarge",
     "TRANSIENT_EXCEPTIONS",
     "build_header_profiles",
