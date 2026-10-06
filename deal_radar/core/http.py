@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import ssl
 import time
 from collections import OrderedDict
@@ -308,15 +309,69 @@ def cache_bust(url: str, param: str = "_", value: str | None = None) -> str:
 # --------------------------------------------------------------------------- client
 
 
-class HttpStatusError(Exception):
-    """Non-retryable HTTP status (or retries exhausted on a retryable one)."""
+_SECRET_PARAMS = frozenset(
+    {"apikey", "api_key", "key", "token", "access_token", "client_secret", "secret", "sig", "signature", "password", "auth"}
+)
+_DISCORD_WEBHOOK = re.compile(r"(/api(?:/v\d+)?/webhooks/\d+/)[^/?#]+")
+_TELEGRAM_BOT = re.compile(r"(/bot)\d+:[A-Za-z0-9_-]+")
 
-    def __init__(self, status: int, url: str, body: str = "", headers: Mapping[str, str] | None = None) -> None:
-        super().__init__(f"HTTP {status} for {url}: {body[:300]}")
+
+def redact_url(url: str) -> str:
+    """Strip credentials from a URL before it reaches an exception message or a log line.
+
+    Masks secret-looking query parameters (``apiKey``, ``token``...), userinfo, Discord
+    webhook tokens (``/webhooks/<id>/<token>``) and Telegram bot tokens (``/bot<id>:<tok>``).
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<unparseable url>"
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    path = _TELEGRAM_BOT.sub(r"\1<redacted>", _DISCORD_WEBHOOK.sub(r"\1<redacted>", parts.path))
+    query = urlencode(
+        [(k, "<redacted>" if k.lower() in _SECRET_PARAMS else v) for k, v in parse_qsl(parts.query, keep_blank_values=True)],
+        safe="<>",
+    )
+    return urlunsplit((parts.scheme, netloc, path, query, ""))
+
+
+class HttpStatusError(Exception):
+    """Unexpected HTTP status (non-retryable, or retries exhausted on a retryable one).
+
+    ``url`` is always credential-redacted; ``body`` (first 64 KB) and case-insensitive
+    ``headers`` are preserved so callers can read e.g. Discord's JSON ``retry_after``
+    or ``X-RateLimit-*`` headers. ``retry_after`` carries the parsed ``Retry-After``.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        url: str,
+        body: str = "",
+        headers: Mapping[str, str] | None = None,
+        *,
+        retry_after: float | None = None,
+    ) -> None:
+        safe_url = redact_url(url)
+        super().__init__(f"HTTP {status} for {safe_url}: {body[:300]}")
         self.status = status
-        self.url = url
+        self.url = safe_url
         self.body = body
         self.headers: Mapping[str, str] = CIMultiDict(headers or {})
+        self.retry_after = retry_after
+
+
+class RetryableHttpError(RetryableError):
+    """A retryable status (429/5xx) that still carries the response for the final error."""
+
+    def __init__(self, status: int, url: str, body: str, headers: Mapping[str, str], retry_after: float | None) -> None:
+        super().__init__(f"HTTP {status} from {urlsplit(url).hostname or '?'}", retry_after=retry_after, status=status)
+        self.url = url
+        self.body = body
+        self.headers = headers
+
+    def to_status_error(self) -> HttpStatusError:
+        return HttpStatusError(self.status or 0, self.url, self.body, self.headers, retry_after=self.retry_after)
 
 
 @dataclass(slots=True)
@@ -503,8 +558,8 @@ class HttpClient:
                     if status in RETRYABLE_STATUSES:
                         if retry_after is not None and bucket is not None:
                             bucket.penalize(retry_after)
-                        raise RetryableError(f"HTTP {status} from {host}", retry_after=retry_after, status=status)
-                    raise HttpStatusError(status, str(resp.url), text, resp_headers)
+                        raise RetryableHttpError(status, str(resp.url), text, resp_headers, retry_after)
+                    raise HttpStatusError(status, str(resp.url), text, resp_headers, retry_after=retry_after)
             finally:
                 elapsed = _ms(started)
                 self._latency.observe(elapsed, host=host)
@@ -517,14 +572,14 @@ class HttpClient:
         if not retry:
             try:
                 return await _once()
-            except RetryableError as exc:
-                raise HttpStatusError(exc.status or 0, url, str(exc)) from exc
+            except RetryableHttpError as exc:
+                raise exc.to_status_error() from None
         try:
             return await retry_async(_once, policy=policy or self.settings.retry, retry_on=TRANSIENT_EXCEPTIONS, on_retry=_on_retry)
         except RetryExhausted as exc:
             last = exc.last_exc
-            if isinstance(last, RetryableError) and last.status:
-                raise HttpStatusError(last.status, url, str(last)) from exc
+            if isinstance(last, RetryableHttpError):
+                raise last.to_status_error() from None
             raise
 
     async def get_json(self, url: str, **kwargs: Any) -> HttpResponse:
@@ -597,6 +652,7 @@ __all__ = [
     "NetworkSettings",
     "RETRYABLE_STATUSES",
     "ResponseTooLarge",
+    "RetryableHttpError",
     "TRANSIENT_EXCEPTIONS",
     "build_header_profiles",
     "cache_bust",
@@ -605,4 +661,5 @@ __all__ = [
     "estimate_chrome_major",
     "json_dumps",
     "json_loads",
+    "redact_url",
 ]

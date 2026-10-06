@@ -365,6 +365,35 @@ async def test_http_client_non_retryable_status_raises(server: TestServer, clien
     assert info.value.status == 403 and "blocked" in info.value.body
 
 
+def test_redact_url_masks_credentials() -> None:
+    from deal_radar.core.http import redact_url
+
+    assert redact_url("https://discord.com/api/v10/webhooks/123/abcDEF_tok?wait=true") == (
+        "https://discord.com/api/v10/webhooks/123/<redacted>?wait=true"
+    )
+    assert "SECRET" not in redact_url("https://api.telegram.org/bot123456:SECRET-tok_x/sendMessage")
+    red = redact_url("https://api.bestbuy.com/v1/products(sku in(1))?apiKey=SECRET&format=json")
+    assert "SECRET" not in red and "format=json" in red
+    assert "pw" not in redact_url("https://user:pw@example.com/x")
+
+
+async def test_http_client_status_errors_keep_body_and_redact(server: TestServer, client: HttpClient) -> None:
+    url = str(server.make_url("/forbidden")) + "?apiKey=SECRET"
+    with pytest.raises(HttpStatusError) as info:
+        await client.get_json(url)
+    assert "SECRET" not in str(info.value) and "SECRET" not in info.value.url
+    assert info.value.body == "blocked"
+
+
+async def test_http_client_retry_false_preserves_retryable_response(server: TestServer, client: HttpClient) -> None:
+    server.state["flaky"] = -10  # type: ignore[attr-defined]  # keep returning 503
+    with pytest.raises(HttpStatusError) as info:
+        await client.get_json(str(server.make_url("/flaky")) + "?token=SECRET", retry=False)
+    assert info.value.status == 503 and info.value.retry_after == 0.0
+    assert info.value.headers.get("retry-after") == "0"
+    assert "SECRET" not in str(info.value)
+
+
 async def test_http_client_max_bytes_and_text(server: TestServer, client: HttpClient) -> None:
     with pytest.raises(ResponseTooLarge):
         await client.get_bytes(str(server.make_url("/big")), max_bytes=1000)

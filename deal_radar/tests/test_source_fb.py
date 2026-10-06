@@ -1020,7 +1020,9 @@ async def test_poll_restarts_a_crashed_browser(tmp_path: Path, http: HttpClient,
 async def test_poll_turns_navigation_failures_into_source_error(tmp_path: Path, http: HttpClient) -> None:
     exe = await _require_chromium("full")
     cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0)
-    _write_state(Path(cfg.browser.storage_state_path))
+    state_path = Path(cfg.browser.storage_state_path)
+    _write_state(state_path)
+    original_state = state_path.read_text()
     metrics = Metrics()
     # Nothing listens on port 9: every navigation fails with a Playwright error.
     ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config(), metrics), base_url="http://127.0.0.1:9")
@@ -1032,7 +1034,7 @@ async def test_poll_turns_navigation_failures_into_source_error(tmp_path: Path, 
     finally:
         await ingestor.teardown()
     assert metrics.counter("fb_queries_total", "", ("outcome",)).value(outcome="error") == 1
-    assert not Path(cfg.browser.storage_state_path).with_suffix(".json.tmp").exists()
+    assert state_path.read_text() == original_state  # a session that never worked is not written back
 
 
 # --------------------------------------------------------------------------- CLI
