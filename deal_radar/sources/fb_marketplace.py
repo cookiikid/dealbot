@@ -893,6 +893,8 @@ class FbMarketplaceIngestor(BaseIngestor):
         self.cfg: FbMarketplaceSource = cfg
         # Only tests point this elsewhere; listing URLs always use FB_BASE_URL.
         self.base_url = (base_url or FB_BASE_URL).rstrip("/")
+        if hasattr(cfg, "max_searches_per_hour"):  # honoured once the config schema exposes it
+            self.max_searches_per_hour = cfg.max_searches_per_hour
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None

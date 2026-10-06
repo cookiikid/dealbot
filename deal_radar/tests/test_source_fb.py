@@ -1584,3 +1584,17 @@ def test_parse_stats_report_search_feeds() -> None:
     assert stats["search_feeds"] == 1 and stats["nodes"] == 0
     _, stats = fb.parse_payloads([("graphql", json.dumps({"data": [{"id": "1", "marketplace_listing_title": "x"}]}))])
     assert stats["search_feeds"] == 0 and stats["nodes"] == 1
+
+
+def test_hourly_search_cap_follows_config_when_the_schema_has_it(tmp_path: Path, http: HttpClient) -> None:
+    class _CappedSource(FbMarketplaceSource):
+        max_searches_per_hour: int | None = 12
+
+    base = _fb_cfg(tmp_path, None)
+    capped = _CappedSource(**{name: getattr(base, name) for name in FbMarketplaceSource.model_fields})
+    assert fb.FbMarketplaceIngestor(capped, _ctx(http, _app_config())).max_searches_per_hour == 12
+    unlimited = _CappedSource(**{**{name: getattr(base, name) for name in FbMarketplaceSource.model_fields},
+                                 "max_searches_per_hour": None})
+    ingestor = fb.FbMarketplaceIngestor(unlimited, _ctx(http, _app_config()))
+    assert ingestor.max_searches_per_hour is None and ingestor._searches_left() is None
+    assert fb.FbMarketplaceIngestor(base, _ctx(http, _app_config())).max_searches_per_hour == fb.MAX_SEARCHES_PER_HOUR
