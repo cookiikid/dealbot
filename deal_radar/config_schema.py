@@ -274,6 +274,9 @@ class RedditSource(SourceCommon):
 class FeedSpec(Strict):
     name: str
     url: str
+    # Per-feed cadence: e.g. the Hot Deals forum every ~30 s, frontpage/popular every few
+    # minutes. None => every poll of the source.
+    interval_seconds: OptFloat = Field(default=None, gt=0)
 
 
 class SlickdealsSource(SourceCommon):
@@ -303,6 +306,7 @@ class FieldMap(Strict):
 class _EndpointCommon(Strict):
     name: str
     retailer: str
+    currency: str = "USD"  # Shopify/generic JSON rarely state their currency
     profile_hint: OptStr = None
     poll_interval_seconds: OptFloat = None  # per-endpoint override
     cache_bust: bool = False

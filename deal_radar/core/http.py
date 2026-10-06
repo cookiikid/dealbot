@@ -548,7 +548,9 @@ class HttpClient:
                         return HttpResponse(304, str(resp.url), resp_headers, None, True, _ms(started), attempts)
                     if status in expected:
                         body = await _read_limited(resp, max_bytes)
-                        if conditional:
+                        if conditional and 200 <= status < 300:
+                            # Only real content updates validators: a 403/429/435 block page
+                            # that a caller chose to "expect" must not wipe a good ETag.
                             self.conditional.store(cond_key, resp_headers)
                         return HttpResponse(status, str(resp.url), resp_headers, _parse(body, parse, resp), False, _ms(started), attempts)
                     text = (await _read_limited(resp, 64_000)).decode("utf-8", "replace")

@@ -66,6 +66,7 @@ from sqlalchemy.dialects import postgresql as pg_dialect
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy.sql.dml import Insert
 
 from deal_radar.core.logs import get_logger
@@ -542,9 +543,17 @@ class Database:
             path = _sqlite_file_path(self.url)
             if path is not None:
                 path.parent.mkdir(parents=True, exist_ok=True)
-            # File databases use AsyncAdaptedQueuePool, :memory: uses StaticPool (SQLAlchemy
-            # defaults); SQLite has a single writer anyway, so no pool sizing is passed.
-            engine = create_async_engine(self.url, **common)
+                # SQLAlchemy's default AsyncAdaptedQueuePool; SQLite has a single writer
+                # anyway (busy_timeout queues writers), so no pool sizing is passed.
+                engine = create_async_engine(self.url, **common)
+            else:
+                # An in-memory database lives in exactly one connection. SQLAlchemy's
+                # default StaticPool hands that connection to every concurrent checkout,
+                # so a reader's reset-on-return ROLLBACK would wipe a Recorder transaction
+                # half-way. A one-connection queue pool makes checkouts exclusive instead.
+                engine = create_async_engine(
+                    self.url, poolclass=AsyncAdaptedQueuePool, pool_size=1, max_overflow=0, pool_recycle=-1, **common
+                )
             event.listen(engine.sync_engine, "connect", _apply_sqlite_pragmas)
         else:
             engine = create_async_engine(
