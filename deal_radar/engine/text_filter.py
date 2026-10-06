@@ -39,8 +39,8 @@ Negation (``negatable`` groups only) is evaluated per match, not by masking:
   *scope enders* sits between the term and the match ("no **box** cracked screen",
   "no **returns** untested", "no issues **except** dead pixels") the term is
   attached to that word and does not negate the match.
-* Form-style answers directly after the match are negations too:
-  "Dead pixels: none", "Burn-in: no", "Mining: never".
+* Form-style answers after the match (optionally after up to two more label
+  words) are negations too: "Dead pixels: none", "Burn-in: no", "Mining: never".
 
 Performance design
 ------------------
@@ -710,7 +710,8 @@ class TextFilter:
         self._trailing_neg: re.Pattern[str] | None = None
         if terms:
             alts = "|".join(r"\W+".join(re.escape(w).replace("'", "['’]") for w in t) for t in terms)
-            self._trailing_neg = re.compile(rf"\s*[:=]\s*(?:{alts})(?![\w'’])")
+            # "Dead pixels: none" - the label may continue for up to two words after the match
+            self._trailing_neg = re.compile(rf"(?:[ \t]+[^\W\d_]+){{0,2}}?\s*[:=]\s*(?:{alts})(?![\w'’])")
 
         self._profiles: tuple[_Profile, ...] = tuple(
             sorted(

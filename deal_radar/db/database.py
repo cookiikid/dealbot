@@ -861,10 +861,8 @@ class Recorder:
             if not self._stopping and self._queue.qsize() < self.batch_size:
                 # Accumulate until the batch fills up or the flush window closes.
                 self._flush_now.clear()
-                try:
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._flush_now.wait(), self.flush_seconds)
-                except TimeoutError:
-                    pass
             await self._flush(self._take_batch())
 
     async def _flush(self, batch: list[_Entry]) -> None:

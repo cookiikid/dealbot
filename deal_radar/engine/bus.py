@@ -13,8 +13,22 @@ Two interchangeable backends share one tiny interface (:class:`ListingBus`):
 ``RedisStreamBus`` (distributed)
     One Redis Stream (``{prefix}{bus.stream_key}``) and one consumer group
     (``bus.group``). Collectors ``XADD`` with ``MAXLEN ~ bus.maxlen`` (approximate
-    trimming is O(1) amortised: Redis drops whole macro-nodes). Processors use the
-    node id as consumer name and fetch, in priority order:
+    trimming is O(1) amortised: Redis drops whole macro-nodes) a single field ``d``
+    holding ``RawListing.model_dump_json()``. Encoding never fails: scraped text with
+    lone UTF-16 surrogates (truncated emoji in upstream JSON), undecodable ``bytes`` or
+    reference cycles in ``extra`` are scrubbed (:func:`encode_listing`) instead of
+    raising out of the source loop.
+
+    ``publish`` treats an unreachable Redis exactly like a full memory queue: it waits
+    (capped exponential backoff, rate-limited warnings) until the entry is written or
+    the bus is closed (:class:`BusClosedError`). A collector on a flaky residential
+    link therefore pauses during an outage and resumes afterwards instead of losing
+    its source loops; only non-transient errors (``WRONGTYPE``, ``NOPERM``...) raise
+    :class:`BusError`, and those already surface at :meth:`start` on boot.
+    ``OOM`` is treated as transient for publishing: memory comes back as processors
+    ack and TTL'd keys expire.
+
+    Processors use the node id as consumer name and fetch, in priority order:
 
     1. their *own* pending entries (``XREADGROUP ... 0``) once at start-up — a
        restarted node resumes exactly what it held when it crashed, without waiting
@@ -54,7 +68,7 @@ Metrics: ``bus_published_total``, ``bus_consumed_total``, ``bus_poison_total``,
 ``bus_backlog`` (memory: queue size; Redis: consumer-group lag — entries not yet
 delivered to the group — falling back to ``XLEN`` when the lag is unknown),
 plus ``bus_pending``, ``bus_recovered_total{via}``, ``bus_lost_total``,
-``bus_backpressure_total`` and ``bus_errors_total{op}``.
+``bus_backpressure_total``, ``bus_sanitized_total`` and ``bus_errors_total{op}``.
 """
 
 from __future__ import annotations
@@ -67,7 +81,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from redis import exceptions as redis_exc
 
 from deal_radar.core.backoff import BackoffPolicy, ExponentialBackoff, RetryExhausted, retry_async
@@ -96,7 +110,13 @@ TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
 )
 
-_PUBLISH_POLICY = BackoffPolicy(max_attempts=4, base_delay=0.05, max_delay=1.0, max_total_seconds=5.0)
+# Errors a publisher waits out instead of failing: transport trouble plus a full Redis
+# (memory returns as processors ack and TTL'd dedup keys expire).
+PUBLISH_RETRY_ERRORS: tuple[type[BaseException], ...] = (*TRANSIENT_ERRORS, redis_exc.OutOfMemoryError)
+
+_PUBLISH_BACKOFF_BASE = 0.05  # seconds; doubles per consecutive failure ("equal" jitter)
+_PUBLISH_BACKOFF_CAP = 2.0
+_PUBLISH_LOG_INTERVAL = 30.0  # at most one "still failing" warning per publisher per interval
 _START_POLICY = BackoffPolicy(max_attempts=6, base_delay=0.2, max_delay=2.0, max_total_seconds=15.0)
 _BACKLOG_REFRESH_SECONDS = 2.0
 _INFLIGHT_MAX = 100_000  # bound on locally tracked un-acked entry ids
@@ -107,7 +127,7 @@ class BusClosedError(RuntimeError):
 
 
 class BusError(Exception):
-    """Publishing failed after retries (Redis unreachable, OOM, ...)."""
+    """Non-transient Redis failure (``WRONGTYPE``, ``NOPERM``...), or ``start`` gave up."""
 
 
 @dataclass
@@ -356,6 +376,60 @@ def decode_payload(fields: Mapping[Any, Any] | None) -> tuple[RawListing | None,
 def _json_fallback(value: Any) -> Any:
     """Serialise exotic ``extra`` values (objects, enums from other libs) as strings."""
     return str(value)
+
+
+_SCRUB_MAX_DEPTH = 24  # deeper (or cyclic) ``extra`` structures collapse to their repr
+
+
+def _clean_str(value: str) -> str:
+    """Valid UTF-8 text: re-pair split surrogates, replace lone ones with U+FFFD."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+
+def _scrub(value: Any, depth: int = 0) -> Any:
+    """JSON-safe copy of ``value``: clean text, decoded bytes, no cycles."""
+    if isinstance(value, str):
+        return _clean_str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", "replace")
+    if depth >= _SCRUB_MAX_DEPTH and isinstance(value, (Mapping, list, tuple, set, frozenset, BaseModel)):
+        try:
+            return _clean_str(repr(value))[:1000]  # repr() renders cycles as {...} / [...]
+        except Exception:  # noqa: BLE001 - hostile __repr__
+            return "<unrepresentable>"
+    if isinstance(value, BaseModel):
+        return _scrub(value.model_dump(), depth + 1)
+    if isinstance(value, Mapping):
+        return {
+            (_scrub(k, depth + 1) if isinstance(k, (str, bytes)) else k): _scrub(v, depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_scrub(v, depth + 1) for v in value]
+    return value  # numbers, datetimes, enums...; anything else goes through _json_fallback
+
+
+def encode_listing(raw: RawListing) -> tuple[str, bool]:
+    """``RawListing`` -> stream payload. Returns ``(json, sanitized)`` and never raises.
+
+    The fast path is plain ``model_dump_json``. It fails on lone surrogates, invalid
+    UTF-8 ``bytes`` and reference cycles, so the slow path scrubs every field and
+    re-validates; if ``extra`` still cannot be serialised it is replaced by a marker.
+    """
+    try:
+        return raw.model_dump_json(fallback=_json_fallback), False
+    except (ValueError, TypeError):  # PydanticSerializationError is a ValueError
+        pass
+    data = {name: _scrub(getattr(raw, name)) for name in type(raw).model_fields}
+    try:
+        return RawListing.model_validate(data).model_dump_json(fallback=_json_fallback), True
+    except (ValueError, TypeError):
+        data["extra"] = {"bus_unserializable_extra": True}
+        return RawListing.model_validate(data).model_dump_json(fallback=_json_fallback), True
 
 
 class RedisStreamBus(ListingBus):
