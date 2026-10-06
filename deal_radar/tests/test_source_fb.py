@@ -864,7 +864,7 @@ async def _run_against(
     _write_state(Path(cfg.browser.storage_state_path))
     ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config(), metrics), base_url=str(server.make_url("/")))
     ingestor.results_timeout_seconds = 3.0
-    ingestor.scroll_settle_seconds = 1.5
+    ingestor.scroll_settle_seconds = 5.0  # returns as soon as the pagination payload arrived
     results: list[list[Any]] = []
     try:
         for _ in range(polls):
