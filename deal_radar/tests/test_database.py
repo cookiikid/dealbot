@@ -274,6 +274,31 @@ async def test_in_memory_sqlite_works() -> None:
         await database.close()
 
 
+async def test_in_memory_sqlite_survives_concurrent_readers_and_writers() -> None:
+    # With SQLAlchemy's default StaticPool every checkout shares the one connection, so a
+    # concurrent reader's reset-on-return ROLLBACK wiped the writer's open transaction
+    # (FOREIGN KEY failures, all rows lost).
+    database = Database("sqlite+aiosqlite://")
+    await database.connect()
+    try:
+        items = [make_item(f"m{i}") for i in range(50)]
+
+        async def writer(offset: int) -> None:
+            for r in range(5):
+                at = T0 + timedelta(minutes=offset + r)
+                await database.write_snapshots([rec(i, accepted_fr(), make_score(), at) for i in items])
+
+        async def reader() -> None:
+            for _ in range(40):
+                await database.counts()
+                await database.recent_alerts()
+
+        await asyncio.gather(writer(0), reader(), writer(100), reader())
+        assert await database.counts() == {"listings": 50, "snapshots": 50 * 10, "alerts": 0}
+    finally:
+        await database.close()
+
+
 def test_rejects_unsupported_database_url() -> None:
     with pytest.raises(ValueError, match="unsupported"):
         Database("mysql+aiomysql://user:pw@localhost/deals")
