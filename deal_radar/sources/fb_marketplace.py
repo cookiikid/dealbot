@@ -851,6 +851,9 @@ class FbMarketplaceIngestor(BaseIngestor):
     drain_timeout_seconds: float = 5.0
     #: Search navigations allowed per sliding hour for the account (``None`` disables).
     max_searches_per_hour: int | None = MAX_SEARCHES_PER_HOUR
+    #: Upper bound for each shutdown step (state save, page/context/browser close, driver
+    #: stop): a wedged renderer or driver must never block process shutdown.
+    close_timeout_seconds: float = 10.0
 
     def __init__(self, cfg: FbMarketplaceSource, ctx: IngestorContext, *, base_url: str | None = None) -> None:
         super().__init__(cfg, ctx)
@@ -961,18 +964,22 @@ class FbMarketplaceIngestor(BaseIngestor):
             await asyncio.wait(pending, timeout=1.0)
         page, context, browser, playwright = self._page, self._context, self._browser, self._playwright
         self._page = self._context = self._browser = self._playwright = None
+        steps: list[tuple[str, Callable[[], Any]]] = []
         if page is not None:
-            with contextlib.suppress(Exception):
-                await page.close()
+            steps.append(("page", page.close))
         if context is not None:
-            with contextlib.suppress(Exception):
-                await context.close()
+            steps.append(("context", context.close))
         if browser is not None:
-            with contextlib.suppress(Exception):
-                await browser.close()
+            steps.append(("browser", browser.close))
         if playwright is not None:
-            with contextlib.suppress(Exception):
-                await playwright.stop()
+            steps.append(("playwright", playwright.stop))  # also kills a browser that ignored close()
+        for what, close in steps:
+            try:
+                await asyncio.wait_for(close(), timeout=self.close_timeout_seconds)
+            except asyncio.TimeoutError:
+                self.log.warning("browser shutdown step timed out", extra={"source": self.name, "step": what})
+            except Exception:  # noqa: BLE001, S110 - already dead objects raise on close; nothing to do
+                pass
 
     async def _new_page(self) -> "Page":
         assert self._context is not None
@@ -1027,7 +1034,7 @@ class FbMarketplaceIngestor(BaseIngestor):
         self._page = None
         try:
             self._page = await self._new_page()
-        except PlaywrightError as exc:  # the context itself is gone (e.g. Playwright driver died)
+        except Exception as exc:  # noqa: BLE001 - the context itself is gone (e.g. Playwright driver died)
             self.log.warning("could not open a tab; restarting the browser", extra={"source": self.name, "error": str(exc)[:200]})
             await self.setup()
         assert self._page is not None
@@ -1056,7 +1063,7 @@ class FbMarketplaceIngestor(BaseIngestor):
             return
         path = Path(self.cfg.browser.storage_state_path).expanduser()
         try:
-            state = await context.storage_state()
+            state = await asyncio.wait_for(context.storage_state(), timeout=self.close_timeout_seconds)
             cookies = state.get("cookies") if isinstance(state, Mapping) else None
             if not has_session_cookie(cookies if isinstance(cookies, list) else []):
                 level = self.log.debug if self.cfg.browser.user_data_dir else self.log.warning
@@ -1156,6 +1163,15 @@ class FbMarketplaceIngestor(BaseIngestor):
                 if dead is not None:
                     raise SourceError(f"{dead} during search {term!r}: {exc}") from exc
                 listings = []
+            except SourceError:
+                raise  # walls (SourceBlocked) and config problems keep their meaning
+            except Exception as exc:  # noqa: BLE001 - e.g. the Playwright driver process died
+                # A dead driver raises plain Exceptions while is_connected() stays True:
+                # only a full restart (new driver, browser and context) recovers.
+                self._m_queries.inc(outcome="error")
+                self._needs_restart = True
+                self._restart_reason = "browser died"
+                raise SourceError(f"browser connection lost during search {term!r}: {exc!r}") from exc
             else:
                 completed += 1
                 self._m_queries.inc(outcome="ok")
@@ -1213,7 +1229,8 @@ class FbMarketplaceIngestor(BaseIngestor):
                 await self._wait_for_more(sink, before)
             await self._drain_pending()
             await self._raise_if_blocked(page, None)  # logged-out walls appear after scrolling
-            embedded: list[str] = await page.evaluate(_EMBEDDED_JSON_JS, list(PAYLOAD_MARKERS))
+            found = await page.evaluate(_EMBEDDED_JSON_JS, list(PAYLOAD_MARKERS))
+            embedded = [text for text in found if isinstance(text, str)] if isinstance(found, list) else []
         finally:
             self._capture = None
         self._m_payloads.inc(len(embedded), kind="embedded")
@@ -1236,6 +1253,7 @@ class FbMarketplaceIngestor(BaseIngestor):
             )
         if not listings:
             cards = await page.evaluate(_DOM_CARDS_JS, [ITEM_LINK_SELECTOR, limit])
+            cards = [card for card in cards if isinstance(card, Mapping)] if isinstance(cards, list) else []
             listings = parse_dom_cards(cards, query=term, profile_hint=profile.id)
             if listings:
                 self._m_payloads.inc(kind="dom")
@@ -1422,9 +1440,20 @@ async def run_login(
                     print("The browser window was closed before the login finished.")
                     return 1
                 cookies = await context.cookies()
-                if has_session_cookie(cookies) and detect_block(page.url) not in ("checkpoint", "login_required"):
-                    logged_in = True
-                    break
+                if has_session_cookie(cookies):
+                    # Cookies alone are not proof: a stale (server-side invalidated) session
+                    # loaded from the old file keeps c_user/xs while Facebook shows its login
+                    # form or a checkpoint. Require a page that is not a wall as well.
+                    probe = await _page_probe(page)
+                    wall = detect_block(
+                        page.url,
+                        title=str(probe.get("title") or ""),
+                        text=str(probe.get("text") or ""),
+                        has_login_form=bool(probe.get("loginForm")),
+                    )
+                    if wall is None:
+                        logged_in = True
+                        break
                 await asyncio.sleep(LOGIN_POLL_SECONDS)
             if not logged_in:
                 print("Timed out waiting for the login; nothing was saved.")
@@ -1463,7 +1492,12 @@ async def run_check(config: AppConfig, *, base_url: str = FB_BASE_URL) -> int:
             print(f"NOT logged in: {problem}. Run --login again.")
             return 1
     async with async_playwright() as playwright:
-        browser, context = await new_stealth_context(playwright, browser_cfg, geo)
+        try:
+            browser, context = await new_stealth_context(playwright, browser_cfg, geo)
+        except PlaywrightError as exc:
+            print(f"Could not start the browser ({str(exc).splitlines()[0][:300]}).\n"
+                  "Install it with `playwright install chromium` or set browser.executable_path.")
+            return 1
         try:
             page = await context.new_page()
             await page.goto(f"{base_url}/marketplace/", wait_until="domcontentloaded")

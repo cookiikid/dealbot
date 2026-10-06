@@ -10,12 +10,14 @@ stored under ``tests/fixtures/reddit/``.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
+import inspect
 import json
 import random
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +38,7 @@ from deal_radar.sources.reddit_stream import (
     INSTALLED_CLIENT_GRANT,
     OAUTH_BASE,
     PUBLIC_BASE,
+    RATE_LIMIT_MAX_RESET_SECONDS,
     TOKEN_REFRESH_MARGIN_SECONDS,
     TOKEN_URL,
     UNAUTH_BLOCK_COOLDOWN_SECONDS,
@@ -111,7 +114,7 @@ class Seen:
     form: dict[str, str]
 
 
-Responder = Callable[[Seen], web.StreamResponse]
+Responder = Callable[[Seen], "web.StreamResponse | Awaitable[web.StreamResponse]"]
 
 
 def reply(
@@ -162,7 +165,8 @@ class FakeReddit:
         if not queue:
             return web.Response(status=418, text=f"unrouted {request.method} {request.path}")
         responder = queue.pop(0) if len(queue) > 1 else queue[0]
-        return responder(seen)
+        result = responder(seen)
+        return await result if inspect.isawaitable(result) else result
 
 
 @pytest.fixture
@@ -1125,3 +1129,67 @@ async def test_unknown_inaccessible_reasons_do_not_explode_metric_labels(http: H
     reddit.on("GET", PUBLIC_HWS, reply(403, {"reason": "Some new reason 8f2a1c0d9e!", "error": 403}))
     assert await ing.poll() == []
     assert ing.m_posts.value(subreddit="hardwareswap", outcome="inaccessible_other") == 1
+
+
+def test_link_post_with_body_keeps_the_body() -> None:
+    # Reddit allows link posts with body text; coupon codes / condition notes live there.
+    data = post("buildapcsales_new.json", "1nyk2gq")
+    data["selftext"] = "Use code **GPU20** at checkout. Open-box units also in store."
+    raw = parse_deal_post(data, subreddit="buildapcsales")
+    assert raw.description == data["selftext"]
+    assert raw.outbound_url is not None and raw.outbound_url.startswith("https://www.bestbuy.com/")
+
+
+async def test_absurd_ratelimit_reset_is_clamped(http: HttpClient, reddit: FakeReddit) -> None:
+    clock = FakeClock()
+    ing = make_ingestor(http, reddit, env=OAUTH_ENV, clock=clock, subreddits=[{"name": "buildapcsales"}])
+    reddit.on("POST", TOKEN_PATH, reply(200, token_payload()))
+    reddit.on("GET", OAUTH_BAPCS, listing_reply("buildapcsales_new.json", headers={
+        "x-ratelimit-used": "999", "x-ratelimit-remaining": "0.0", "x-ratelimit-reset": "86400"}))
+    await ing.poll()
+    assert ing.next_interval() <= RATE_LIMIT_MAX_RESET_SECONDS + 3.0
+    reddit.reset()
+    reddit.on("GET", OAUTH_BAPCS, reply(429, body=b"", content_type="text/plain", headers={"x-ratelimit-reset": "86400"}))
+    clock.now += RATE_LIMIT_MAX_RESET_SECONDS + 1
+    with pytest.raises(SourceBlocked) as info:
+        await ing.poll()
+    assert info.value.cooldown_seconds is not None and info.value.cooldown_seconds <= RATE_LIMIT_MAX_RESET_SECONDS + 1.0
+
+
+async def test_cancelled_poll_during_token_refresh_releases_the_lock(http: HttpClient, reddit: FakeReddit) -> None:
+    ing = make_ingestor(http, reddit, env=OAUTH_ENV, subreddits=[{"name": "buildapcsales"}])
+    gate = asyncio.Event()
+
+    async def slow_token(_seen: Seen) -> web.StreamResponse:
+        await gate.wait()
+        return web.json_response(token_payload("tok-slow"))
+
+    reddit.on("POST", TOKEN_PATH, slow_token, reply(200, token_payload("tok-2")))
+    reddit.on("GET", OAUTH_BAPCS, listing_reply("buildapcsales_new.json", headers=RL_OK))
+    task = asyncio.create_task(ing.poll())
+    for _ in range(500):
+        if reddit.calls("POST", TOKEN_PATH):
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    gate.set()
+    listings = await asyncio.wait_for(ing.poll(), timeout=5)  # the refresh lock was released
+    assert len(listings) == 4
+    assert [s.headers["Authorization"] for s in reddit.calls("GET", OAUTH_BAPCS)] == ["bearer tok-2"]
+
+
+async def test_run_once_times_out_cleanly_and_recovers(http: HttpClient, reddit: FakeReddit) -> None:
+    ing = make_ingestor(http, reddit, subreddits=[{"name": "buildapcsales"}], poll_timeout_seconds=0.2)
+    gate = asyncio.Event()
+
+    async def slow_listing(_seen: Seen) -> web.StreamResponse:
+        await gate.wait()
+        return web.json_response(fixture("buildapcsales_new.json", newest_age_s=60))
+
+    reddit.on("GET", PUBLIC_BAPCS, slow_listing, listing_reply("buildapcsales_new.json", newest_age_s=60))
+    with pytest.raises(asyncio.TimeoutError):
+        await ing.run_once()
+    gate.set()
+    assert len(await ing.run_once()) == 4

@@ -28,7 +28,14 @@ Transport
   block page raises :class:`SourceBlocked` with a multi-hour cooldown; a warning is
   logged once at startup.
 * ``raw_json=1`` opts out of Reddit's legacy HTML escaping of ``<``, ``>`` and ``&``
-  in JSON bodies, so titles and preview image URLs arrive verbatim.
+  in JSON bodies, so titles and preview image URLs arrive verbatim. URLs are therefore
+  never passed through ``html.unescape`` (it expands semicolon-less HTML5 legacy
+  entities: ``&region=us`` would become ``®ion=us``); only ``;``-terminated entities
+  such as the ``&amp;`` / ``&#x200B;`` that new Reddit's editor writes into markdown
+  are decoded.
+* Listing bodies are capped at :data:`MAX_LISTING_BYTES`; bodies of at least
+  :data:`PARSE_IN_THREAD_BYTES` are decoded and parsed in a worker thread (a page of
+  long swap posts is hundreds of ms of regex work that must not stall the event loop).
 * The User-Agent follows Reddit's API rules (``<platform>:<app id>:<version> (by
   /u/<username>)``) and is *never* a browser identity — Reddit forbids lying about
   the User-Agent and blocks spoofed ones.
@@ -45,7 +52,10 @@ concurrently, so the most pessimistic ``remaining`` of the current window wins.
 remain than one poll cycle needs (minimum :data:`RATE_LIMIT_MIN_REMAINING`), and
 otherwise (b) spreads the remaining budget evenly over the rest of the window, never
 polling faster than configured. A 429 (often with an empty body and no
-``Retry-After``) pauses the source until ``X-Ratelimit-Reset``.
+``Retry-After``) pauses the source until ``X-Ratelimit-Reset``. Reset values beyond
+:data:`RATE_LIMIT_MAX_RESET_SECONDS` (the documented window is 10 minutes) are clamped
+so a bogus header cannot stall the source for hours. When several subreddits fail in
+one poll, the :class:`SourceBlocked` with the longest cooldown wins.
 
 Freshness without the ``before`` cursor
 ---------------------------------------
@@ -79,7 +89,8 @@ Parsing
   flair is not BUYING/CLOSED/TRADING — the flair bot can lag, so the title decides
   when it is missing) with ``source_kind=LOCAL``. Title = the ``[H]`` part; prices are
   banned from swap titles, so price = the first ``$`` amount in the body that is not
-  struck through (``~~$500~~``) or marked sold (``[$200 Sold for $185 to /u/x]``);
+  struck through (``~~$500~~``) or marked sold (``[$200 Sold for $185 to /u/x]``,
+  ``Sold for $400``);
   ``extra["multi_item"]`` when ``[H]`` lists several items; seller trade count from
   the ``"Trades: N"`` user flair; images from direct i.imgur.com / i.redd.it links and
   inline media; the timestamp album link in ``extra["timestamps_url"]``; payment
@@ -94,13 +105,16 @@ import asyncio
 import base64
 import hashlib
 import html
+import itertools
 import re
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlsplit
+
+from pydantic import SecretStr
 
 from deal_radar.core.backoff import parse_retry_after
 from deal_radar.core.http import HttpClient, HttpResponse, HttpStatusError, json_loads
@@ -126,6 +140,9 @@ INSTALLED_CLIENT_GRANT = "https://oauth.reddit.com/grants/installed_client"
 UNAUTH_QPM = 10.0  # documented budget for logged-out access; floors the interval without headers
 RATE_LIMIT_MIN_REMAINING = 2  # wait for the window reset below this many remaining requests
 RATE_LIMIT_RESET_MARGIN_SECONDS = 1.0
+# The documented window is 10 minutes; a larger X-Ratelimit-Reset is treated as bogus and
+# clamped so one bad header cannot silently stall the source for hours.
+RATE_LIMIT_MAX_RESET_SECONDS = 900.0
 TOKEN_REFRESH_MARGIN_SECONDS = 120.0  # re-run the grant this long before expiry (capped at 10% of lifetime)
 TOKEN_SCOPE = "read"  # least privilege: /r/{sub}/new only needs the read scope
 DEFAULT_TOKEN_LIFETIME_SECONDS = 3600.0  # used if the token response omits expires_in
@@ -133,6 +150,22 @@ BLOCK_COOLDOWN_SECONDS = 1800.0  # HTML network-policy wall in OAuth mode
 UNAUTH_BLOCK_COOLDOWN_SECONDS = 6 * 3600.0  # public .json is shut down: a 403/429 there will not heal soon
 OAUTH_429_MIN_COOLDOWN_SECONDS = 30.0
 OAUTH_429_DEFAULT_COOLDOWN_SECONDS = 60.0  # 429 without X-Ratelimit-Reset / Retry-After
+# The OAuth2 wiki words ``expires_in`` as "Unix Epoch Seconds" while every client (and
+# every observed response) treats it as a relative lifetime: accept both.
+EPOCH_EXPIRES_IN_THRESHOLD = 1_000_000_000.0
+# 100 posts x 40k-char selftext (+ selftext_html) stays well below this; it only bounds
+# memory if a proxy or error page streams something absurd.
+MAX_LISTING_BYTES = 32 * 1024 * 1024
+MAX_TOKEN_BYTES = 64 * 1024
+# Bodies at least this large are JSON-decoded and parsed in a worker thread: a 100-post
+# page of long swap posts costs hundreds of ms of regex work that must not stall the loop.
+PARSE_IN_THREAD_BYTES = 256 * 1024
+MAX_IMAGES_PER_POST = 20  # the normalizer keeps 8; bounds work on image-dump posts
+MAX_PRICES_PER_POST = 20  # distinct amounts kept in extra["prices"]
+MAX_AMOUNTS_SCANNED = 200  # stop scanning a swap body after this many $ amounts / image links
+# Upstream ``reason`` values of 403/404 subreddit errors used as metric labels; anything
+# else is reported as "other" so a new upstream string cannot grow label cardinality.
+_INACCESSIBLE_REASONS = frozenset({"private", "banned", "quarantined", "gold_only", "gated", "restricted"})
 
 # 429 is accepted (not retried by the HTTP layer) because a short retry cannot fix an
 # exhausted window; 401/403/404 bodies are needed to tell token expiry, private
@@ -200,6 +233,8 @@ _TRADES_RE = re.compile(r"\btrades?\s*:\s*(\d+)", re.IGNORECASE)
 _STRIKE_RE = re.compile(r"~~.*?~~", re.DOTALL)
 # "[$200 Sold for $185 to /u/x]", "$400 - SOLD": amounts of items that are gone.
 _SOLD_RE = re.compile(r"\$\s?[\d,.]+[kK]?[\s\[\]()\-\u2013:]*sold\b[^\n|\]]*", re.IGNORECASE)
+# "Sold for $400 to /u/x", "sold to /u/x for $400", "SOLD @ $400": the sale price, not an ask.
+_SOLD_FOR_RE = re.compile(r"\bsold\s+(?:to\s+/?u/[\w-]+\s+)?(?:for|at|@)\s*\$\s?[\d,.]+[kK]?", re.IGNORECASE)
 _REMOVED_TITLE_RE = re.compile(r"^\s*\[\s*removed\b", re.IGNORECASE)  # "[ Removed by moderator ]"
 _PAYMENT_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("paypal", re.compile(r"\bpay\s?pal\b|\bpp\b|\bg&s\b", re.IGNORECASE)),
@@ -214,9 +249,18 @@ _PAYMENT_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 # r/hardwareswap only allows PayPal Goods & Services and local cash; the rest are bannable.
 _DISALLOWED_PAYMENTS = frozenset({"zelle", "venmo", "cashapp", "friends_family", "crypto", "gift_card", "wire"})
-_SHIPPED_AFTER_RE = re.compile(r"^[\s,.)]*(?:\+\s*)?(?:shipped|ship(?:ping)?\s+incl|free\s+ship)", re.IGNORECASE)
+# "$400 shipped", "**$400** shipped" (markdown bold), "$400 (shipped)".
+_SHIPPED_AFTER_RE = re.compile(r"^[\s,.()*_~]*(?:\+\s*)?(?:shipped|ship(?:ping)?\s+incl|free\s+ship)", re.IGNORECASE)
 
 _URL_RE = re.compile(r"https?://[^\s<>()\[\]\"'|`]+", re.IGNORECASE)
+# Only ";"-terminated entities are decoded. html.unescape() also expands HTML5 legacy
+# entities without a semicolon, which corrupts verbatim (raw_json=1) URLs:
+# "&region=us" -> "®ion=us", "&gtin=" -> ">in=", "&section=" -> "§ion=".
+_ENTITY_RE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|amp|lt|gt|quot|apos|nbsp);")
+# Zero-width characters (new Reddit's editor writes "&#x200B;" spacer paragraphs) never
+# belong in a URL; neither does whitespace produced by decoding "&nbsp;".
+_URL_JUNK_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
+_URL_STOP_RE = re.compile(r"\s")
 _DIRECT_IMAGE_RE = re.compile(
     r"https?://(?:i\.imgur\.com|i\.redd\.it|preview\.redd\.it)/[A-Za-z0-9_\-]+\.(?:jpe?g|png|webp|gif)(?:\?[^\s)\]]*)?",
     re.IGNORECASE,
@@ -236,9 +280,8 @@ class MoneySpan:
     end: int
 
 
-def find_money(text: str) -> list[MoneySpan]:
-    """Every dollar amount in ``text`` with its character span, in order."""
-    spans: list[MoneySpan] = []
+def iter_money(text: str) -> Iterator[MoneySpan]:
+    """Lazily yield every dollar amount in ``text`` with its character span, in order."""
     for m in _MONEY_RE.finditer(text):
         whole = m.group("a") if m.group("a") is not None else m.group("b")
         cents = m.group("ac") if m.group("a") is not None else m.group("bc")
@@ -248,8 +291,12 @@ def find_money(text: str) -> list[MoneySpan]:
             continue
         if m.group("ak"):
             value *= 1000.0
-        spans.append(MoneySpan(round(value, 2), m.start(), m.end()))
-    return spans
+        yield MoneySpan(round(value, 2), m.start(), m.end())
+
+
+def find_money(text: str) -> list[MoneySpan]:
+    """Every dollar amount in ``text`` with its character span, in order."""
+    return list(iter_money(text))
 
 
 def _depths(text: str) -> list[int]:
@@ -391,8 +438,26 @@ def _is_external(url: str) -> bool:
     return bool(host) and not _host_matches(host, _REDDIT_HOST_SUFFIXES) and not _host_matches(host, _IMAGE_HOST_SUFFIXES)
 
 
+def unescape_entities(text: str) -> str:
+    """Decode ``;``-terminated HTML entities only (``&amp;``, ``&#x200B;``), never ``&region``."""
+    if "&" not in text:
+        return text
+    return _ENTITY_RE.sub(lambda m: html.unescape(m.group(0)), text)
+
+
 def _clean_url(url: str) -> str:
-    return html.unescape(url).rstrip(".,;:!?*_~")
+    """Normalise a URL lifted from JSON or markdown.
+
+    With ``raw_json=1`` URLs arrive verbatim; ``&amp;``-style escapes still show up in
+    markdown written by new Reddit's editor (and in payloads fetched without
+    ``raw_json``), so terminated entities are decoded, zero-width spacers dropped, the
+    URL cut at whitespace and trailing markdown/sentence punctuation stripped.
+    """
+    url = _URL_JUNK_RE.sub("", unescape_entities(url))
+    stop = _URL_STOP_RE.search(url)
+    if stop is not None:
+        url = url[: stop.start()]
+    return url.rstrip(".,;:!?*_~")
 
 
 def _first_external_link(text: str) -> str | None:
@@ -403,13 +468,15 @@ def _first_external_link(text: str) -> str | None:
     return None
 
 
-def _dedupe(urls: Sequence[str]) -> list[str]:
+def _dedupe(urls: Iterable[str], limit: int = MAX_IMAGES_PER_POST) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for url in urls:
         if url and url not in seen and url.startswith(("http://", "https://")):
             seen.add(url)
             out.append(url)
+            if len(out) >= limit:
+                break
     return out
 
 
@@ -592,7 +659,7 @@ def parse_deal_post(post: Mapping[str, Any], *, subreddit: str, skip_flairs: Seq
         source_id=_fullname(post),
         url=_permalink_url(post),
         title=title,
-        description=selftext if is_self else "",
+        description=selftext,  # link posts may carry a body too (coupon codes, notes)
         price=parsed.price,
         list_price=parsed.list_price,
         image_urls=_dedupe(images),
@@ -620,8 +687,8 @@ def parse_swap_title(title: str) -> SwapTitle | None:
         return None
     return SwapTitle(
         location=m.group("loc").strip(),
-        have=m.group("have").strip(" \t,;-"),
-        want=m.group("want").strip(" \t,;-"),
+        have=m.group("have").strip(" \t,;:-"),  # "[H]: item" / "[W]: PayPal" are common
+        want=m.group("want").strip(" \t,;:-"),
     )
 
 
@@ -675,22 +742,28 @@ def parse_location_tag(tag: str) -> Location:
 
 
 def _swap_price(selftext: str, have: str) -> tuple[float | None, float | None, list[float]]:
-    """(price, shipping, all amounts) — struck-through ``~~$x~~`` amounts are ignored."""
-    body = _SOLD_RE.sub(" ", _STRIKE_RE.sub(" ", selftext or ""))
-    amounts = find_money(body)
-    text = body
-    if not amounts:
-        amounts = find_money(have)
-        text = have
-    if not amounts:
-        return None, None, []
-    first = amounts[0]
-    shipping = 0.0 if _SHIPPED_AFTER_RE.match(text[first.end : first.end + 30]) else None
-    distinct: list[float] = []
-    for span in amounts:
-        if span.value not in distinct:
-            distinct.append(span.value)
-    return first.value, shipping, distinct
+    """(price, shipping, distinct amounts) of a swap post.
+
+    Struck-through ``~~$x~~`` amounts and sold markers (``[$200 Sold for $185 to /u/x]``,
+    ``Sold for $400``) are removed first. At most :data:`MAX_PRICES_PER_POST` distinct
+    amounts are collected and at most :data:`MAX_AMOUNTS_SCANNED` examined, so a huge
+    price table costs bounded work.
+    """
+    body = _SOLD_FOR_RE.sub(" ", _SOLD_RE.sub(" ", _STRIKE_RE.sub(" ", selftext or "")))
+    for text in (body, have):
+        first: MoneySpan | None = None
+        distinct: list[float] = []
+        for span in itertools.islice(iter_money(text), MAX_AMOUNTS_SCANNED):
+            if first is None:
+                first = span
+            if span.value not in distinct:
+                distinct.append(span.value)
+                if len(distinct) >= MAX_PRICES_PER_POST:
+                    break
+        if first is not None:
+            shipping = 0.0 if _SHIPPED_AFTER_RE.match(text[first.end : first.end + 30]) else None
+            return first.value, shipping, distinct
+    return None, None, []
 
 
 def payment_methods(text: str) -> list[str]:
@@ -703,13 +776,11 @@ def _have_items(have: str) -> list[str]:
 
 
 def _swap_images(post: Mapping[str, Any], selftext: str) -> list[str]:
-    images = [_clean_url(m.group(0)) for m in _DIRECT_IMAGE_RE.finditer(selftext)]
     link = _clean_url(_str(post.get("url_overridden_by_dest")) or _str(post.get("url")))
-    if link and _direct_image(link):
-        images.insert(0, link)
-    images += _media_metadata_images(post)
-    images += _preview_images(post)
-    return _dedupe(images)
+    direct = [link] if link and _direct_image(link) else []
+    # Lazy and bounded: _dedupe stops at the cap, islice bounds repeated links.
+    body = (_clean_url(m.group(0)) for m in itertools.islice(_DIRECT_IMAGE_RE.finditer(selftext), MAX_AMOUNTS_SCANNED))
+    return _dedupe(itertools.chain(direct, body, _media_metadata_images(post), _preview_images(post)))
 
 
 def _timestamps_url(post: Mapping[str, Any], selftext: str) -> str | None:
@@ -870,8 +941,8 @@ class RedditOAuth:
     def __init__(
         self,
         http: HttpClient,
-        client_id: str,
-        client_secret: str | None,
+        client_id: str | SecretStr,
+        client_secret: str | SecretStr | None,
         *,
         user_agent: str,
         device_id: str,
@@ -881,8 +952,11 @@ class RedditOAuth:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._http = http
-        self._client_id = client_id
-        self._client_secret = client_secret
+        # Credentials stay wrapped until the Basic header is built (never in repr/vars/logs).
+        self._client_id = client_id if isinstance(client_id, SecretStr) else SecretStr(client_id)
+        if isinstance(client_secret, str):
+            client_secret = SecretStr(client_secret) if client_secret else None
+        self._client_secret: SecretStr | None = client_secret
         self._user_agent = user_agent
         self._device_id = device_id
         self._token_url = token_url
@@ -896,7 +970,7 @@ class RedditOAuth:
 
     @property
     def grant_type(self) -> str:
-        return CLIENT_CREDENTIALS_GRANT if self._client_secret else INSTALLED_CLIENT_GRANT
+        return CLIENT_CREDENTIALS_GRANT if self._client_secret is not None else INSTALLED_CLIENT_GRANT
 
     def _current(self) -> str | None:
         if self._token is not None and self._clock() < self._refresh_at:
@@ -919,21 +993,26 @@ class RedditOAuth:
             self._token = None
             self._refresh_at = 0.0
 
+    def _basic_auth(self) -> str:
+        # Installed apps authenticate with an empty password.
+        secret = self._client_secret.get_secret_value() if self._client_secret is not None else ""
+        pair = f"{self._client_id.get_secret_value()}:{secret}"
+        return "Basic " + base64.b64encode(pair.encode("utf-8")).decode("ascii")
+
     async def _refresh(self) -> str:
-        secret = self._client_secret or ""  # installed apps authenticate with an empty password
-        basic = base64.b64encode(f"{self._client_id}:{secret}".encode("utf-8")).decode("ascii")
         form = {"grant_type": self.grant_type, "scope": TOKEN_SCOPE}
-        if not self._client_secret:
+        if self._client_secret is None:
             form["device_id"] = self._device_id
         try:
             resp = await self._http.request(
                 "POST",
                 self._token_url,
                 data=form,
-                headers={"Authorization": f"Basic {basic}", "User-Agent": self._user_agent},
+                headers={"Authorization": self._basic_auth(), "User-Agent": self._user_agent},
                 accept="application/json",
                 expected=(200,),
                 parse="bytes",
+                max_bytes=MAX_TOKEN_BYTES,
             )
         except HttpStatusError as exc:
             self._m_token.inc(outcome=f"http_{exc.status}")
@@ -962,11 +1041,7 @@ class RedditOAuth:
         token_type = str(payload.get("token_type", "bearer")).lower()
         if token_type != "bearer":
             _log.warning("unexpected reddit token_type", extra={"source": "reddit", "token_type": token_type})
-        try:
-            lifetime = float(payload.get("expires_in") or DEFAULT_TOKEN_LIFETIME_SECONDS)
-        except (TypeError, ValueError):
-            lifetime = DEFAULT_TOKEN_LIFETIME_SECONDS
-        lifetime = max(1.0, lifetime)
+        lifetime = _token_lifetime(payload.get("expires_in"))
         margin = min(TOKEN_REFRESH_MARGIN_SECONDS, lifetime * 0.1)
         self._token = token
         self._refresh_at = self._clock() + lifetime - margin
@@ -974,9 +1049,25 @@ class RedditOAuth:
         self._m_token.inc(outcome="ok")
         _log.info(
             "reddit oauth token acquired",
-            extra={"source": "reddit", "grant": "client_credentials" if self._client_secret else "installed_client", "expires_in_s": lifetime},
+            extra={"source": "reddit", "grant": self.grant_type, "expires_in_s": round(lifetime, 1)},
         )
         return token
+
+
+def _token_lifetime(expires_in: Any, *, now: Callable[[], float] = time.time) -> float:
+    """Seconds the token stays valid: relative ``expires_in`` (3600/86400 observed), or an
+    absolute Unix timestamp as the OAuth2 wiki words it; defaults when missing/garbage."""
+    if isinstance(expires_in, bool):
+        return DEFAULT_TOKEN_LIFETIME_SECONDS
+    try:
+        value = float(expires_in)
+    except (TypeError, ValueError):
+        return DEFAULT_TOKEN_LIFETIME_SECONDS
+    if value != value or value in (float("inf"), float("-inf")) or value == 0:
+        return DEFAULT_TOKEN_LIFETIME_SECONDS
+    if value >= EPOCH_EXPIRES_IN_THRESHOLD:
+        value -= now()
+    return max(1.0, value)
 
 
 def _looks_like_html_text(text: str) -> bool:
@@ -1012,6 +1103,12 @@ def _float_header(headers: Mapping[str, str], name: str) -> float | None:
     if value != value or value < 0:  # NaN / negative
         return None
     return value
+
+
+def _reset_header(headers: Mapping[str, str]) -> float | None:
+    """``X-Ratelimit-Reset`` in seconds, clamped to :data:`RATE_LIMIT_MAX_RESET_SECONDS`."""
+    value = _float_header(headers, "X-Ratelimit-Reset")
+    return None if value is None else min(value, RATE_LIMIT_MAX_RESET_SECONDS)
 
 
 # --------------------------------------------------------------------------- rate limits
@@ -1152,8 +1249,13 @@ class RedditIngestor(BaseIngestor):
                 continue
             listings.extend(result)
         if failures:
+            # A block anywhere pauses the whole source: honour the longest cooldown seen
+            # (a 30 s 429 on one subreddit must not mask a 30 min block wall on another).
+            blocked = [exc for _, exc in failures if isinstance(exc, SourceBlocked)]
+            if blocked:
+                raise max(blocked, key=lambda exc: exc.cooldown_seconds or 0.0)
             for _, exc in failures:
-                if isinstance(exc, (SourceBlocked, SourceAuthError)):
+                if isinstance(exc, SourceAuthError):
                     raise exc
             if len(failures) == len(specs):
                 raise failures[0][1]
@@ -1162,16 +1264,13 @@ class RedditIngestor(BaseIngestor):
         return listings
 
     async def _poll_subreddit(self, spec: "SubredditSpec") -> list[RawListing]:
-        payload = await self._fetch_listing(spec)
-        if payload is None:
+        body = await self._fetch_listing(spec)
+        if body is None:
             return []
-        outcome = parse_listing(
-            payload,
-            subreddit=spec.name,
-            mode=spec.mode,
-            skip_flairs=self.cfg.skip_flairs,
-            locations=self.cfg.hardwareswap_locations if spec.mode == "swap" else (),
-        )
+        if len(body) >= PARSE_IN_THREAD_BYTES:
+            outcome = await asyncio.to_thread(self._parse_body, spec, body)
+        else:
+            outcome = self._parse_body(spec, body)
         for listing in outcome.listings:
             listing.query = f"r/{spec.name}"
         if outcome.listings:
@@ -1182,13 +1281,27 @@ class RedditIngestor(BaseIngestor):
             self.m_posts.inc(outcome.errors, subreddit=spec.name, outcome="malformed")
         return outcome.listings
 
+    def _parse_body(self, spec: "SubredditSpec", body: bytes) -> ParseOutcome:
+        """Decode + parse one listing body (pure; may run in a worker thread)."""
+        try:
+            payload = json_loads(body)
+        except ValueError as exc:
+            raise SourceError(f"r/{spec.name}: malformed JSON listing") from exc
+        return parse_listing(
+            payload,
+            subreddit=spec.name,
+            mode=spec.mode,
+            skip_flairs=self.cfg.skip_flairs,
+            locations=self.cfg.hardwareswap_locations if spec.mode == "swap" else (),
+        )
+
     def listing_url(self, spec: "SubredditSpec") -> str:
         if self.oauth is not None:
             return f"{self.endpoints.oauth_base}/r/{spec.name}/new"
         return f"{self.endpoints.public_base}/r/{spec.name}/new.json"
 
-    async def _fetch_listing(self, spec: "SubredditSpec") -> Any | None:
-        """GET one listing; returns parsed JSON, or None when the subreddit is inaccessible."""
+    async def _fetch_listing(self, spec: "SubredditSpec") -> bytes | None:
+        """GET one listing; returns the JSON body, or None when the subreddit is inaccessible."""
         url = self.listing_url(spec)
         params = {"limit": str(spec.limit), "raw_json": "1"}
         refreshed = False
@@ -1207,17 +1320,15 @@ class RedditIngestor(BaseIngestor):
                 expected=_LISTING_STATUSES,
                 parse="bytes",
                 browser_identity=False,
+                max_bytes=MAX_LISTING_BYTES,
             )
             self._observe_rate_limit(resp)
             self.m_requests.inc(subreddit=spec.name, status=resp.status)
-            body = resp.data if isinstance(resp.data, (bytes, bytearray)) else b""
+            body = bytes(resp.data) if isinstance(resp.data, (bytes, bytearray)) else b""
             if resp.status == 200:
-                if _looks_like_html(resp.headers, bytes(body)):
+                if _looks_like_html(resp.headers, body):
                     raise SourceBlocked(f"r/{spec.name}: Reddit served an HTML page instead of JSON", cooldown_seconds=self.block_cooldown)
-                try:
-                    return json_loads(bytes(body))
-                except ValueError as exc:
-                    raise SourceError(f"r/{spec.name}: malformed JSON listing") from exc
+                return body
             if resp.status == 401:
                 if self.oauth is not None and token is not None and not refreshed:
                     self.oauth.invalidate(token)
@@ -1234,7 +1345,7 @@ class RedditIngestor(BaseIngestor):
                 and self.oauth is not None
                 and token is not None
                 and not refreshed
-                and _looks_like_html(resp.headers, bytes(body))
+                and _looks_like_html(resp.headers, body)
             ):
                 # Reddit answers an invalid/expired bearer with its HTML network-policy page
                 # rather than a 401 from some networks: one fresh token before giving up.
@@ -1242,7 +1353,7 @@ class RedditIngestor(BaseIngestor):
                 refreshed = True
                 self.log.info("reddit 403 block page with OAuth; retrying once with a fresh token", extra={"source": self.name, "subreddit": spec.name})
                 continue
-            return self._inaccessible(spec, resp, bytes(body))
+            return self._inaccessible(spec, resp, body)
 
     def _inaccessible(self, spec: "SubredditSpec", resp: HttpResponse, body: bytes) -> None:
         """403/404: a JSON body with ``reason`` is a private/banned subreddit; anything else is a block."""
@@ -1255,11 +1366,12 @@ class RedditIngestor(BaseIngestor):
             if isinstance(payload, Mapping):
                 reason = payload.get("reason")
         if reason:
+            label = reason if isinstance(reason, str) and reason in _INACCESSIBLE_REASONS else "other"
             self.log.warning(
                 "subreddit not accessible; skipping",
-                extra={"source": self.name, "subreddit": spec.name, "status": resp.status, "reason": str(reason)},
+                extra={"source": self.name, "subreddit": spec.name, "status": resp.status, "reason": str(reason)[:100]},
             )
-            self.m_posts.inc(subreddit=spec.name, outcome=f"inaccessible_{reason}")
+            self.m_posts.inc(subreddit=spec.name, outcome=f"inaccessible_{label}")
             return None
         if resp.status == 404 and not _looks_like_html(resp.headers, body):
             self.log.warning("subreddit not found; skipping", extra={"source": self.name, "subreddit": spec.name})
@@ -1273,8 +1385,8 @@ class RedditIngestor(BaseIngestor):
 
     def _cooldown_429(self, resp: HttpResponse) -> float:
         hint = max(
-            _float_header(resp.headers, "X-Ratelimit-Reset") or 0.0,
-            parse_retry_after(_header(resp.headers, "Retry-After")) or 0.0,
+            _reset_header(resp.headers) or 0.0,
+            min(parse_retry_after(_header(resp.headers, "Retry-After")) or 0.0, RATE_LIMIT_MAX_RESET_SECONDS),
         )
         if self.oauth is None:
             return max(self.block_cooldown, hint)
@@ -1284,7 +1396,7 @@ class RedditIngestor(BaseIngestor):
 
     def _observe_rate_limit(self, resp: HttpResponse) -> None:
         remaining = _float_header(resp.headers, "X-Ratelimit-Remaining")
-        reset = _float_header(resp.headers, "X-Ratelimit-Reset")
+        reset = _reset_header(resp.headers)
         used = _float_header(resp.headers, "X-Ratelimit-Used")
         self.rate_limit.observe(remaining=remaining, used=used, reset_seconds=reset, now=self._clock())
         if remaining is not None:
@@ -1315,6 +1427,7 @@ __all__ = [
     "build_user_agent",
     "common_skip_reason",
     "find_money",
+    "iter_money",
     "iter_posts",
     "location_allowed",
     "parse_deal_post",
@@ -1327,4 +1440,5 @@ __all__ = [
     "registrable_domain",
     "retailer_for_url",
     "swap_intent",
+    "unescape_entities",
 ]

@@ -275,6 +275,50 @@ STEALTH_INIT_SCRIPT = r"""
     }
   }
 
+  // The headless shell keeps a "HeadlessChrome" User-Agent Client Hints brand even when
+  // the UA string is overridden. Drop it from the JS surface (brands, high-entropy values,
+  // toJSON) so scripts see the same browser the UA describes. The Sec-CH-UA *header* cannot
+  // be fixed from JS, which is why launch_browser() warns when it falls back to the shell.
+  function patchUserAgentData(win) {
+    const proto = win.NavigatorUAData && win.NavigatorUAData.prototype;
+    const nav = win.navigator;
+    if (!proto || !nav || !nav.userAgentData) return;
+    const headless = (entry) => !!entry && typeof entry.brand === 'string' && /headless/i.test(entry.brand);
+    let current = null;
+    try { current = nav.userAgentData.brands; } catch (_) { return; }
+    if (!Array.isArray(current) || !current.some(headless)) return;
+    // Like the native getters: a fresh array per call, frozen when the native one is.
+    const scrub = (list) => {
+      if (!Array.isArray(list) || !list.some(headless)) return list;
+      const out = list.filter((entry) => !headless(entry));
+      return win.Object.isFrozen(list) ? win.Object.freeze(out) : out;
+    };
+    const brandsDesc = Object.getOwnPropertyDescriptor(proto, 'brands');
+    if (brandsDesc && brandsDesc.get && !nativeSource.has(brandsDesc.get)) {
+      const nativeBrands = brandsDesc.get;
+      defineGetter(proto, 'brands', makeGetter('brands', (self, outer) => scrub(callNative(nativeBrands, self, [], outer))));
+    }
+    const nativeHigh = proto.getHighEntropyValues;
+    if (typeof nativeHigh === 'function' && !nativeSource.has(nativeHigh)) {
+      replaceMethod(proto, 'getHighEntropyValues', makeMethod('getHighEntropyValues', 1, (self, args, outer) =>
+        callNative(nativeHigh, self, args, outer).then((values) => {
+          if (values && typeof values === 'object') {
+            if ('brands' in values) values.brands = scrub(values.brands);
+            if ('fullVersionList' in values) values.fullVersionList = scrub(values.fullVersionList);
+          }
+          return values;
+        })));
+    }
+    const nativeToJSON = proto.toJSON;
+    if (typeof nativeToJSON === 'function' && !nativeSource.has(nativeToJSON)) {
+      replaceMethod(proto, 'toJSON', makeMethod('toJSON', 0, (self, args, outer) => {
+        const value = callNative(nativeToJSON, self, args, outer);
+        if (value && typeof value === 'object' && 'brands' in value) value.brands = scrub(value.brands);
+        return value;
+      }));
+    }
+  }
+
   function patchPlugins(win) {
     const nav = win.navigator;
     const proto = win.Navigator && win.Navigator.prototype;
@@ -478,7 +522,7 @@ STEALTH_INIT_SCRIPT = r"""
     if (patchedRealms.has(win)) return;
     if (!win.Function) return;  // throws SecurityError for cross-origin windows
     patchedRealms.add(win);
-    const steps = [patchToString, patchNavigator, patchPlugins, patchChrome, patchPermissions,
+    const steps = [patchToString, patchNavigator, patchUserAgentData, patchPlugins, patchChrome, patchPermissions,
       patchWebGl, patchOuterSize, patchIframes];
     for (const step of steps) {
       try { step(win); } catch (_) { /* never break the page */ }
@@ -683,6 +727,13 @@ def launch_options(cfg: "BrowserSection", *, locale: str | None = None) -> dict[
     return options
 
 
+_SHELL_FALLBACK_WARNING = (
+    "full chromium build not installed; falling back to chrome-headless-shell, whose Sec-CH-UA request "
+    "headers still advertise HeadlessChrome (install it with `playwright install chromium` or set "
+    "browser.executable_path to a real Chrome/Chromium)"
+)
+
+
 def _missing_executable(exc: BaseException) -> bool:
     return "executable doesn't exist" in str(exc).lower()
 
@@ -700,7 +751,7 @@ async def launch_browser(playwright: "Playwright", cfg: "BrowserSection", *, loc
     except PlaywrightError as exc:
         if "channel" not in options or not _missing_executable(exc):
             raise
-        log.warning("full chromium build not installed; falling back to headless shell", extra={"error": str(exc)[:200]})
+        log.warning(_SHELL_FALLBACK_WARNING, extra={"error": str(exc)[:200]})
         options.pop("channel")
         return await playwright.chromium.launch(**options)
 
@@ -711,7 +762,7 @@ async def _launch_persistent(playwright: "Playwright", user_data_dir: str, optio
     except PlaywrightError as exc:
         if "channel" not in options or not _missing_executable(exc):
             raise
-        log.warning("full chromium build not installed; falling back to headless shell", extra={"error": str(exc)[:200]})
+        log.warning(_SHELL_FALLBACK_WARNING, extra={"error": str(exc)[:200]})
         options = {k: v for k, v in options.items() if k != "channel"}
         return await playwright.chromium.launch_persistent_context(user_data_dir, **options)
 

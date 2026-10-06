@@ -23,19 +23,28 @@ One poll issues one request per (profile, search term) pair::
     X-EBAY-C-MARKETPLACE-ID: EBAY_US
     X-EBAY-C-ENDUSERCTX: contextualLocation=country%3DUS%2Czip%3D19406,affiliateCampaignId=<ePN id>
 
+When ``sources.ebay.queries`` is non-empty, those explicit (usually *coalesced*)
+searches replace the per-profile terms: ``q=rtx (4090, 5090)`` is one call covering
+several profiles, and the text filter assigns the real profile afterwards. Fields a
+query leaves unset (price range, condition ids, category) are inherited from its
+``profile_hint`` profile when it names one.
+
 In ``filter``, commas separate filters and ``|`` separates values inside ``{}``. Both
 belong to eBay's filter grammar, so the whole value is percent-encoded as one query
 parameter. The price range is widened to cover every variant band of the profile, so
-a 3090 Ti listing is not cut off by the base 3090 ceiling. The pages are newest-first
-with ``limit`` up to 200, so one page per query covers the gap between polls. When a
-page is full and even its oldest item is newer than the previous poll,
-``ebay_page_saturated_total`` flags that ``limit`` should go up.
+a 3090 Ti listing is not cut off by the base 3090 ceiling. eBay supports one category
+per request and answers 409 (errorId 12020) to ``fieldgroups`` combined with several
+``category_ids``, so ``fieldgroups`` is dropped when a profile lists more than one.
+The pages are newest-first with ``limit`` up to 200, so one page per query covers the
+gap between polls. When a page is full and even its oldest item is newer than the
+previous poll, ``ebay_page_saturated_total`` flags that ``limit`` should go up.
 
 Quota math
 ----------
 The default Browse quota is **5,000 calls/day per application keyset**. Every node
 using the keyset shares it, and so does ``getItem``. It resets at midnight
-America/Los_Angeles (observed empirically). With ``Q`` = (profile, term) pairs::
+America/Los_Angeles (observed empirically). With ``Q`` = searches per poll ((profile,
+term) pairs, or the number of ``sources.ebay.queries``)::
 
     calls_per_poll         = Q
     allowed_polls_per_day  = daily_call_budget * budget_safety_factor / Q
@@ -54,13 +63,26 @@ used up the source sleeps until the reset. A hard guard never starts a poll that
 would exceed ``daily_call_budget``. Retries are capped at 2 per request (eBay's
 Growth Check rule for infrastructure errors).
 
-HTTP 429 with errorId 2001 is eBay's unpublished *short-burst* throttle. It can fire
-while daily quota remains. On a 429 the queries not yet started in that cycle are
-skipped (they would be throttled too), partial results are kept, and the next
-interval is stretched exponentially. If no query succeeded, the cycle raises
-:class:`EbayRateLimited` (a ``SourceError``) so the base loop backs off. A failure
-of one query never discards the others' results. Only when *all* queries fail does
-the poll raise.
+Failure handling
+----------------
+A failure of one query never discards the others' results. Only when *all* queries
+fail does the poll raise, so the base loop backs off.
+
+* HTTP 429 with errorId 2001 is eBay's unpublished *short-burst* throttle. It can fire
+  while daily quota remains. The queries not yet started in that cycle are skipped
+  (they would be throttled too), and the next interval is stretched exponentially. If
+  no query succeeded, the cycle raises :class:`EbayRateLimited`.
+* Errors every remaining query would also hit stop the cycle the same way: an HTML
+  block page from the edge (403, or a bot wall served with 200) raises
+  :class:`SourceBlocked` so the base loop cools down and notifies the operator; a
+  rejected keyset (401 after a fresh token, 403 errorId 1100) raises
+  ``SourceAuthError``; an unreachable token endpoint costs one mint attempt per poll,
+  not one per query.
+* A 200 whose body is not a JSON object (empty, ``null``, a proxy page) is a failed
+  query, never an empty success.
+* Searches still running at ``poll_timeout_seconds * 0.85`` are abandoned (and still
+  booked against the quota), so one hung request cannot make the base loop's poll
+  timeout throw away the results that already arrived.
 
 Authentication
 --------------
@@ -102,7 +124,12 @@ Parsing notes
 * Money values and ``conditionId`` arrive as JSON *strings* and are parsed with
   ``Decimal``.
 * AUCTION-only listings are skipped, because a bid is not a buy price. Auctions that
-  still offer Buy It Now keep their BIN ``price``.
+  still offer Buy It Now keep their BIN ``price``. Whether ``price`` holds the BIN
+  price or the bid for such items is undocumented; since eBay requires the BIN price
+  to exceed the starting bid, a ``price`` equal to ``currentBidPrice`` is treated as
+  the bid and the item is skipped.
+* Amounts that are not finite (``NaN``, ``1e400``) are dropped: JSON, and so the
+  Redis stream, would silently turn them into ``null``.
 * Shipping is the cheapest known ``shippingOptions[].shippingCost`` (free = 0). It is
   ``None`` when eBay cannot quote it, for example CALCULATED shipping without a
   ``contextualLocation`` zip.
@@ -114,6 +141,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hashlib
 import math
 import re
@@ -131,7 +159,15 @@ from pydantic import SecretStr, ValidationError
 
 from deal_radar.config_schema import EbayQuery, EbaySource, Profile
 from deal_radar.core.backoff import BackoffPolicy, RetryExhausted
-from deal_radar.core.http import RETRYABLE_STATUSES, HttpClient, HttpResponse, HttpStatusError, json_dumps, json_loads
+from deal_radar.core.http import (
+    RETRYABLE_STATUSES,
+    HttpClient,
+    HttpResponse,
+    HttpStatusError,
+    json_dumps,
+    json_loads,
+    redact_url,
+)
 from deal_radar.core.logs import get_logger
 from deal_radar.core.metrics import Metrics
 from deal_radar.engine.types import Location, RawListing, SellerInfo, SourceKind, utcnow
@@ -162,6 +198,7 @@ THROTTLE_BASE_SECONDS = 30.0  # first stretch after a burst throttle; doubles pe
 LEDGER_KEY_TTL_SECONDS = 2 * 86_400
 POLL_BUDGET_FRACTION = 0.85  # queries still running after this share of poll_timeout_seconds are abandoned
 COALESCED_LABEL = "coalesced"  # metrics label of a configured query without a profile_hint
+PARSE_INLINE_MAX_ITEMS = 25  # bigger pages are parsed in a worker thread
 
 _AUTH_ERRORS = frozenset({"invalid_client", "invalid_grant", "invalid_scope", "unauthorized_client", "invalid_request"})
 _BUY_NOW_OPTIONS = frozenset({"FIXED_PRICE", "BEST_OFFER", "CLASSIFIED_AD"})
@@ -210,21 +247,33 @@ class EbayTokenUnavailable(SourceError):
     """The token endpoint is down or answered nonsense; no search can run until it recovers."""
 
 
+def safe_error_text(exc: BaseException) -> str:
+    """Exception text that is safe to log or keep in ``health.last_error``.
+
+    ``repr()`` of aiohttp's ``ClientResponseError`` family (``TooManyRedirects``...) embeds
+    the request headers, i.e. the Basic client credentials or the Bearer token.
+    """
+    if isinstance(exc, RetryExhausted):
+        return f"gave up after {exc.attempts} attempt(s): {safe_error_text(exc.last_exc)}"
+    if isinstance(exc, aiohttp.ClientResponseError):
+        info = getattr(exc, "request_info", None)
+        url = redact_url(str(info.real_url)) if info is not None else "?"
+        return f"{type(exc).__name__}(status={exc.status}, message={exc.message!r}, url={url})"
+    return repr(exc)
+
+
 def looks_blocked(body: str | bytes | None, headers: Mapping[str, str] | None = None) -> bool:
     """True for an HTML block wall (edge WAF / bot challenge) rather than an eBay API answer."""
     if not body:
         return False
     try:
         json_loads(body)
-        return False  # any JSON body is the API talking (eBay's own 403 says "Access denied" too)
     except ValueError:
-        pass
-    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else body
-    head = text[:4096]
-    content_type = str((headers or {}).get("Content-Type", "")).lower()
-    if _BLOCK_WALL.search(head):
-        return True
-    return "html" in content_type or head.lstrip()[:1] == "<"
+        text = body.decode("utf-8", "replace") if isinstance(body, bytes) else body
+        head = text[:4096]
+        content_type = str((headers or {}).get("Content-Type", "")).lower()
+        return bool(_BLOCK_WALL.search(head)) or "html" in content_type or head.lstrip()[:1] == "<"
+    return False  # any JSON body is the API talking (eBay's own 403 also says "Access denied")
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -437,7 +486,7 @@ class EbayTokenManager:
             raise EbayTokenUnavailable(f"eBay token endpoint returned HTTP {exc.status}") from exc
         except (RetryExhausted, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             self._m_requests.inc(outcome="error")
-            raise EbayTokenUnavailable(f"eBay token endpoint unreachable: {exc!r}") from exc
+            raise EbayTokenUnavailable(f"eBay token endpoint unreachable: {safe_error_text(exc)}") from exc
         except ValueError as exc:  # 200 with a body that is not JSON (proxy page, truncated reply)
             self._m_requests.inc(outcome="error")
             raise EbayTokenUnavailable("eBay token endpoint returned a non-JSON response") from exc
@@ -810,6 +859,11 @@ def build_queries(
         lookup = known_profiles if known_profiles is not None else {p.id: p for p in profiles}
         configured: list[SearchQuery] = []
         for spec in cfg.queries:
+            if spec.profile_hint and spec.profile_hint not in lookup:
+                log.warning(
+                    "sources.ebay.queries profile_hint names no configured profile; nothing is inherited",
+                    extra={"term": spec.q, "profile_hint": spec.profile_hint},
+                )
             query = build_configured_query(cfg, spec, lookup.get(spec.profile_hint or ""), search_url)
             if any(q.url == query.url for q in configured):
                 log.warning("duplicate sources.ebay.queries entry ignored", extra={"term": query.term})
@@ -1220,11 +1274,11 @@ def classify_error(exc: BaseException) -> SourceError:
         err.__cause__ = exc
         return err
     if isinstance(exc, RetryExhausted):
-        err = SourceError(f"eBay request failed after {exc.attempts} attempt(s): {exc.last_exc!r}")
+        err = SourceError(f"eBay request failed after {exc.attempts} attempt(s): {safe_error_text(exc.last_exc)}")
     elif isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError)):
-        err = SourceError(f"eBay request failed: {exc!r}")
+        err = SourceError(f"eBay request failed: {safe_error_text(exc)}")
     else:
-        err = SourceError(f"eBay query failed: {exc!r}")
+        err = SourceError(f"eBay query failed: {safe_error_text(exc)}")
     err.__cause__ = exc
     return err
 
@@ -1491,12 +1545,19 @@ class EbayIngestor(BaseIngestor):
             started_at = utcnow()
             try:
                 data = await self._search(query, state)
-                page = parse_search_page(
+                summaries = data.get("itemSummaries")
+                parse = functools.partial(
+                    parse_search_page,
                     data,
                     query=query.term,
                     profile_hint=query.profile_hint,
                     prefer_affiliate=bool(self.cfg.affiliate_campaign_id),
                 )
+                # A 200-item page takes ~10 ms of pydantic work: keep it off the event loop.
+                if isinstance(summaries, list) and len(summaries) > PARSE_INLINE_MAX_ITEMS:
+                    page = await asyncio.to_thread(parse)
+                else:
+                    page = parse()
                 self._after_page(query, page, started_at)
             except asyncio.CancelledError:
                 raise
@@ -1624,4 +1685,5 @@ __all__ = [
     "parse_shipping",
     "parse_timestamp",
     "price_bounds",
+    "safe_error_text",
 ]

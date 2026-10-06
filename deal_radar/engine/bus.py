@@ -7,8 +7,8 @@ Two interchangeable backends share one tiny interface (:class:`ListingBus`):
     burst from a fast source exerts *backpressure* on the source loop instead of
     growing memory without bound. ``ack`` is a no-op (nothing survives a restart
     anyway). ``close()`` wakes every consumer through a sentinel that each consumer
-    re-queues for its siblings, and cancels publishers blocked on a full queue, so
-    shutdown never hangs.
+    re-queues for its siblings, and releases publishers blocked on a full queue with
+    :class:`BusClosedError`, so shutdown never hangs. Queued items are dropped.
 
 ``RedisStreamBus`` (distributed)
     One Redis Stream (``{prefix}{bus.stream_key}``) and one consumer group
@@ -26,7 +26,7 @@ Two interchangeable backends share one tiny interface (:class:`ListingBus`):
     its source loops; only non-transient errors (``WRONGTYPE``, ``NOPERM``...) raise
     :class:`BusError`, and those already surface at :meth:`start` on boot.
     ``OOM`` is treated as transient for publishing: memory comes back as processors
-    ack and TTL'd keys expire.
+    trim acknowledged history (below) and TTL'd keys expire.
 
     Processors use the node id as consumer name and fetch, in priority order:
 
@@ -51,9 +51,23 @@ Two interchangeable backends share one tiny interface (:class:`ListingBus`):
     trimmed away by ``MAXLEN`` while still pending are acknowledged and counted as
     lost (a signal that ``bus.maxlen`` is too small for the processing lag).
 
+    Memory: a stream keeps acknowledged entries until something trims them, so with
+    ``MAXLEN`` alone it settles at ``maxlen`` x entry size (~1.3-2.8 KB per listing:
+    120-270 MB at 100k), which under ``maxmemory`` + ``volatile-ttl`` first evicts
+    the TTL'd dedup keys and then makes Redis refuse every ``XADD`` (``OOM`` blocks the
+    very command that would trim). Consumers therefore also run
+    ``XTRIM MINID ~ <floor>`` every 30 s, where the floor is the minimum over all
+    groups of the last-delivered id and the oldest pending id: only history every
+    group has delivered *and* acknowledged is removed, so stream memory follows the
+    real backlog and ``MAXLEN`` is just the safety cap. ``XTRIM``, ``XREADGROUP`` and
+    ``XACK`` still work under OOM, which lets processors drain and unblock publishers;
+    ``XGROUP CREATE`` does not, so an OOM on it is ignored when the group exists.
+
     The consumer never dies on Redis trouble: connection errors, failovers and even a
-    vanished stream/group (``FLUSHALL``, eviction → ``NOGROUP``) are retried with
-    capped exponential backoff; the group is recreated when needed. Initial group
+    vanished stream/group (``FLUSHALL``/``DEL`` wake the blocked read with
+    ``UNBLOCKED``, later reads get ``NOGROUP``) are retried with capped exponential
+    backoff that saturates instead of overflowing during long outages; the group is
+    recreated when needed. Initial group
     creation uses ``$`` (renaming the group must not replay up to ``maxlen`` stale
     listings) while recreation after a loss uses ``0`` (the stream was recreated by
     later ``XADD`` calls and holds only fresh entries). Publishers also create the
@@ -68,7 +82,8 @@ Metrics: ``bus_published_total``, ``bus_consumed_total``, ``bus_poison_total``,
 ``bus_backlog`` (memory: queue size; Redis: consumer-group lag — entries not yet
 delivered to the group — falling back to ``XLEN`` when the lag is unknown),
 plus ``bus_pending``, ``bus_recovered_total{via}``, ``bus_lost_total``,
-``bus_backpressure_total``, ``bus_sanitized_total`` and ``bus_errors_total{op}``.
+``bus_backpressure_total``, ``bus_sanitized_total``, ``bus_trimmed_total`` and
+``bus_errors_total{op}``.
 """
 
 from __future__ import annotations
@@ -84,7 +99,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ValidationError
 from redis import exceptions as redis_exc
 
-from deal_radar.core.backoff import BackoffPolicy, ExponentialBackoff, RetryExhausted, retry_async
+from deal_radar.core.backoff import BackoffPolicy, RetryExhausted, retry_async
 from deal_radar.core.logs import get_logger
 from deal_radar.core.metrics import Metrics
 from deal_radar.engine.types import RawListing
@@ -117,9 +132,33 @@ PUBLISH_RETRY_ERRORS: tuple[type[BaseException], ...] = (*TRANSIENT_ERRORS, redi
 _PUBLISH_BACKOFF_BASE = 0.05  # seconds; doubles per consecutive failure ("equal" jitter)
 _PUBLISH_BACKOFF_CAP = 2.0
 _PUBLISH_LOG_INTERVAL = 30.0  # at most one "still failing" warning per publisher per interval
+_CONSUME_BACKOFF_BASE = 0.1  # seconds; consumer retry after a failed read (capped, never gives up)
+_CONSUME_BACKOFF_CAP = 5.0
 _START_POLICY = BackoffPolicy(max_attempts=6, base_delay=0.2, max_delay=2.0, max_total_seconds=15.0)
 _BACKLOG_REFRESH_SECONDS = 2.0
+_TRIM_INTERVAL_SECONDS = 30.0  # consumer-side XTRIM MINID of fully processed history
 _INFLIGHT_MAX = 100_000  # bound on locally tracked un-acked entry ids
+
+
+class _LoopBackoff:
+    """Capped exponential backoff ("equal" jitter) for loops that retry forever.
+
+    ``core.backoff.ExponentialBackoff`` evaluates ``base * 2 ** failures`` unbounded and
+    raises ``OverflowError`` on the 1025th consecutive failure (about an hour of Redis
+    outage at a 5 s cap) — inside the very error handler that must keep the consumer
+    alive. The exponent is clamped here; the delay is at the cap long before that.
+    """
+
+    def __init__(self, base: float, cap: float) -> None:
+        self._policy = BackoffPolicy(max_attempts=1, base_delay=base, max_delay=cap, jitter="equal")
+        self.failures = 0
+
+    def next_delay(self) -> float:
+        self.failures += 1
+        return self._policy.delay(min(self.failures, 64))
+
+    def reset(self) -> None:
+        self.failures = 0
 
 
 class BusClosedError(RuntimeError):
@@ -378,6 +417,17 @@ def _json_fallback(value: Any) -> Any:
     return str(value)
 
 
+def _parse_stream_id(value: Any) -> tuple[int, int] | None:
+    """``b"1700000000000-3"`` -> ``(1700000000000, 3)`` for ordering; None if unparseable."""
+    if value is None:
+        return None
+    ms, sep, seq = _as_str(value).partition("-")
+    try:
+        return int(ms), (int(seq) if sep else 0)
+    except ValueError:
+        return None
+
+
 def _is_group_loss(exc: BaseException) -> bool:
     """Did the stream or the consumer group disappear (FLUSHALL, eviction, DEL, DESTROY)?
 
@@ -499,6 +549,11 @@ class RedisStreamBus(ListingBus):
         self._m_sanitized = m.counter(
             "bus_sanitized_total", "Listings whose text/extra had to be scrubbed to encode as JSON"
         )
+        self._m_trimmed = m.counter("bus_trimmed_total", "Fully processed entries trimmed from the stream")
+        # Consumers trim acknowledged history so stream memory follows the real backlog
+        # instead of maxlen x entry size (see module docstring).
+        self.trim_acked = True
+        self._next_trim_at = 0.0
 
     # ------------------------------------------------------------------ setup
 
@@ -522,11 +577,25 @@ class RedisStreamBus(ListingBus):
         try:
             await self.redis.xgroup_create(self.stream, self.group, id=start_id, mkstream=True)
             log.info("bus consumer group created", extra={**self._log_extra, "start_id": start_id})
+        except redis_exc.OutOfMemoryError:
+            # Redis checks maxmemory before BUSYGROUP, so XGROUP CREATE fails under OOM even
+            # for an existing group. Reads, acks and trims still work: an existing group is
+            # all we need (otherwise a processor could not even start to drain the stream).
+            if not any(_as_str(info.get("name", "")) == self.group for info in await self._group_infos()):
+                raise
         except redis_exc.ResponseError as exc:
             if "BUSYGROUP" not in str(exc):
                 raise
         self._group_ready = True
         self._group_lost = False
+
+    async def _group_infos(self) -> list[Mapping[str, Any]]:
+        """``XINFO GROUPS`` rows ([] when the stream does not exist yet)."""
+        try:
+            groups = await self.redis.xinfo_groups(self.stream)
+        except redis_exc.ResponseError:  # ERR no such key
+            return []
+        return [info for info in groups or [] if isinstance(info, Mapping)]
 
     async def start(self) -> None:
         if self._group_ready:
@@ -555,7 +624,7 @@ class RedisStreamBus(ListingBus):
         if sanitized:
             self._m_sanitized.inc()
             log.warning("bus listing needed text scrubbing to encode", extra={**self._log_extra, "listing": raw.listing_key})
-        backoff = ExponentialBackoff(base=_PUBLISH_BACKOFF_BASE, cap=_PUBLISH_BACKOFF_CAP, jitter="equal")
+        backoff = _LoopBackoff(_PUBLISH_BACKOFF_BASE, _PUBLISH_BACKOFF_CAP)
         failing_since: float | None = None
         next_warning_at = 0.0
         while True:
@@ -574,16 +643,16 @@ class RedisStreamBus(ListingBus):
                 delay = backoff.next_delay()
                 if now >= next_warning_at:
                     next_warning_at = now + _PUBLISH_LOG_INTERVAL
-                    log.warning(
-                        "bus publish failed; waiting for Redis",
-                        extra={
-                            **self._log_extra,
-                            "attempt": backoff.failures,
-                            "failing_for_s": round(now - failing_since, 1),
-                            "error": repr(exc),
-                            "retry_in_s": round(delay, 3),
-                        },
-                    )
+                    extra = {
+                        **self._log_extra,
+                        "attempt": backoff.failures,
+                        "failing_for_s": round(now - failing_since, 1),
+                        "error": repr(exc),
+                        "retry_in_s": round(delay, 3),
+                    }
+                    if isinstance(exc, redis_exc.OutOfMemoryError):
+                        extra["hint"] = "Redis maxmemory reached: is a processor running (it trims acked entries)? lower bus.maxlen or raise maxmemory"
+                    log.warning("bus publish failed; waiting for Redis", extra=extra)
                 await self._sleep(delay)
                 if self._closed:
                     raise BusClosedError("bus closed while publish was waiting for Redis") from exc
@@ -601,7 +670,7 @@ class RedisStreamBus(ListingBus):
     # ------------------------------------------------------------------ consume
 
     async def consume(self) -> AsyncIterator[BusMessage]:
-        backoff = ExponentialBackoff(base=0.1, cap=5.0, jitter="equal")
+        backoff = _LoopBackoff(_CONSUME_BACKOFF_BASE, _CONSUME_BACKOFF_CAP)
         while not self._closed:
             try:
                 if not self._group_ready:
@@ -648,6 +717,7 @@ class RedisStreamBus(ListingBus):
                 for entry_id, _ in entries[index:]:
                     self._inflight.pop(entry_id, None)
             await self._maybe_refresh_backlog()
+            await self._maybe_trim()
 
     async def _next_batch(self) -> list[tuple[str, Any]]:
         # 1) Our own PEL: entries this consumer name held when the process last died.
@@ -785,13 +855,7 @@ class RedisStreamBus(ListingBus):
         """Query the group lag (``XINFO GROUPS``; ``XLEN`` fallback) and update the gauges."""
         lag: Any = None
         pending: Any = None
-        try:
-            groups = await self.redis.xinfo_groups(self.stream)
-        except redis_exc.ResponseError:
-            groups = []  # stream does not exist yet
-        for info in groups or []:
-            if not isinstance(info, Mapping):
-                continue
+        for info in await self._group_infos():
             if _as_str(info.get("name", "")) == self.group:
                 lag = info.get("lag")
                 pending = info.get("pending")
@@ -816,6 +880,53 @@ class RedisStreamBus(ListingBus):
         except Exception as exc:  # noqa: BLE001 - a stale gauge must never break the data path
             self._m_errors.inc(op="backlog")
             log.debug("bus backlog refresh failed", extra={**self._log_extra, "error": repr(exc)})
+
+    # ------------------------------------------------------------------ trimming
+
+    async def trim_acknowledged(self) -> int:
+        """Drop history that every consumer group has fully processed; returns entries removed.
+
+        The threshold is the minimum over *all* groups of their last-delivered id and
+        their oldest pending id, and ``XTRIM MINID`` only removes ids strictly below it,
+        so nothing undelivered or un-acked by any group is ever touched. Without a group
+        nothing is trimmed (entries wait for the group to be (re)created).
+        """
+        floor: tuple[int, int] | None = None
+        for info in await self._group_infos():
+            group_floor = _parse_stream_id(info.get("last-delivered-id"))
+            if group_floor is None:
+                return 0
+            if int(info.get("pending") or 0) > 0:
+                summary = await self.redis.xpending(self.stream, info.get("name"))
+                oldest = _parse_stream_id(summary.get("min")) if isinstance(summary, Mapping) else None
+                if oldest is None:
+                    return 0  # acked in between, or an unknown reply shape: retry next time
+                group_floor = min(group_floor, oldest)
+            floor = group_floor if floor is None else min(floor, group_floor)
+        if floor is None or floor == (0, 0):
+            return 0
+        removed = int(await self.redis.xtrim(self.stream, minid=f"{floor[0]}-{floor[1]}", approximate=True) or 0)
+        if removed:
+            self._m_trimmed.inc(removed)
+        return removed
+
+    async def _maybe_trim(self) -> None:
+        if not self.trim_acked:
+            return
+        now = time.monotonic()
+        if now < self._next_trim_at:
+            return
+        self._next_trim_at = now + _TRIM_INTERVAL_SECONDS
+        try:
+            removed = await self.trim_acknowledged()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - trimming is housekeeping, never fatal
+            self._m_errors.inc(op="trim")
+            log.debug("bus trim failed", extra={**self._log_extra, "error": repr(exc)})
+            return
+        if removed:
+            log.debug("bus trimmed acknowledged history", extra={**self._log_extra, "removed": removed})
 
 
 # --------------------------------------------------------------------------- factory

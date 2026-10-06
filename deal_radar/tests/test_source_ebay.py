@@ -16,18 +16,21 @@ import inspect
 import json
 import random
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs
 
+import aiohttp
 import aioresponses.core as aioresponses_core
 import fakeredis
 import pytest
 from aiohttp import ClientResponse, web
 from aiohttp.test_utils import TestServer
 from aioresponses import CallbackResult, aioresponses
+from multidict import CIMultiDict, CIMultiDictProxy
 from pydantic import SecretStr
 from yarl import URL
 
@@ -45,6 +48,7 @@ from deal_radar.sources.ebay_api import (
     EbayIngestor,
     EbayRateLimited,
     EbayRequestError,
+    EbayResponseError,
     EbayTokenManager,
     QuotaLedger,
     build_enduserctx,
@@ -53,6 +57,8 @@ from deal_radar.sources.ebay_api import (
     build_search_url,
     classify_error,
     collect_images,
+    decode_search_body,
+    looks_blocked,
     parse_item_summary,
     parse_search_page,
     parse_shipping,
@@ -692,10 +698,11 @@ async def test_all_queries_failing_raises_source_error(http: HttpClient) -> None
     ingestor = make_ingestor(make_config(profiles), http)
     with aioresponses() as m:
         m.post(TOKEN_URL, payload=token_payload("tok"))
-        m.get(SEARCH_RE, status=400, payload=ebay_error(12520, "The condition ID is invalid"), repeat=True)
+        too_large = ebay_error(12023, "This keyword search results in a response that is too large to return.")
+        m.get(SEARCH_RE, status=400, payload=too_large, repeat=True)
         with pytest.raises(SourceError, match="all 2 eBay queries failed") as excinfo:
             await ingestor.poll()
-    assert "12520" in str(excinfo.value)
+    assert "12023" in str(excinfo.value)
     assert not isinstance(excinfo.value, (SourceAuthError, EbayRateLimited))
 
 
@@ -928,7 +935,8 @@ async def test_configured_coalesced_queries_replace_profile_terms(http: HttpClie
     assert by_q["rtx (4090, 5090)"].query["category_ids"] == "27386"
     assert by_q["rtx 4090 founders edition"].query["filter"] == RTX4090_FILTER
     assert by_q["rtx 4090 founders edition"].query["category_ids"] == "27386"
-    assert by_q["geforce rtx"].query["filter"] == "buyingOptions:{FIXED_PRICE|BEST_OFFER},itemLocationCountry:US,deliveryCountry:US"
+    bare = "buyingOptions:{FIXED_PRICE|BEST_OFFER},itemLocationCountry:US,deliveryCountry:US"
+    assert by_q["geforce rtx"].query["filter"] == bare
     assert "category_ids" not in by_q["geforce rtx"].query
     assert len(listings) == 4  # same items from every query, emitted once
     assert all(raw.query == "rtx (4090, 5090)" and raw.profile_hint is None for raw in listings)
@@ -1048,6 +1056,169 @@ def test_auction_with_bin_whose_price_is_only_the_current_bid_is_skipped() -> No
     assert parse_item_summary(item) is None  # eBay requires BIN > start price, so this price is the bid
     page = parse_search_page({"itemSummaries": [item]})
     assert page.skipped == {"auction_bid_price": 1}
+
+
+async def test_token_endpoint_wall_vs_json_access_denied(http: HttpClient) -> None:
+    access_denied = json.dumps(ebay_error(1100, "Access denied", domain="ACCESS"))
+    assert not looks_blocked(access_denied)  # eBay's own JSON 403 also says "Access denied"
+    assert looks_blocked(AKAMAI_403) and looks_blocked("<html><body>Pardon Our Interruption</body></html>")
+    tm = EbayTokenManager(http, TOKEN_URL, SecretStr("cid"), SecretStr("sec"), clock=FakeClock())
+    with aioresponses() as m:
+        m.post(TOKEN_URL, status=403, body=access_denied, content_type="application/json")
+        with pytest.raises(SourceError) as excinfo:
+            await tm.get_token()
+    assert not isinstance(excinfo.value, SourceBlocked)
+
+    ingestor = make_ingestor(make_config([gpu_profile(f"gpu_{i}", [f"gpu {i}"]) for i in range(3)]), http)
+    with aioresponses() as m:
+        m.post(TOKEN_URL, status=403, body=AKAMAI_403, content_type="text/html", repeat=True)
+        with pytest.raises(SourceBlocked):
+            await ingestor.poll()
+    assert len(requests_for(m, "POST")) == 1 and not requests_for(m, "GET")
+
+
+def test_decode_search_body_distinguishes_walls_from_bad_replies() -> None:
+    assert decode_search_body(b'{"total": 0, "limit": 50}') == {"total": 0, "limit": 50}  # no itemSummaries = no hits
+    with pytest.raises(SourceBlocked):
+        decode_search_body(b"<html><title>Pardon Our Interruption...</title></html>", {"Content-Type": "text/html"})
+    for body in (b"<html><body>502 proxy error</body></html>", b"null", b"[1, 2]", b"   ", b'{"itemSummaries": [tr'):
+        with pytest.raises(EbayResponseError):
+            decode_search_body(body, {"Content-Type": "text/html"})
+
+
+async def test_cancelled_poll_leaves_no_orphan_tasks_and_books_the_calls(http: HttpClient) -> None:
+    profiles = [gpu_profile(f"gpu_{i}", [f"gpu {i}"]) for i in range(4)]
+    ingestor = make_ingestor(make_config(profiles, max_concurrency=2), http)
+    in_flight = asyncio.Event()
+
+    async def hang(url: URL, **kwargs: Any) -> CallbackResult:
+        in_flight.set()
+        await asyncio.sleep(30)
+        return CallbackResult(payload=fixture())
+
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("tok"))
+        m.get(SEARCH_RE, callback=hang, repeat=True)
+        poll = asyncio.create_task(ingestor.poll())
+        await asyncio.wait_for(in_flight.wait(), 5)
+        await asyncio.sleep(0.01)
+        poll.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await poll
+    leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert leftovers == []
+    assert ingestor.ledger.used() == 2  # the two in-flight searches are booked against the quota
+
+
+async def test_unicode_query_is_utf8_percent_encoded_on_the_wire() -> None:
+    captured: dict[str, str] = {}
+
+    async def token(request: web.Request) -> web.Response:
+        return web.json_response(token_payload("t"))
+
+    async def search(request: web.Request) -> web.Response:
+        captured["raw"] = request.rel_url.raw_query_string
+        captured["q"] = request.query["q"]
+        return web.json_response({"total": 0, "limit": 8, "offset": 0})
+
+    app = web.Application()
+    app.router.add_post(TOKEN_PATH, token)
+    app.router.add_get(SEARCH_PATH, search)
+    term = "Café RTX 4090 – 24GB ＲＴＸ"
+    async with TestServer(app) as server:
+        client = make_http(trust_env=False)
+        try:
+            endpoints = EbayEndpoints(str(server.make_url("/")).rstrip("/"))
+            ingestor = make_ingestor(make_config([gpu_profile("rtx_4090", [term])], limit=8), client, endpoints=endpoints)
+            assert await ingestor.poll() == []  # a JSON object without itemSummaries is a valid empty result
+        finally:
+            await client.close()
+    assert captured["q"] == term
+    assert "q=Caf%C3%A9%20RTX%204090%20%E2%80%93%2024GB%20%EF%BC%B2%EF%BC%B4%EF%BC%B8" in captured["raw"]
+
+
+def _redirect_loop(url: str, authorization: str) -> aiohttp.TooManyRedirects:
+    headers = CIMultiDictProxy(CIMultiDict({"Authorization": authorization}))
+    return aiohttp.TooManyRedirects(aiohttp.RequestInfo(URL(url), "GET", headers, URL(url)), (), status=302, message="Found")
+
+
+async def test_transport_errors_never_leak_credentials(http: HttpClient) -> None:
+    basic = "Basic " + base64.b64encode(b"test-client-id:test-client-secret").decode()
+    tm = EbayTokenManager(http, TOKEN_URL, SecretStr("test-client-id"), SecretStr("test-client-secret"), clock=FakeClock())
+    with aioresponses() as m:
+        m.post(TOKEN_URL, exception=_redirect_loop(TOKEN_URL, basic))
+        with pytest.raises(SourceError) as excinfo:
+            await tm.get_token()
+    assert basic.split()[1] not in str(excinfo.value) and "test-client-secret" not in str(excinfo.value)
+
+    ingestor = make_ingestor(make_config(), http)
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("v^1.1#i^1#secret-app-token"))
+        m.get(SEARCH_RE, exception=_redirect_loop(API + SEARCH_PATH, "Bearer v^1.1#i^1#secret-app-token"))
+        with pytest.raises(SourceError) as excinfo:
+            await ingestor.poll()
+    assert "secret-app-token" not in str(excinfo.value)
+    assert "secret-app-token" not in (ingestor.health.last_error or "")
+
+
+async def test_large_pages_are_parsed_off_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A real server: aioresponses cannot feed bodies above aiohttp's stream high-water mark.
+    import deal_radar.sources.ebay_api as ebay_api
+
+    threads: list[int] = []
+    real_parse = ebay_api.parse_search_page
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        threads.append(threading.get_ident())
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(ebay_api, "parse_search_page", spy)
+    valid = [item for item in fixture()["itemSummaries"] if isinstance(item, dict) and "price" in item and "itemId" in item]
+    big = {"total": 900, "limit": 200, "itemSummaries": []}
+    for n in range(200):
+        big["itemSummaries"].append(dict(valid[n % len(valid)], itemId=f"v1|{900000 + n}|0"))
+
+    async def token(request: web.Request) -> web.Response:
+        return web.json_response(token_payload("t"))
+
+    async def search(request: web.Request) -> web.Response:
+        return web.json_response(big if request.query["q"] == "rtx 4090" else fixture())
+
+    app = web.Application()
+    app.router.add_post(TOKEN_PATH, token)
+    app.router.add_get(SEARCH_PATH, search)
+    profiles = [gpu_profile("rtx_4090", ["rtx 4090"]), gpu_profile("rtx_3090", ["rtx 3090"])]
+    async with TestServer(app) as server:
+        client = make_http(trust_env=False)
+        try:
+            endpoints = EbayEndpoints(str(server.make_url("/")).rstrip("/"))
+            ingestor = make_ingestor(make_config(profiles, max_concurrency=1, limit=200), client, endpoints=endpoints)
+            listings = await ingestor.poll()
+        finally:
+            await client.close()
+    assert len(listings) == 160 + 4  # 4 of every 5 clones are buyable (one is AUCTION-only); the small page adds 4
+    loop_thread = threading.get_ident()
+    assert sorted(t == loop_thread for t in threads) == [False, True]  # big page in a worker, small page inline
+
+
+class _BrokenRedis:
+    """Every command fails, like a Redis that went away mid-run."""
+
+    def __getattr__(self, name: str) -> Any:
+        def fail(*args: Any, **kwargs: Any) -> Any:
+            raise ConnectionError(f"redis down ({name})")
+
+        return fail
+
+
+async def test_redis_outage_degrades_to_local_token_and_ledger(http: HttpClient) -> None:
+    ingestor = make_ingestor(make_config(), http, redis=_BrokenRedis())
+    ingestor.ledger = QuotaLedger(5000, redis=_BrokenRedis(), clock=lambda: NOON_PDT)
+    with aioresponses() as m:
+        m.post(TOKEN_URL, payload=token_payload("tok"))
+        m.get(SEARCH_RE, payload=fixture())
+        assert len(await ingestor.poll()) == 4
+    assert ingestor.ledger.used() == 1
 
 
 async def test_budget_guard_sees_fleet_usage_in_redis_before_the_first_poll(http: HttpClient) -> None:

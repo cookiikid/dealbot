@@ -890,6 +890,202 @@ async def test_redis_maxlen_trims_stream_approximately(rclient: aioredis.Redis) 
     assert 1000 <= length < 1600
 
 
+@contextlib.asynccontextmanager
+async def one_entry_per_stream_node(client: aioredis.Redis) -> AsyncIterator[None]:
+    """Make approximate (``~``) trimming exact so the trim floor can be asserted precisely."""
+    previous = (await client.config_get("stream-node-max-entries"))["stream-node-max-entries"]
+    await client.config_set("stream-node-max-entries", 1)
+    try:
+        yield
+    finally:
+        await client.config_set("stream-node-max-entries", previous)
+
+
+async def test_redis_trim_removes_only_fully_processed_history(rclient: aioredis.Redis) -> None:
+    async with one_entry_per_stream_node(rclient):
+        cfg = make_config(batch_size=20)
+        metrics = Metrics()
+        bus = RedisStreamBus(rclient, cfg, "gcp-1", metrics=metrics)
+        await bus.start()
+        assert await bus.trim_acknowledged() == 0  # empty stream
+        for i in range(30):
+            await bus.publish(make_listing(i))
+        ids = [entry_id.decode() for entry_id, _ in await rclient.xrange(bus.stream)]
+        delivered = await collect(bus, 20, ack=False)
+        assert [m.id for m in delivered] == ids[:20]
+        for msg in delivered[:5] + delivered[8:10]:
+            await bus.ack(msg)  # acked: 0-4 and 8-9; pending: 5-7 and 10-19; undelivered: 20-29
+
+        assert await bus.trim_acknowledged() == 5  # only 0-4: below the oldest pending entry (5)
+        remaining = [entry_id.decode() for entry_id, _ in await rclient.xrange(bus.stream)]
+        assert remaining == ids[5:]
+        assert await pending_count(rclient, bus) == 13
+        assert metric(metrics, "counter", "bus_trimmed_total") == 5
+
+        for msg in delivered[5:8] + delivered[10:]:
+            await bus.ack(msg)
+        # Nothing pending: the floor is the last delivered id (19), undelivered 20-29 stay.
+        assert await bus.trim_acknowledged() == 14
+        assert [e.decode() for e, _ in await rclient.xrange(bus.stream)] == ids[19:]
+        rest = await collect(bus, 10)
+        assert [m.id for m in rest] == ids[20:]
+        assert await bus.trim_acknowledged() == 10  # keeps only the last delivered entry
+        assert await rclient.xlen(bus.stream) == 1
+        await bus.close()
+
+
+async def test_redis_trim_respects_every_consumer_group(rclient: aioredis.Redis) -> None:
+    async with one_entry_per_stream_node(rclient):
+        cfg = make_config(batch_size=50)
+        bus = RedisStreamBus(rclient, cfg, "gcp-1")
+        await bus.start()
+        # An unrelated group (analytics, debugging) created before any entry and never read.
+        await rclient.xgroup_create(bus.stream, "audit", id="$")
+        for i in range(10):
+            await bus.publish(make_listing(i))
+        await collect(bus, 10)  # our group delivered + acked everything
+        assert await bus.trim_acknowledged() == 0
+        assert await rclient.xlen(bus.stream) == 10
+        await rclient.xreadgroup("audit", "x", {bus.stream: ">"}, count=4)  # audit: 4 delivered, pending
+        assert await bus.trim_acknowledged() == 0  # its oldest pending entry is the first one
+        first_four = [e for e, _ in await rclient.xrange(bus.stream, count=4)]
+        await rclient.xack(bus.stream, "audit", *first_four)
+        assert await bus.trim_acknowledged() == 3  # floor = audit's last delivered (4th) entry
+        await bus.close()
+
+
+async def test_redis_trim_is_a_noop_without_any_group(rclient: aioredis.Redis) -> None:
+    bus = RedisStreamBus(rclient, make_config(), "gcp-1")
+    assert await bus.trim_acknowledged() == 0  # no stream at all
+    await rclient.xadd(bus.stream, {PAYLOAD_FIELD: make_listing(1).model_dump_json()})
+    assert await bus.trim_acknowledged() == 0  # stream without group: entries wait for one
+    assert await rclient.xlen(bus.stream) == 1
+
+
+async def test_redis_consumer_trims_acknowledged_history_periodically(
+    rclient: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import deal_radar.engine.bus as bus_module
+
+    monkeypatch.setattr(bus_module, "_TRIM_INTERVAL_SECONDS", 0.05)
+    cfg = make_config(batch_size=10)
+    metrics = Metrics()
+    bus = RedisStreamBus(rclient, cfg, "gcp-1", metrics=metrics)
+    await bus.start()
+    for i in range(200):
+        await bus.publish(make_listing(i))
+    received: list[BusMessage] = []
+
+    async def run() -> None:
+        async for msg in bus.consume():
+            received.append(msg)
+            await bus.ack(msg)
+
+    task = asyncio.create_task(run())
+    deadline = time.monotonic() + 5.0
+    while (len(received) < 200 or await rclient.xlen(bus.stream) > 10) and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    await bus.close()
+    await asyncio.wait_for(task, 2.0)
+    assert len({m.id for m in received}) == 200
+    assert await rclient.xlen(bus.stream) <= 10  # history follows the backlog, not maxlen
+    assert metric(metrics, "counter", "bus_trimmed_total") >= 190
+    assert await bus.refresh_backlog() == 0  # group lag is still computable after MINID trims
+
+    off = RedisStreamBus(rclient, cfg, "gcp-2")
+    off.trim_acked = False
+    await off.publish(make_listing(999))
+    await collect(off, 1)
+    assert metric(off.metrics, "counter", "bus_trimmed_total") == 0
+
+
+async def test_redis_start_and_consume_work_while_redis_is_out_of_memory(
+    rclient: aioredis.Redis, fast_publish_backoff: None
+) -> None:
+    cfg = make_config()
+    producer = RedisStreamBus(rclient, cfg, "collector")
+    await producer.start()
+    for i in range(3):
+        await producer.publish(make_listing(i))
+    await rclient.config_set("maxmemory", 1)  # every denyoom command (XADD, XGROUP CREATE) now fails
+    try:
+        late = RedisStreamBus(rclient, cfg, "collector-2")
+        blocked = asyncio.create_task(late.publish(make_listing(3)))
+        consumer = RedisStreamBus(rclient, cfg, "gcp-1")
+        await consumer.start()  # XGROUP CREATE refused with OOM, but the group exists
+        got = await collect(consumer, 3)  # XREADGROUP / XACK are allowed under OOM
+        assert sorted(m.raw.source_id for m in got) == sorted(make_listing(i).source_id for i in range(3))
+        assert not blocked.done(), "publish waits while Redis refuses writes"
+        missing = RedisStreamBus(rclient, cfg.model_copy(update={"bus": cfg.bus.model_copy(update={"group": "other"})}), "x")
+        with pytest.raises(BusError):
+            await missing.start()  # a group that does not exist cannot be created under OOM
+    finally:
+        await rclient.config_set("maxmemory", 0)
+    await asyncio.wait_for(blocked, 2.0)  # memory is back: the waiting publish goes through
+    rest = await collect(consumer, 1)
+    assert rest[0].raw.source_id == make_listing(3).source_id
+    await consumer.close()
+
+
+async def test_redis_processor_trimming_unblocks_publishers_at_maxmemory(fast_publish_backoff: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """At maxmemory XADD is refused and cannot trim the stream itself; the processor's
+    MINID trims of acknowledged history must free memory so publishing never deadlocks."""
+    import deal_radar.engine.bus as bus_module
+
+    binary = _redis_binary()
+    if not binary:
+        pytest.skip("redis-server binary not available")
+    port = _free_port()
+    proc = _spawn_redis(binary, port)
+    if proc is None:
+        pytest.skip("could not start redis-server")
+    monkeypatch.setattr(bus_module, "_TRIM_INTERVAL_SECONDS", 0.05)
+    client = aioredis.Redis(host="127.0.0.1", port=port, socket_timeout=5.0)
+    cfg = make_config(batch_size=32, maxlen=100_000)  # MAXLEN far away: only MINID trims help
+    producer = RedisStreamBus(client, cfg, "laptop-1")
+    consumer = RedisStreamBus(client, cfg, "gcp-1")
+    received: list[str] = []
+    task: asyncio.Task[None] | None = None
+    try:
+        await producer.start()
+        used = int((await client.info("memory"))["used_memory"])
+        await client.config_set("maxmemory", used + 1_500_000)  # ~1.5 MB of headroom
+        await client.config_set("maxmemory-policy", "noeviction")
+
+        async def run() -> None:
+            async for msg in consumer.consume():
+                received.append(msg.raw.source_id)
+                await consumer.ack(msg)
+
+        total = 1500  # ~4 MB of listings: more than twice the headroom
+
+        async def produce() -> None:
+            for i in range(total):
+                await producer.publish(make_listing(i, description="x" * 1500))
+
+        producing = asyncio.create_task(produce())
+        deadline = time.monotonic() + 10.0
+        while metric(producer.metrics, "counter", "bus_errors_total", op="publish") == 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert not producing.done(), "the collector must be stuck on OOM before the processor starts"
+        stuck_at = metric(producer.metrics, "counter", "bus_published_total")
+        assert 0 < stuck_at < total
+
+        task = asyncio.create_task(run())  # processor (re)starts: consumes, acks and trims
+        await asyncio.wait_for(producing, 20.0)
+        deadline = time.monotonic() + 10.0
+        while len(received) < total and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert len(set(received)) == total
+        assert metric(consumer.metrics, "counter", "bus_trimmed_total") > 0
+    finally:
+        await consumer.close()
+        if task is not None:
+            await asyncio.wait_for(task, 5.0)
+        await client.aclose()
+        _stop_redis(proc)
+
+
 @pytest.mark.parametrize("gap", [0.0, 0.1], ids=["publish-immediately", "publish-later"])
 async def test_redis_consumer_recovers_after_stream_and_group_vanish(rclient: aioredis.Redis, gap: float) -> None:
     # The idle consumer is parked in XREADGROUP BLOCK; Redis 7 wakes it with
@@ -983,6 +1179,35 @@ async def test_redis_group_recreation_after_loss_survives_an_intermediate_error(
     assert received == [make_listing(1).source_id, make_listing(2).source_id]
     assert flaky.calls["xgroup_create"] >= 3  # initial create, OOM, successful recreate
     assert metric(metrics, "counter", "bus_errors_total", op="consume") >= 2
+
+
+def test_loop_backoff_saturates_instead_of_overflowing() -> None:
+    from deal_radar.engine.bus import _LoopBackoff
+
+    backoff = _LoopBackoff(0.1, 5.0)
+    delays = [backoff.next_delay() for _ in range(5000)]  # core ExponentialBackoff dies at #1025
+    assert 0.05 <= delays[0] <= 0.1
+    assert all(2.5 <= d <= 5.0 for d in delays[10:])
+    backoff.reset()
+    assert backoff.next_delay() <= 0.1
+
+
+async def test_redis_consumer_outlives_more_than_1024_consecutive_failures(
+    rclient: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ~1 h of Redis outage at the production 5 s cap; compressed with a tiny backoff.
+    import deal_radar.engine.bus as bus_module
+
+    monkeypatch.setattr(bus_module, "_CONSUME_BACKOFF_BASE", 0.00001)
+    monkeypatch.setattr(bus_module, "_CONSUME_BACKOFF_CAP", 0.00002)
+    producer = RedisStreamBus(rclient, make_config(), "collector")
+    await producer.publish(make_listing(1))
+    flaky = FlakyRedis(rclient, {"xreadgroup": 1100})
+    bus = RedisStreamBus(flaky, make_config(), "gcp-1")  # type: ignore[arg-type]
+    got = await collect(bus, 1, timeout=20.0)
+    assert got[0].raw.source_id == make_listing(1).source_id
+    assert flaky.calls["xreadgroup"] > 1100
+    await bus.close()
 
 
 async def test_redis_consumer_survives_transient_errors(rclient: aioredis.Redis) -> None:

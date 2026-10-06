@@ -660,7 +660,18 @@ _STEALTH_PROBE_JS = """async () => {
   try { Object.getOwnPropertyDescriptor(Navigator.prototype, 'languages').get.call({}); } catch (err) { brandError = err.name; }
   const notif = (await navigator.permissions.query({ name: 'notifications' })).state;
   await fetch('/echo');
+  const uaData = navigator.userAgentData;
+  const high = uaData ? await uaData.getHighEntropyValues(['fullVersionList']) : null;
+  const brandsGetter = uaData ? Object.getOwnPropertyDescriptor(NavigatorUAData.prototype, 'brands').get : null;
+  let uaBrandError = null;
+  try { brandsGetter.call({}); } catch (err) { uaBrandError = err.name; }
   return {
+    brands: uaData ? uaData.brands.map((b) => b.brand) : null,
+    brandsFrozen: uaData ? Object.isFrozen(uaData.brands) : null,
+    fullVersionBrands: high ? high.fullVersionList.map((b) => b.brand) : null,
+    jsonBrands: uaData ? uaData.toJSON().brands.map((b) => b.brand) : null,
+    brandsSource: brandsGetter ? ts.call(brandsGetter) : null,
+    uaBrandError,
     ua: navigator.userAgent,
     webdriver: navigator.webdriver,
     plugins: navigator.plugins.length,
@@ -727,6 +738,11 @@ async def test_stealth_init_script_in_real_chromium(build: str, tmp_path: Path) 
 
     assert info["webdriver"] in (False, None)
     assert "HeadlessChrome" not in info["ua"]
+    # The headless shell keeps a "HeadlessChrome" UA-CH brand even with the UA overridden.
+    assert info["brands"] and not any("Headless" in b for b in info["brands"])
+    assert not any("Headless" in b for b in info["fullVersionBrands"] + info["jsonBrands"])
+    assert info["brandsSource"] == "function get brands() { [native code] }"
+    assert info["uaBrandError"] == "TypeError"
     assert info["plugins"] > 0 and info["mimeTypes"] > 0
     assert "PDF Viewer" in info["pluginNames"] and info["pdfMime"] == "application/pdf"
     assert info["language"] == "en-US" and info["languages"] == ["en-US", "en"]
@@ -1462,3 +1478,67 @@ async def test_run_check_reports_a_browser_that_cannot_start(tmp_path: Path, cap
     _write_state(Path(config.sources.fb_marketplace.browser.storage_state_path))
     assert await fb.run_check(config, base_url="http://127.0.0.1:9") == 1
     assert "Could not start the browser" in capsys.readouterr().out
+
+
+def _driver_pid(ingestor: fb.FbMarketplaceIngestor) -> int | None:
+    impl = getattr(ingestor._playwright, "_impl_obj", None)
+    proc = getattr(getattr(getattr(impl, "_connection", None), "_transport", None), "_proc", None)
+    pid = getattr(proc, "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
+async def test_poll_recovers_after_playwright_driver_dies(tmp_path: Path, http: HttpClient) -> None:
+    # When the Playwright driver (node) process dies, every call raises a plain
+    # Exception("Connection closed while reading from the driver"), not a Playwright
+    # Error, and Browser.is_connected() keeps saying True.
+    exe = await _require_chromium("full")
+    server = TestServer(FakeMarketplace("dom").app(), host="127.0.0.1")
+    await server.start_server()
+    cfg = _fb_cfg(tmp_path, exe, profiles=["steamdeck"], scrolls_per_query=0)
+    _write_state(Path(cfg.browser.storage_state_path))
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()), base_url=str(server.make_url("/")))
+    ingestor.results_timeout_seconds = 2.0
+    try:
+        first = await ingestor.poll()
+        pid = _driver_pid(ingestor)
+        if pid is None:
+            pytest.skip("cannot locate the Playwright driver process in this Playwright version")
+        os.kill(pid, 9)
+        await asyncio.sleep(0.5)
+        with pytest.raises(SourceError, match="browser connection lost"):
+            await ingestor.poll()
+        second = await asyncio.wait_for(ingestor.poll(), timeout=60)
+    finally:
+        await asyncio.wait_for(ingestor.teardown(), timeout=30)
+        await server.close()
+    assert [i.source_id for i in second] == [i.source_id for i in first]
+
+
+class _Wedged:
+    """A browser object whose every call hangs (frozen renderer / stuck driver)."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def _hang(self, *args: Any, **kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+
+    storage_state = _hang
+    close = _hang
+
+    async def stop(self) -> None:
+        await asyncio.Event().wait()
+
+
+async def test_teardown_is_bounded_when_the_browser_is_wedged(tmp_path: Path, http: HttpClient) -> None:
+    cfg = _fb_cfg(tmp_path, None)
+    _write_state(Path(cfg.browser.storage_state_path))
+    original = Path(cfg.browser.storage_state_path).read_text()
+    ingestor = fb.FbMarketplaceIngestor(cfg, _ctx(http, _app_config()))
+    ingestor.close_timeout_seconds = 0.2
+    ingestor._page, ingestor._context, ingestor._browser, ingestor._playwright = (  # type: ignore[assignment]
+        _Wedged(), _Wedged(), _Wedged(), _Wedged())
+    ingestor._session_ok = True
+    await asyncio.wait_for(ingestor.teardown(), timeout=5.0)
+    assert ingestor._context is None and ingestor._playwright is None
+    assert Path(cfg.browser.storage_state_path).read_text() == original
