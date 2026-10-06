@@ -189,8 +189,8 @@ async def _start_fake(default: tuple[int, Any, dict[str, str]]) -> FakeAPI:
     fake = FakeAPI(default=default)
     app = web.Application()
     app.router.add_post("/{tail:.*}", fake.handler)
-    fake.server = TestServer(app, access_log=None)
-    await fake.server.start_server()
+    fake.server = TestServer(app)
+    await fake.server.start_server(access_log=None)  # the fake's access log would print the token itself
     return fake
 
 
@@ -821,8 +821,8 @@ async def ws_env():
         hub = WebSocketHub(cfg, **kwargs)
         app = web.Application()
         hub.attach(app)
-        server = TestServer(app, access_log=None)
-        await server.start_server()
+        server = TestServer(app)
+        await server.start_server(access_log=None)
         servers.append(server)
         hubs.append(hub)
         return hub, server

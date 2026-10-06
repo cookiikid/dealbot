@@ -59,6 +59,7 @@ BUTTONS_PER_ROW = 2
 BUTTON_TEXT_LIMIT = 64
 BUTTON_URL_LIMIT = 2048
 KEY_FACTS = 4  # Price, Market, Discount, Score: kept even in tight captions
+MIN_HEADLINE = 120  # headline budget never shrinks below this to make room for facts
 
 ALL_STATUSES = range(100, 600)
 DISABLE_STATUSES = frozenset({401, 403, 404})
@@ -116,6 +117,8 @@ def _valid_url(url: str | None, limit: int = BUTTON_URL_LIMIT) -> bool:
 def _truncate_plain(text: str, limit: int) -> str:
     if text_length(text) <= limit:
         return text
+    if limit <= 0:
+        return ""
     out: list[str] = []
     used = 0
     for ch in text:
@@ -174,20 +177,30 @@ def _assemble(head: str, candidates: list[_Line], max_len: int) -> str:
     return "\n".join([head, *(line.text for line in chosen)])
 
 
+def _compose(alert: Alert, max_len: int, *, markup: bool) -> str:
+    candidates = _candidate_lines(alert, markup=markup)
+    plain_head = headline(alert)
+    fit = fit_escaped if markup else _truncate_plain
+    wrapper = text_length("<b></b>") if markup else 0
+    if max_len <= wrapper:
+        return fit(plain_head, max_len)
+    # The headline may not crowd out the key facts (a title full of "&" triples in
+    # size once escaped), but it always keeps a readable minimum.
+    key_cost = sum(text_length(line.text) + 1 for line in candidates if line.priority == 1)
+    head_budget = max(max_len - wrapper - key_cost, min(max_len - wrapper, MIN_HEADLINE))
+    head_text = fit(plain_head, head_budget)
+    head = f"<b>{head_text}</b>" if markup else head_text
+    return _assemble(head, candidates, max_len)
+
+
 def build_telegram_message(alert: Alert, *, max_len: int) -> str:
     """HTML-formatted alert of at most ``max_len`` UTF-16 units *including markup*."""
-    plain_head = headline(alert)
-    wrapper = text_length("<b></b>")
-    if max_len <= wrapper:
-        return fit_escaped(plain_head, max_len)
-    head = f"<b>{fit_escaped(plain_head, max_len - wrapper)}</b>"
-    return _assemble(head, _candidate_lines(alert, markup=True), max_len)
+    return _compose(alert, max_len, markup=True)
 
 
 def build_plain_message(alert: Alert, *, max_len: int = MESSAGE_LIMIT) -> str:
     """Markup-free variant used when Telegram refuses the HTML message."""
-    head = _truncate_plain(headline(alert), max_len)
-    return _assemble(head, _candidate_lines(alert, markup=False), max_len)
+    return _compose(alert, max_len, markup=False)
 
 
 def build_inline_keyboard(alert: Alert) -> list[list[dict[str, str]]]:
