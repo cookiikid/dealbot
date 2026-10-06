@@ -1094,7 +1094,11 @@ async def test_redis_publish_survives_real_server_restart() -> None:
 
         task = asyncio.create_task(run())
         await bus.publish(make_listing(1))
-        _stop_redis(proc)
+        deadline = time.monotonic() + 3.0
+        while not received and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert received == [make_listing(1).source_id]
+        _stop_redis(proc)  # no persistence: the restarted server is empty (no stream, no group)
         blocked = asyncio.create_task(bus.publish(make_listing(2)))
         await asyncio.sleep(0.5)
         assert not blocked.done(), "publish must wait for Redis to come back"
