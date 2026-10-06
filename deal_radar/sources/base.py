@@ -78,7 +78,7 @@ class IngestorContext:
 @dataclass
 class SourceHealth:
     name: str
-    state: str = "idle"  # idle | ok | degraded | open | standby | stopped
+    state: str = "idle"  # idle | ok | degraded | open | standby | setup_failed | stopped
     polls: int = 0
     failures: int = 0
     consecutive_failures: int = 0
@@ -270,14 +270,8 @@ class BaseIngestor(abc.ABC):
         """Poll forever until ``stop`` is set, emitting new/changed listings."""
         self.log.info("source starting", extra={"source": self.name, "interval_s": self.cfg.poll_interval_seconds})
         try:
-            await self.setup()
-        except Exception as exc:  # noqa: BLE001 - surface any setup failure as source state
-            self.health.state = "stopped"
-            self._record_failure(exc)
-            self.log.exception("source setup failed", extra={"source": self.name})
-            await self._notify(f"{self.name} failed to start", repr(exc))
-            return
-        try:
+            if not await self._setup_with_retry(stop):
+                return
             while not stop.is_set():
                 delay = await self._cycle(emit)
                 self.health.next_poll_in_s = round(delay, 2)
@@ -295,6 +289,28 @@ class BaseIngestor(abc.ABC):
             except Exception:  # noqa: BLE001
                 self.log.exception("source teardown failed", extra={"source": self.name})
             self.log.info("source stopped", extra={"source": self.name})
+
+    async def _setup_with_retry(self, stop: asyncio.Event) -> bool:
+        """Run ``setup`` until it succeeds; retry every ``cooldown_seconds`` (tokens, browsers
+        and DNS can all fail transiently at boot). Returns False if stopped first."""
+        attempt = 0
+        while not stop.is_set():
+            attempt += 1
+            try:
+                await self.setup()
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - surface any setup failure as source state
+                self._record_failure(exc)
+                self.health.state = "setup_failed"
+                self.log.exception("source setup failed", extra={"source": self.name, "attempt": attempt})
+                if attempt == 1 or attempt % 10 == 0:
+                    await self._notify(f"{self.name} failed to start", f"{exc!r} — retrying every {self.cfg.cooldown_seconds:.0f}s")
+                self.health.next_poll_in_s = self.cfg.cooldown_seconds
+                if await _wait(stop, self.cfg.cooldown_seconds):
+                    return False
+        return False
 
     async def _cycle(self, emit: EmitFn) -> float:
         if self._lease is not None:

@@ -33,6 +33,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
+from multidict import CIMultiDict
 
 from deal_radar.core.backoff import BackoffPolicy, RetryableError, RetryExhausted, parse_retry_after, retry_async
 from deal_radar.core.logs import get_logger
@@ -260,8 +261,9 @@ class ConditionalCache:
         return headers
 
     def store(self, key: str, headers: Mapping[str, str]) -> None:
-        etag = headers.get("ETag") or headers.get("etag")
-        last_modified = headers.get("Last-Modified") or headers.get("last-modified")
+        lowered = {k.lower(): v for k, v in headers.items()}
+        etag = lowered.get("etag")
+        last_modified = lowered.get("last-modified")
         if not etag and not last_modified:
             self._entries.pop(key, None)
             return
@@ -293,14 +295,14 @@ class HttpStatusError(Exception):
         self.status = status
         self.url = url
         self.body = body
-        self.headers = dict(headers or {})
+        self.headers: Mapping[str, str] = CIMultiDict(headers or {})
 
 
 @dataclass(slots=True)
 class HttpResponse:
     status: int
     url: str
-    headers: dict[str, str]
+    headers: Mapping[str, str]  # case-insensitive (CIMultiDict)
     data: Any = None  # parsed JSON / text / bytes depending on ``parse``
     not_modified: bool = False
     elapsed_ms: float = 0.0
@@ -463,7 +465,8 @@ class HttpClient:
                     proxy=proxy or self.settings.proxy,
                 ) as resp:
                     status = resp.status
-                    resp_headers = {k: v for k, v in resp.headers.items()}
+                    # Case-insensitive copy: servers send "Etag", "etag", "x-ratelimit-remaining"...
+                    resp_headers: CIMultiDict[str] = CIMultiDict(resp.headers)
                     if status == 304 and conditional:
                         return HttpResponse(304, str(resp.url), resp_headers, None, True, _ms(started), attempts)
                     if status in expected:

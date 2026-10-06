@@ -1,0 +1,151 @@
+# =============================================================================
+#  DealRadar full stack.  Run from the repository root:
+#
+#   GCP VM (primary: Valkey + collector/processor):
+#     docker compose -f deal_radar/deploy/docker-compose.yml up -d --build
+#
+#   Home laptop (RTX 3080, residential IP: Facebook Marketplace / OfferUp collector):
+#     docker compose -f deal_radar/deploy/docker-compose.yml --profile local up -d --build dealradar-browser
+#
+#   Desktop (RTX 3060 12GB: local vision API):
+#     docker compose -f deal_radar/deploy/docker-compose.yml --profile vision up -d ollama ollama-pull
+#
+#  Nodes talk over Tailscale; nothing here is exposed on a public interface by default.
+# =============================================================================
+name: dealradar
+
+x-dealradar-common: &dealradar-common
+  env_file:
+    - path: ../../.env
+      required: false
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    # AOF so dedup keys and un-acked stream entries survive restarts.
+    # volatile-ttl: under memory pressure evict the dedup keys closest to expiry, never stream data.
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${VALKEY_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - volatile-ttl
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    ports:
+      # Bind to loopback by default; set REDIS_BIND to the VM's Tailscale IP (100.x.y.z)
+      # so the laptop collector and other nodes can reach it over the tailnet only.
+      - "${REDIS_BIND:-127.0.0.1}:6379:6379"
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  dealradar:
+    <<: *dealradar-common
+    build:
+      context: ../..
+      dockerfile: deal_radar/deploy/Dockerfile
+      target: runtime
+    image: dealradar:latest
+    depends_on:
+      valkey:
+        condition: service_healthy
+    environment:
+      NODE_ID: ${NODE_ID:-gcp-primary}
+      APP_ROLES: collector,processor
+      BUS_BACKEND: redis
+      REDIS_URL: redis://:${REDIS_PASSWORD}@valkey:6379/0
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////app/data/dealradar.db}
+      LOG_JSON: "true"
+    ports:
+      - "${HTTP_BIND:-127.0.0.1}:8080:8080"
+    volumes:
+      - dealradar-data:/app/data
+
+  dealradar-browser:
+    <<: *dealradar-common
+    profiles: ["local"]
+    build:
+      context: ../..
+      dockerfile: deal_radar/deploy/Dockerfile
+      target: browser
+    image: dealradar:browser
+    # Chromium needs a larger /dev/shm than Docker's 64 MB default.
+    shm_size: "1gb"
+    environment:
+      NODE_ID: ${LOCAL_NODE_ID:-home-laptop}
+      APP_ROLES: collector
+      BUS_BACKEND: redis
+      # The primary's Valkey over Tailscale, e.g. redis://:pass@100.101.102.103:6379/0
+      REDIS_URL: ${PRIMARY_REDIS_URL:?set PRIMARY_REDIS_URL to the primary Valkey over Tailscale}
+      FB_ENABLED: ${FB_ENABLED:-true}
+      FB_NODES: ${LOCAL_NODE_ID:-home-laptop}
+      OFFERUP_ENABLED: ${OFFERUP_ENABLED:-false}
+      OFFERUP_NODES: ${LOCAL_NODE_ID:-home-laptop}
+      # API sources stay on the cloud node.
+      REDDIT_ENABLED: "false"
+      SLICKDEALS_ENABLED: "false"
+      EBAY_ENABLED: "false"
+      RETAIL_ENABLED: "false"
+      HTTP_PORT: "8081"
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ../../data:/app/data   # holds fb_storage_state.json created by the --login helper
+
+  ollama:
+    profiles: ["vision"]
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      OLLAMA_KEEP_ALIVE: 30m          # keep weights resident: a cold load costs seconds
+      OLLAMA_NUM_PARALLEL: "2"        # matches vision.max_concurrency
+      OLLAMA_MAX_LOADED_MODELS: "2"   # small model + escalation model on 12 GB
+      OLLAMA_FLASH_ATTENTION: "1"
+    ports:
+      # Bind to the desktop's Tailscale IP so only the tailnet can reach the GPU.
+      - "${OLLAMA_BIND:-127.0.0.1}:11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ollama-pull:
+    profiles: ["vision"]
+    image: ollama/ollama:latest
+    depends_on: [ollama]
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        sleep 3 &&
+        ollama pull ${VISION_MODEL:-qwen2.5vl:3b} &&
+        { [ -z "${VISION_ESCALATION_MODEL:-}" ] || ollama pull ${VISION_ESCALATION_MODEL}; }
+
+volumes:
+  valkey-data:
+  dealradar-data:
+  ollama-models:
