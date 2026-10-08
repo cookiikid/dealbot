@@ -1097,3 +1097,121 @@ async def test_poll_cancellation_propagates(upstream: FakeSlickdeals, http: Http
     with pytest.raises(asyncio.CancelledError):
         await task
     release.set()
+
+
+# --------------------------------------------------------------------------- cadence / consistency follow-ups
+
+
+def _cadence_ingestor(app_config: AppConfig, feeds: list[FeedSpec], **cfg: Any) -> SlickdealsIngestor:
+    ctx = IngestorContext(http=None, metrics=Metrics(), config=app_config, node_id="test", rng=random.Random(3))  # type: ignore[arg-type]
+    return SlickdealsIngestor(SlickdealsSource(enabled=True, search_feeds_from_profiles=False, feeds=feeds, **cfg), ctx)
+
+
+def test_next_interval_never_sleeps_past_the_next_due_feed(app_config: AppConfig) -> None:
+    forum = FeedSpec(name="hot_deals_forum", url="https://slickdeals.net/newsearch.php?searchin=first&forumchoice%5B%5D=9&rss=1")
+    frontpage = FeedSpec(name="frontpage", url="https://slickdeals.net/newsearch.php?mode=frontpage&rss=1", interval_seconds=180)
+
+    plain = _cadence_ingestor(app_config, [forum], poll_interval_seconds=30, jitter_pct=0.15)
+    assert plain.seconds_until_next_due() is None
+    assert all(25.5 <= plain.next_interval() <= 34.5 for _ in range(50))  # jittered base only
+
+    ingestor = _cadence_ingestor(app_config, [forum, frontpage], poll_interval_seconds=30, jitter_pct=0.15)
+    now, ingestor.clock = _fixed_clock()
+    assert ingestor.seconds_until_next_due() == 0.0  # never fetched: due now
+    ingestor.feeds_for_poll()
+    now[0] += 172.0  # a jittered poll lands 8 s before the frontpage is due
+    assert ingestor.seconds_until_next_due() == pytest.approx(8.0)
+    assert ingestor.next_interval() == pytest.approx(8.0)
+    now[0] += 8.0
+    assert [f.name for f in ingestor.feeds_for_poll()] == ["hot_deals_forum", "frontpage"]
+    now[0] += 179.5  # within FEED_DUE_TOLERANCE_SECONDS of the due time: not pushed a whole cycle back
+    assert [f.name for f in ingestor.feeds_for_poll()] == ["hot_deals_forum", "frontpage"]
+
+
+async def test_cancelled_poll_gives_the_feed_slot_back(upstream: FakeSlickdeals, http: HttpClient, app_config: AppConfig) -> None:
+    arrived = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(request: web.Request) -> Reply:
+        arrived.set()
+        await release.wait()
+        return rss("frontpage.xml")
+
+    upstream.responses["frontpage"] = slow
+    ingestor = make_ingestor(upstream, http, app_config, feeds=[])
+    ingestor.static_feeds = [FeedTarget(name="frontpage", url=upstream.frontpage_url(), interval_seconds=180)]
+    now, ingestor.clock = _fixed_clock()
+    task = asyncio.create_task(ingestor.poll())
+    await asyncio.wait_for(arrived.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    now[0] += 5
+    assert [f.name for f in ingestor.feeds_for_poll()] == ["frontpage"]  # still due: nothing was delivered
+
+
+def test_merge_keeps_retailer_and_outbound_url_consistent() -> None:
+    def raw(feed: str, retailer: str | None, outbound: str | None) -> RawListing:
+        return RawListing(
+            source="slickdeals",
+            source_kind=SourceKind.AGGREGATOR,
+            source_id="20099271",
+            url="https://slickdeals.net/f/20099271",
+            title="LG C6 $1499.99",
+            price=1499.99,
+            retailer=retailer,
+            outbound_url=outbound,
+            extra={"feeds": [feed]},
+        )
+
+    amazon_dp = "https://www.amazon.com/dp/B0GRK5D3RW"
+    # Primary knows no retailer but carries an Amazon link; the other feed says Best Buy.
+    merged = merge_duplicates([raw("frontpage", None, amazon_dp), raw("hot_deals_forum", "Best Buy", None)])[0]
+    assert merged.retailer == "Best Buy" and merged.outbound_url is None
+    # A link from a feed that resolved a different store is not borrowed.
+    merged = merge_duplicates([raw("frontpage", "Best Buy", None), raw("hot_deals_forum", "Amazon", amazon_dp)])[0]
+    assert merged.retailer == "Best Buy" and merged.outbound_url is None
+    merged = merge_duplicates([raw("frontpage", "Amazon", None), raw("hot_deals_forum", None, amazon_dp)])[0]
+    assert merged.retailer == "Amazon" and merged.outbound_url == amazon_dp
+
+
+def test_outbound_url_skips_links_of_another_known_store() -> None:
+    body = (
+        '<a href="https://www.amazon.com/dp/B0GRK5D3RW">Amazon</a> '
+        '<a href="https://www.bestbuy.com/site/lg-c6/6673112.p">Best Buy</a> '
+        '<a href="https://shop.example.com/lg-c6">Shop</a>'
+    )
+    assert extract_outbound_url(body) == "https://www.amazon.com/dp/B0GRK5D3RW"
+    assert extract_outbound_url(body, retailer="Best Buy") == "https://www.bestbuy.com/site/lg-c6/6673112.p"
+    assert extract_outbound_url(body, retailer="Bob's Hardware") == "https://shop.example.com/lg-c6"  # unknown host: kept
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("bh-cosmetics", "Bh Cosmetics"),  # "bh" is an abbreviation alias, not a store name prefix
+        ("best-buy-outlet", "Best Buy"),
+        ("Dell Refurbished", "Dell"),
+        ("Seller Name That Is Far Too Long To Be A Store via Amazon", "Amazon"),
+    ],
+)
+def test_normalize_store_prefix_guards(raw: str, expected: str) -> None:
+    assert normalize_store(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["<" * 100_000, "<a " * 40_000, "<a " + 'a="x ' * 20_000 + ">", "[url=" * 30_000, "<" + " " * 100_000 + "x", "<style " * 20_000],
+)
+def test_html_helpers_stay_linear_on_more_pathological_bodies(body: str) -> None:
+    started = time.perf_counter()
+    html_to_text(body)
+    extract_outbound_url(body)
+    extract_images({}, body)
+    extract_retailer("Thing $5", body)
+    assert time.perf_counter() - started < 2.0
+
+
+def test_html_to_text_keeps_text_around_closed_scripts() -> None:
+    assert html_to_text("a<script>var x = '<b>';</script>b<STYLE>p{}</style >c") == "a b c"

@@ -15,19 +15,27 @@ Design decisions
   for 1024 can never be refused for length.
 * **Photo first, text fallback.** With an image and ``send_photos`` the alert goes out
   as ``sendPhoto`` (URL fetched by Telegram) with the caption; Telegram cannot fetch
-  many marketplace CDN URLs (signed/expiring, hot-link protected), and a 400 there
-  falls back to ``sendMessage`` with a large link preview of the deal page.
+  many marketplace CDN URLs (signed/expiring, hot-link protected). Any 400 there
+  ("failed to get HTTP URL content", "wrong type of the web page content", "wrong
+  file identifier/HTTP URL specified", bad dimensions...) falls back to
+  ``sendMessage`` with a large link preview of the deal page.
   A 400 on ``sendMessage`` (e.g. an entity Telegram dislikes or a button URL it
   refuses) is retried once as plain text without markup, so the alert still lands.
 * **Silent vs. loud.** ``disable_notification`` is set for severities below
   ``silent_below`` unless the router asked for a mention.
-* **429 / migration.** ``parameters.retry_after`` is honoured within the dispatch
-  timeout budget (and blocks the next send to this chat); ``migrate_to_chat_id``
-  (group upgraded to a supergroup) is followed automatically.
+* **429 / migration.** ``parameters.retry_after`` (integer seconds in the JSON body,
+  preferred over any ``Retry-After`` header) is honoured within the dispatch timeout
+  budget and blocks the next send to this chat; ``migrate_to_chat_id`` (group
+  upgraded to a supergroup) is followed automatically.
 * **Dead targets are disabled.** 401/404 (bad token), 403 (bot blocked/kicked) and
   "chat not found" flip ``configured`` to ``False`` so the router stops hammering.
 * **The bot token lives in the URL path** (``/bot<token>/sendMessage``). URLs are
-  never logged and the token is redacted from every error string.
+  never logged, and every error string is redacted: the configured token raw and
+  percent-encoded (``:`` -> ``%3A``), plus anything shaped like a bot token, so an
+  exception quoting a normalised URL cannot leak it either.
+* **Invisible characters.** Scraped text goes through
+  :func:`dispatchers.discord.sanitize_text` (control, zero-width and bidi-override
+  characters stripped) before it is escaped.
 * **Unencodable text.** Lone UTF-16 surrogates (possible in Playwright-scraped titles)
   are replaced before formatting (:func:`dispatchers.discord.scrub_alert`), otherwise
   the shared ``links()`` and the JSON encoder would refuse the whole alert.
@@ -37,11 +45,12 @@ from __future__ import annotations
 
 import asyncio
 import html
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 from pydantic import SecretStr
@@ -52,7 +61,7 @@ from deal_radar.core.http import HttpClient, json_loads
 from deal_radar.core.logs import get_logger
 from deal_radar.core.metrics import Metrics
 from deal_radar.dispatchers.base import Dispatcher, facts, headline, links, risk_summary
-from deal_radar.dispatchers.discord import NOT_SENT_ERRORS, scrub_alert, scrub_surrogates
+from deal_radar.dispatchers.discord import NOT_SENT_ERRORS, sanitize_text, scrub_alert, scrub_surrogates
 from deal_radar.engine.types import Alert, DispatchResult
 
 log = get_logger("dispatch.telegram")
@@ -72,6 +81,8 @@ MAX_ATTEMPTS = 6
 MIN_ATTEMPT_SECONDS = 0.25
 DEFAULT_RETRY_AFTER = 1.0
 SERVER_ERROR_BASE_DELAY = 0.25
+# "<bot id>:<secret>" with the colon raw or percent-encoded, with or without the "/bot" prefix.
+_BOT_TOKEN = re.compile(r"(?<!\d)\d{5,16}(?::|%3[Aa])[A-Za-z0-9_-]{30,}")
 
 
 # --------------------------------------------------------------------------- text helpers
@@ -151,10 +162,11 @@ def _candidate_lines(alert: Alert, *, markup: bool) -> list[_Line]:
     lines: list[_Line] = []
     order = 1
     for index, fact in enumerate(facts(alert)):
-        text = f"<b>{escape(fact.name)}:</b> {escape(fact.value)}" if markup else f"{fact.name}: {fact.value}"
+        value = sanitize_text(fact.value)
+        text = f"<b>{escape(fact.name)}:</b> {escape(value)}" if markup else f"{fact.name}: {value}"
         lines.append(_Line(order, 1 if index < KEY_FACTS else 3, text))
         order += 1
-    risk = risk_summary(alert)
+    risk = sanitize_text(risk_summary(alert), single_line=True)
     if risk:
         lines.append(_Line(order, 2, f"⚠️ <b>Risk:</b> {escape(risk)}" if markup else f"⚠️ Risk: {risk}"))
         order += 1
@@ -182,7 +194,7 @@ def _assemble(head: str, candidates: list[_Line], max_len: int) -> str:
 
 def _compose(alert: Alert, max_len: int, *, markup: bool) -> str:
     candidates = _candidate_lines(alert, markup=markup)
-    plain_head = headline(alert)
+    plain_head = sanitize_text(headline(alert), single_line=True)
     fit = fit_escaped if markup else _truncate_plain
     wrapper = text_length("<b></b>") if markup else 0
     if max_len <= wrapper:
@@ -214,7 +226,7 @@ def build_inline_keyboard(alert: Alert) -> list[list[dict[str, str]]]:
         if not _valid_url(url) or url in seen:
             continue
         seen.add(url)
-        buttons.append({"text": _truncate_plain(label, BUTTON_TEXT_LIMIT) or "Open", "url": url})
+        buttons.append({"text": _truncate_plain(sanitize_text(label, single_line=True), BUTTON_TEXT_LIMIT) or "Open", "url": url})
     return [buttons[i : i + BUTTONS_PER_ROW] for i in range(0, len(buttons), BUTTONS_PER_ROW)]
 
 
@@ -315,7 +327,12 @@ class TelegramDispatcher(Dispatcher):
 
     def _redact(self, text: str) -> str:
         token = self._token_value()
-        return text.replace(token, "<redacted>") if token else text
+        if token:
+            text = text.replace(token, "<redacted>")
+            encoded = quote(token, safe="")
+            if encoded != token:
+                text = text.replace(encoded, "<redacted>").replace(encoded.replace("%3A", "%3a"), "<redacted>")
+        return _BOT_TOKEN.sub("<redacted>", text)
 
     def _disable(self, status: int, detail: str) -> None:
         if self._disabled_reason is None:

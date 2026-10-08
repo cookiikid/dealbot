@@ -28,14 +28,21 @@ Upstream behaviour (verified live 2026-10-06; see the research notes)
   automated access. Run a single leased poller (``lease_ttl_seconds``), keep the
   volume low and alerts private.
 
-Request volume
---------------
-Configured feeds are fetched every poll. Profile search feeds (one per distinct search
-term, built from ``search_feed_template`` with ``quote_plus``) rotate through
-:data:`SEARCH_FEEDS_PER_POLL` per cycle: with ~20 terms and a 45 s interval each term is
-refreshed every ~4 min (matching the research recommendation of "a few targeted feeds
-every few minutes") instead of multiplying the request rate twenty-fold. Fetches run
-concurrently, bounded by :data:`MAX_CONCURRENT_FEEDS`.
+Request volume and per-feed cadence
+-----------------------------------
+A configured feed without ``interval_seconds`` is fetched on every poll (the Hot Deals
+forum feed: new threads appear 0-22 s after creation, so it drives the source's
+``poll_interval_seconds``). A feed with ``interval_seconds`` (frontpage/popular: their
+``pubDate`` is the promotion time, hours after creation) is fetched only once it is due;
+a poll in which nothing is due is a quiet, empty success, and :meth:`next_interval`
+never sleeps past the moment the next such feed falls due, so a jittered poll interval
+cannot stretch a feed's cadence. The schedule uses a monotonic clock
+(:attr:`SlickdealsIngestor.clock`, injectable for tests); a cancelled poll gives its
+feeds back. Profile search feeds (one per distinct search term, built from
+``search_feed_template`` with ``quote_plus``; off in the shipped config because
+``robots.txt`` disallows keyword-search RSS) rotate through :data:`SEARCH_FEEDS_PER_POLL` per cycle
+instead of multiplying the request rate. Fetches run concurrently, bounded by
+:data:`MAX_CONCURRENT_FEEDS`. Feeds hold exactly the newest 25 items.
 
 Blocks
 ------
@@ -46,7 +53,9 @@ blocked, :class:`SourceBlocked` is raised with a cooldown that starts at
 ``cooldown_seconds`` and doubles for every consecutive blocked poll (capped at
 :data:`BLOCK_COOLDOWN_MAX_SECONDS`, ``Retry-After`` honoured). When every feed failed
 for other reasons (network, malformed XML, 404) a :class:`SourceError` lets the base
-loop apply its normal backoff.
+loop apply its normal backoff. Block statuses are "expected" by the request, so the HTTP
+layer does not see them as blocks: every blocked feed burns the host's browser identity
+itself (``ctx.http.identities.burn``) so the next request presents a different one.
 
 Parsing
 -------
@@ -60,7 +69,10 @@ titles, 454 matched the structured price):
 * **price** — an editorial prefix (``"[Prime] $13.27* | ..."``, ``"$899: ..."``) wins;
   otherwise every ``$`` amount is a candidate except those introduced by
   save/extra/reg./was/list/MSRP/under/``+`` ... or followed by off/%/credit/gift
-  card/rebate/cash back ...; candidates followed by a shipping/store/terminator
+  card/rebate/cash back ..., and a ``-$X``/``- $X`` right after another amount (a
+  discount: ``"$1,099.99 -$100 w/ code"``). Elsewhere the dash is the live separator
+  convention (``"... Gaming Monitor - $679.00"``, ``"... S3225QC -$559.99 @ Amazon"``).
+  Candidates followed by a shipping/store/terminator
   context score higher, ties go to the right-most. Frontpage titles round prices
   (``$1150`` for ``$1149.99``), so a whole-dollar title price is refined with a body
   amount less than $1 away. Without a title price, the editorial body phrase
@@ -73,17 +85,27 @@ titles, 454 matched the structured price):
 * **retailer** — ``data-store-slug`` > ``data-product-exitWebsite`` > body
   ``"<a>Store</a> has ..."`` > title ``" at/@/from/via Store"`` > ``"Micro Center: ..."``
   title prefix > ``-at-<store>`` link slug; common stores are normalised
-  (``best-buy`` / ``bestbuy.com`` / ``Best Buy`` -> ``Best Buy``).
-* **shipping** — free shipping phrases (``Free S&H``, ``FS``, ``Shipping is free``,
-  threshold-aware ``free shipping on orders $35+``) -> 0, ``+ $4.99 shipping`` -> 4.99.
+  (``best-buy`` / ``bestbuy.com`` / ``Best Buy`` -> ``Best Buy``; live multi-word slugs
+  such as ``hp-small-medium-business`` by their leading store name), and a third-party
+  seller written ``"<seller> via Amazon"`` resolves to the marketplace.
+* **shipping** — free shipping phrases (``Free S&H``, ``FS``, ``Shipping is free``) -> 0
+  and ``+ $4.99 shipping`` -> 4.99. A free phrase followed by a threshold (``Free
+  Shipping w/ Prime or on $35+``, ``free shipping on orders over $35``) only counts when
+  the price reaches it; below it the cost is unknown (None) — never the threshold.
 * **outbound_url** — the first direct non-Slickdeals store link in the body, else an
   absolute store URL embedded in a ``/click`` redirect's query string, else
-  ``https://www.amazon.com/dp/<ASIN>`` from ``data-aps-asin``. ``url`` stays the
+  ``https://www.amazon.com/dp/<ASIN>`` from ``data-aps-asin``. It must agree with the
+  retailer: links of another known store are skipped and the ASIN is only used when the
+  retailer is Amazon (multi-store posts often list Amazon second). ``url`` stays the
   thread link (minus ``utm_*``).
 * **spec tokens** (``extra``) — ``vram_gb`` (explicit ``32GB GDDR7``, the size next to
   the GPU model, or a desktop lookup table; system RAM such as ``64GB DDR5`` is
   ignored), ``refresh_hz``, ``size_in`` (also from LG/Samsung model codes) and
   ``panel`` in {OLED, QD-OLED, Mini-LED}.
+
+Every regex that runs over post HTML is linear-time: tag/attribute scans stop at the
+next ``<`` and nested repetitions are bounded, and unclosed ``<script>`` blocks are cut
+procedurally, so a hostile 4 MB body cannot stall the parser thread.
 
 The change signature ignores the title: the frontpage editorial title and the forum
 title of one thread differ, and would otherwise flip-flop between polls.
@@ -100,7 +122,7 @@ import io
 import re
 import time
 from collections import Counter
-from collections.abc import Hashable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -136,6 +158,10 @@ BLOCK_STATUSES = frozenset({403, 429, 503})
 _FETCH_STATUSES = (200, *sorted(BLOCK_STATUSES))
 BLOCK_ESCALATION_STEPS = 4  # the block cooldown doubles up to 2**4 x cooldown_seconds
 BLOCK_COOLDOWN_MAX_SECONDS = 3600.0
+# A feed with ``interval_seconds`` counts as due this much early, so a poll that wakes a
+# hair before the due time (timer resolution) does not push the feed a whole cycle back.
+FEED_DUE_TOLERANCE_SECONDS = 1.0
+MIN_POLL_WAIT_SECONDS = 0.05
 
 MAX_IMAGES = 4
 MAX_DESCRIPTION_CHARS = 4000
@@ -194,6 +220,7 @@ _STORE_ALIASES: dict[str, str] = {
     "lgelectronics": "LG",
     "target": "Target",
     "costco": "Costco",
+    "costcowholesale": "Costco",
     "samsclub": "Sam's Club",
     "bjs": "BJ's",
     "bjswholesale": "BJ's",
@@ -210,6 +237,9 @@ _STORE_ALIASES: dict[str, str] = {
     "monoprice": "Monoprice",
     "nvidia": "NVIDIA",
     "homedepot": "Home Depot",
+    "dickssportinggoods": "Dick's Sporting Goods",
+    "dicks": "Dick's Sporting Goods",
+    "originpc": "Origin PC",
     "thehomedepot": "Home Depot",
     "lowes": "Lowe's",
     "kohls": "Kohl's",
@@ -232,7 +262,11 @@ _DOMAIN_SUFFIXES = ("com", "net", "us")
 _AMOUNT = r"(?P<amt>\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?![\d,]?\d)"
 _MONEY = r"\$\s?" + _AMOUNT
 
-_PRICE_RE = re.compile(r"(?<![\w$])(?P<neg>-\s?)?" + _MONEY + r"(?P<star>\*)?")
+_PRICE_RE = re.compile(r"(?<![\w$])" + _MONEY + r"(?P<star>\*)?")
+# A dash right before a candidate ("- $679.00", "-$559.99") ...
+_DASH_BEFORE_RE = re.compile(r"[-–]\s?$")
+# ... is a discount when it directly follows another amount ("$1,099.99 -$100 w/ code").
+_AMOUNT_BEFORE_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d{1,2})?\*?\s*$")
 _EDITORIAL_PREFIX_RE = re.compile(
     r"^(?:\[[^\]]*\]\s*)*(?:\([^)$|]{0,40}\)\s*)?\$\s?" + _AMOUNT + r"\*?\s*(?:or\s+less\s*)?(?:\||:|-\s|–\s?|—\s?)",
     re.I,
@@ -266,7 +300,8 @@ _LIST_PRICE_RE = re.compile(
     r"\s*(?:price)?\s*(?:is|of|at|for)?\s*[:\-]?\s*)" + _MONEY,
     re.I,
 )
-_STRIKE_PRICE_RE = re.compile(r"<(?:s|strike|del)\b[^>]*>\s*(?:<[^>]+>\s*)*" + _MONEY, re.I)
+# Bounded: at most four wrapper tags between <s>/<del> and the amount ("<s><b>$1,399</b>").
+_STRIKE_PRICE_RE = re.compile(r"<(?:s|strike|del)\b[^<>]{0,500}>\s*(?:<[^<>]{1,500}>\s*){0,4}" + _MONEY, re.I)
 
 _FREE_SHIPPING_RE = re.compile(
     r"\bfree\s+(?:s\s*&\s*h|s/h|shipping|ship|delivery|2-day\s+shipping|next-day\s+delivery)\b|"
@@ -274,8 +309,11 @@ _FREE_SHIPPING_RE = re.compile(
     re.I,
 )
 _FS_TOKEN_RE = re.compile(r"(?<![\w/])(?:FS|F/S)\b")  # case-sensitive: "fs" inside words is not shipping
-_FREE_SHIPPING_THRESHOLD_RE = re.compile(
-    r"\bfree\s+(?:standard\s+)?shipping\s+(?:on|with|for)\s+(?:orders?|purchases?)\s+(?:of\s+|over\s+)?" + _MONEY,
+# Matched right after a free-shipping phrase, within the same clause: "w/ Prime or on $35+",
+# " on orders over $35", " with Prime or on $35+ orders". The amount is a threshold, not a cost.
+_SHIPPING_THRESHOLD_RE = re.compile(
+    r"[^.!?;\n$]{0,40}?\b(?:on|over|above|for|with|w/)\s+(?:(?:all\s+)?(?:orders?|purchases?)\s+)?"
+    r"(?:of\s+|over\s+|above\s+)?" + _MONEY,
     re.I,
 )
 _PAID_SHIPPING_RES = (
@@ -295,15 +333,23 @@ _STORE_PREFIX_RE = re.compile(
     r"Monoprice|Abt|Crutchfield|Staples|Office\s?Depot|BJ'?s|GameStop|Apple|Steam)\b[^:$]{0,25}:\s",
     re.I,
 )
-_BODY_STORE_HAS_RE = re.compile(
-    r">\s*([^<>]{2,40}?)\s*</a>\s*(?:<span[^>]*>.*?</span>\s*)?(?:has|is\s+offering|is\s+having|offers)\b",
-    re.I | re.S,
-)
-_LINK_STORE_SLUG_RE = re.compile(r"-(?:at|from)-([a-z0-9-]+?)/?$")
+# Body "<a>Store</a> [<span>[<a>store.com</a>]</span>] has ...": matched procedurally (see
+# _body_store_has) so a long run of unclosed <span>s cannot make the search quadratic.
+_ANCHOR_TEXT_RE = re.compile(r">([^<>]{2,80})</a\s*>", re.I)
+_SPAN_OPEN_RE = re.compile(r"\s*<span\b[^<>]{0,500}>", re.I)
+_SPAN_CLOSE_RE = re.compile(r"</span\s*>", re.I)
+_SPAN_SCAN_CHARS = 3000  # the live "[<a ...>bhphotovideo.com</a>]" span is ~700 chars
+_STORE_VERB_RE = re.compile(r"\s*(?:has|is\s+offering|is\s+having|offers)\b", re.I)
+_LINK_STORE_SLUG_RE = re.compile(r"-(?:at|from)-([a-z0-9-]{1,60}?)/?$")
+_VIA_SELLER_RE = re.compile(r"\s+via\s+", re.I)
+_STORE_TOKEN_SPLIT_RE = re.compile(r"[\s_-]+")
 
-_ANCHOR_RE = re.compile(r"<a\b([^>]*)>", re.I)
-_IMG_RE = re.compile(r"<img\b([^>]*)>", re.I)
-_ATTR_RE = re.compile(r"([\w:.-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>\"']+))")
+# Tag scans stop at the next "<" so that "<a <a <a ..." stays linear.
+_ANCHOR_RE = re.compile(r"<a\b([^<>]*)>", re.I)
+_IMG_RE = re.compile(r"<img\b([^<>]*)>", re.I)
+# Names only start at a boundary and an unclosed quote runs to the end of the tag: both keep
+# attribute parsing linear in the tag length.
+_ATTR_RE = re.compile(r"(?<![\w:.-])([\w:.-]+)\s*=\s*(?:\"([^\"]*)\"?|'([^']*)'?|([^\s>\"']+))")
 _SKIP_IMAGE_RE = re.compile(
     r"/(?:smilies|smiley|emoji|emoticons?|icons?)/|(?:pixel|spacer|blank|tracking)\.(?:gif|png)|\.gif(?:$|\?)",
     re.I,
@@ -316,12 +362,13 @@ _GUID_THREAD_RE = re.compile(r"^thread-(\d{4,12})$", re.I)
 _THUMB_SCORE_RE = re.compile(r"Thumb\s+Score:\s*([+-]?\d+)", re.I)
 _TITLE_TAG_RE = re.compile(r"\[([^\[\]]{1,40})\]\s*")
 
-_SCRIPT_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1\s*>", re.I | re.S)
-_INLINE_TAG_RE = re.compile(r"</?(?:a|b|i|u|s|em|strong|span|font|strike|del|ins|sup|sub|small|big|mark|abbr)\b[^>]*>", re.I)
-_BLOCK_TAG_RE = re.compile(r"<\s*/?\s*(?:br|p|div|li|ul|ol|h\d|tr|table|blockquote|hr)\b[^>]*>", re.I)
-_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_OPEN_RE = re.compile(r"<(script|style)\b[^<>]{0,1000}>", re.I)
+_SCRIPT_CLOSE_RES = {name: re.compile(rf"</{name}\s*>", re.I) for name in ("script", "style")}
+_INLINE_TAG_RE = re.compile(r"</?(?:a|b|i|u|s|em|strong|span|font|strike|del|ins|sup|sub|small|big|mark|abbr)\b[^<>]*>", re.I)
+_BLOCK_TAG_RE = re.compile(r"<\s{0,8}/?\s{0,8}(?:br|p|div|li|ul|ol|h\d|tr|table|blockquote|hr)\b[^<>]*>", re.I)
+_TAG_RE = re.compile(r"<[^<>]+>")
 _BBCODE_RE = re.compile(
-    r"\[/?(?:list|\*|b|i|u|s|url|img|quote|color|size|font|center|left|right|spoiler|indent)(?:=[^\]]*)?\]",
+    r"\[/?(?:list|\*|b|i|u|s|url|img|quote|color|size|font|center|left|right|spoiler|indent)(?:=[^\[\]]*)?\]",
     re.I,
 )
 _HSPACE_RE = re.compile(r"[ \t   ]+")
@@ -377,6 +424,7 @@ class FeedTarget:
     url: str
     query: str | None = None  # search term, for profile search feeds
     profile_hint: str | None = None
+    interval_seconds: float | None = None  # per-feed cadence; None = every poll
 
     @property
     def is_search(self) -> bool:
@@ -571,11 +619,33 @@ def clean_title(value: Any) -> str:
     return " ".join(html.unescape(_str(value)).split())
 
 
+def _strip_scripts(fragment: str) -> str:
+    """Drop ``<script>``/``<style>`` blocks; an unclosed one swallows the rest (as in browsers).
+
+    Procedural rather than a lazy ``.*?`` regex, which rescans the remainder of the
+    document from every unclosed opening tag (quadratic on ``"<script>" * N``).
+    """
+    out: list[str] = []
+    pos = 0
+    while True:
+        opening = _SCRIPT_OPEN_RE.search(fragment, pos)
+        if opening is None:
+            out.append(fragment[pos:])
+            break
+        out.append(fragment[pos : opening.start()])
+        closing = _SCRIPT_CLOSE_RES[opening.group(1).lower()].search(fragment, opening.end())
+        if closing is None:
+            break
+        out.append(" ")
+        pos = closing.end()
+    return "".join(out)
+
+
 def html_to_text(fragment: str) -> str:
     """Readable plain text from post HTML (block tags become newlines, BBCode removed)."""
     if not fragment:
         return ""
-    text = _SCRIPT_RE.sub(" ", fragment)
+    text = _strip_scripts(fragment)
     text = _INLINE_TAG_RE.sub("", text)
     text = _BLOCK_TAG_RE.sub("\n", text)
     text = _TAG_RE.sub(" ", text)
@@ -622,12 +692,13 @@ class _PriceCandidate:
 def _price_candidates(text: str) -> list[_PriceCandidate]:
     candidates: list[_PriceCandidate] = []
     for m in _PRICE_RE.finditer(text):
-        if m.group("neg"):
-            continue  # "-$50" is a discount
         value = _amount(m)
         if value is None:
             continue
         before = text[max(0, m.start() - 30) : m.start()]
+        dash = _DASH_BEFORE_RE.search(before)
+        if dash is not None and _AMOUNT_BEFORE_RE.search(before[: dash.start()]):
+            continue  # "$1,099.99 -$100 w/ code": a discount, not the price
         after = text[m.end() : m.end() + 40]
         if _NOT_PRICE_BEFORE_RE.search(before) or _NOT_PRICE_AFTER_RE.match(after):
             continue
@@ -707,25 +778,42 @@ def extract_list_price(title: str, body_text: str = "", body_html: str = "", pri
 
 
 def extract_shipping(title: str, body_text: str = "", price: float | None = None) -> float | None:
-    """0.0 for free shipping, the amount for ``+ $X shipping``, None when unknown."""
+    """0.0 for free shipping, the amount for ``+ $X shipping``, None when unknown.
+
+    ``"Free Shipping w/ Prime or on $35+"`` is free only for a price of at least $35;
+    below the threshold the shipping cost is unknown (None), never the $35 itself.
+    """
     title = clean_title(title)
-    if _FREE_SHIPPING_RE.search(title) or _FS_TOKEN_RE.search(title):
+    title_free = _free_shipping(title, price, fs_token=True)
+    if title_free:
         return 0.0
     paid = _paid_shipping(title)
     if paid is not None:
         return paid
-    if body_text:
-        threshold = _FREE_SHIPPING_THRESHOLD_RE.search(body_text)
-        if threshold is not None:
-            minimum = _amount(threshold)
-            if minimum is not None and price is not None and price >= minimum:
-                return 0.0
-            if minimum is not None:
-                return _paid_shipping(body_text)
-        if _FREE_SHIPPING_RE.search(body_text):
-            return 0.0
-        return _paid_shipping(body_text)
-    return None
+    if not body_text:
+        return None
+    if title_free is None and _free_shipping(body_text, price):
+        return 0.0
+    # A threshold the price misses (title or body): only an explicit cost is usable.
+    return _paid_shipping(body_text)
+
+
+def _free_shipping(text: str, price: float | None, *, fs_token: bool = False) -> bool | None:
+    """True: ships free at ``price``. False: free only above a threshold the price misses
+    (or the price is unknown). None: no free-shipping phrase at all."""
+    matches = list(_FREE_SHIPPING_RE.finditer(text))
+    if fs_token:
+        matches.extend(_FS_TOKEN_RE.finditer(text))
+    verdict: bool | None = None
+    for m in matches:
+        threshold = _SHIPPING_THRESHOLD_RE.match(text, m.end())
+        if threshold is None:
+            return True
+        minimum = _amount(threshold)
+        if minimum is not None and price is not None and price >= minimum:
+            return True
+        verdict = False
+    return verdict
 
 
 def _paid_shipping(text: str) -> float | None:
@@ -765,11 +853,36 @@ def lookup_store(name: str | None) -> str | None:
     return None
 
 
+# Canonical names keyed like aliases ("hp" -> "HP", "costco" -> "Costco"): the only keys a
+# multi-word slug may start with ("hp-small-medium-business"). Abbreviated aliases such as
+# "bh" are deliberately absent ("bh-cosmetics" is not B&H Photo).
+_CANONICAL_STORE_KEYS: dict[str, str] = {_store_key(v): v for v in _STORE_ALIASES.values()}
+
+
+def _store_by_leading_name(name: str) -> str | None:
+    """Known store whose own name starts a multi-word name/slug (longest prefix wins)."""
+    tokens = [_store_key(t) for t in _STORE_TOKEN_SPLIT_RE.split(name)]
+    tokens = [t for t in tokens if t]
+    for size in range(len(tokens) - 1, 0, -1):
+        hit = _CANONICAL_STORE_KEYS.get("".join(tokens[:size]))
+        if hit:
+            return hit
+    return None
+
+
 def normalize_store(name: str | None) -> str | None:
-    """Canonical store name; unknown stores are cleaned up (slugs title-cased)."""
+    """Canonical store name; unknown stores are cleaned up (slugs title-cased).
+
+    ``"<seller> via Amazon"`` (a third-party marketplace seller) resolves to the
+    marketplace, and live multi-word slugs to the store they start with
+    (``hp-small-medium-business`` -> ``HP``, ``costco-wholesale`` -> ``Costco``).
+    """
     if not name:
         return None
     cleaned = " ".join(html.unescape(name).split()).strip(" .,:;|-–—*")
+    via = _VIA_SELLER_RE.split(cleaned)
+    if len(via) > 1:
+        cleaned = via[-1].strip(" .,:;|-–—*")
     if not cleaned or len(cleaned) > MAX_STORE_NAME_CHARS or not cleaned[0].isalnum():
         return None
     known = lookup_store(cleaned)
@@ -781,6 +894,9 @@ def normalize_store(name: str | None) -> str | None:
             known = lookup_store(part)
             if known:
                 return known
+    known = _store_by_leading_name(cleaned)
+    if known:
+        return known
     cleaned = cleaned.rstrip("!")
     if cleaned.islower() and " " not in cleaned:
         cleaned = cleaned.replace("-", " ").replace("_", " ").title()
@@ -813,9 +929,9 @@ def extract_retailer(title: str, body_html: str = "", link: str | None = None) -
         if store:
             return store
     if body_html:
-        m = _BODY_STORE_HAS_RE.search(body_html)
-        if m:
-            store = normalize_store(html_to_text(m.group(1)))
+        name = _body_store_has(body_html)
+        if name:
+            store = normalize_store(html_to_text(name))
             if store:
                 return store
     store = _title_store(clean_title(title))
@@ -830,6 +946,40 @@ def extract_retailer(title: str, body_html: str = "", link: str | None = None) -
         if m:
             return lookup_store(m.group(1))
     return None
+
+
+def _body_store_has(body_html: str) -> str | None:
+    """Anchor text of the editorial ``"<a>Store</a> has ..."`` lead-in (the link may be
+    followed by a ``<span class="externallink">[<a>store.com</a>]</span>``)."""
+    for m in _ANCHOR_TEXT_RE.finditer(body_html):
+        name = m.group(1).strip()
+        if not 2 <= len(name) <= MAX_STORE_NAME_CHARS:
+            continue
+        pos = m.end()
+        span = _SPAN_OPEN_RE.match(body_html, pos)
+        if span is not None:
+            closing = _SPAN_CLOSE_RE.search(body_html, span.end(), span.end() + _SPAN_SCAN_CHARS)
+            if closing is None:
+                continue
+            pos = closing.end()
+        if _STORE_VERB_RE.match(body_html, pos):
+            return name
+    return None
+
+
+def _store_of_url(url: str) -> str | None:
+    """Known store behind a URL's host (``www.bestbuy.com``/``smile.amazon.com``), else None."""
+    host = _host(url)
+    if not host:
+        return None
+    return lookup_store(host) or lookup_store(".".join(host.split(".")[-2:]))
+
+
+def _agrees_with_retailer(url: str, retailer: str | None) -> bool:
+    if retailer is None:
+        return True
+    store = _store_of_url(url)
+    return store is None or store == retailer
 
 
 def _is_store_link(url: str) -> bool:
@@ -858,8 +1008,14 @@ def _embedded_target(click_url: str) -> str | None:
     return None
 
 
-def extract_outbound_url(body_html: str) -> str | None:
-    """Direct store link > store URL embedded in a /click redirect > Amazon ``/dp/<ASIN>``."""
+def extract_outbound_url(body_html: str, retailer: str | None = None) -> str | None:
+    """Direct store link > store URL embedded in a /click redirect > Amazon ``/dp/<ASIN>``.
+
+    With a known ``retailer`` the result must agree with it: links that belong to another
+    known store are skipped, and the ASIN (always an Amazon product) is only used when the
+    retailer is Amazon. Multi-store posts ("Best Buy & Amazon") would otherwise pair the
+    primary store with the secondary store's product page.
+    """
     asin: str | None = None
     exit_site: str | None = None
     for attrs in _anchors(body_html):
@@ -869,15 +1025,15 @@ def extract_outbound_url(body_html: str) -> str | None:
         if _is_http_url(href):
             if is_slickdeals_url(href):
                 target = _embedded_target(href)
-                if target:
-                    return target
-            elif _is_store_link(href):
-                return href
+            else:
+                target = href if _is_store_link(href) else None
+            if target and _agrees_with_retailer(target, retailer):
+                return target
         candidate = (attrs.get("data-aps-asin") or "").strip().upper()
         if asin is None and _ASIN_RE.match(candidate):
             asin = candidate
             exit_site = attrs.get("data-product-exitwebsite") or exit_site
-    if asin:
+    if asin and retailer in (None, "Amazon"):
         m = _AMAZON_DOMAIN_RE.match(exit_site or "")
         domain = m.group(1).lower() if m else "amazon.com"
         return f"https://www.{domain}/dp/{asin}"
@@ -991,11 +1147,11 @@ def _size_inches(title: str) -> float | int | None:
         if 10 <= value <= 120:
             return int(value) if value.is_integer() else value
     for regex in (_LG_MODEL_RE, _SAMSUNG_MODEL_RE):
-        m = regex.search(title)
-        if m:
-            value = int(m.group("size"))
-            if 10 <= value <= 120:
-                return value
+        model = regex.search(title)
+        if model:
+            size = int(model.group("size"))
+            if 10 <= size <= 120:
+                return size
     return None
 
 
@@ -1120,6 +1276,7 @@ def build_listing(
     if _IN_STORE_RE.search(title):
         extra["in_store_only"] = True
     extra.update(extract_specs(title))
+    retailer = extract_retailer(title, body_html, link)
 
     return RawListing(
         source=SOURCE_NAME,
@@ -1134,8 +1291,8 @@ def build_listing(
         list_price=extract_list_price(title, body_text, body_html, price),
         image_urls=extract_images(entry, body_html),
         posted_at=entry_posted_at(entry),
-        retailer=extract_retailer(title, body_html, link),
-        outbound_url=extract_outbound_url(body_html),
+        retailer=retailer,
+        outbound_url=extract_outbound_url(body_html, retailer),
         query=query,
         profile_hint=profile_hint,
         extra=extra,
@@ -1208,9 +1365,21 @@ def _merge_into(primary: RawListing, other: RawListing) -> None:
         primary.extra["thumb_score"] = max(scores)
     for key, value in other.extra.items():
         primary.extra.setdefault(key, value)
-    for attr in ("shipping", "list_price", "retailer", "outbound_url", "posted_at", "query", "profile_hint"):
+    for attr in ("shipping", "list_price", "posted_at", "query", "profile_hint"):
         if getattr(primary, attr) is None and getattr(other, attr) is not None:
             setattr(primary, attr, getattr(other, attr))
+    # Retailer and outbound URL travel together: never pair one store with another's link.
+    if primary.retailer is None and other.retailer is not None:
+        primary.retailer = other.retailer
+        if primary.outbound_url is None or not _agrees_with_retailer(primary.outbound_url, primary.retailer):
+            primary.outbound_url = other.outbound_url
+    elif (
+        primary.outbound_url is None
+        and other.outbound_url is not None
+        and other.retailer in (None, primary.retailer)
+        and _agrees_with_retailer(other.outbound_url, primary.retailer)
+    ):
+        primary.outbound_url = other.outbound_url
     for url in other.image_urls:
         if url not in primary.image_urls and len(primary.image_urls) < MAX_IMAGES:
             primary.image_urls.append(url)
@@ -1230,7 +1399,9 @@ class SlickdealsIngestor(BaseIngestor):
     def __init__(self, cfg: "SlickdealsSource", ctx: IngestorContext) -> None:
         super().__init__(cfg, ctx)
         self.cfg: SlickdealsSource = cfg
-        self.static_feeds: list[FeedTarget] = [FeedTarget(name=f.name, url=f.url) for f in cfg.feeds]
+        self.static_feeds: list[FeedTarget] = [
+            FeedTarget(name=f.name, url=f.url, interval_seconds=f.interval_seconds) for f in cfg.feeds
+        ]
         self.search_feeds: list[FeedTarget] = []
         if cfg.search_feeds_from_profiles:
             try:
@@ -1243,6 +1414,9 @@ class SlickdealsIngestor(BaseIngestor):
         self._search_cursor = 0
         self._consecutive_blocks = 0
         self._warned_no_feeds = False
+        # Per-feed cadence: monotonic time at which each interval feed is next due.
+        self.clock: Callable[[], float] = time.monotonic
+        self._next_due: dict[FeedTarget, float] = {}
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_FEEDS)
         m = ctx.metrics
         self.m_fetch = m.counter("slickdeals_feed_fetch_total", "Slickdeals feed fetches by outcome", ("feed", "outcome"))
@@ -1257,6 +1431,7 @@ class SlickdealsIngestor(BaseIngestor):
             extra={
                 "source": self.name,
                 "feeds": [f.name for f in self.static_feeds],
+                "feed_intervals_s": {f.name: f.interval_seconds for f in self.static_feeds if f.interval_seconds},
                 "search_feeds": len(self.search_feeds),
                 "search_feeds_per_poll": min(len(self.search_feeds), SEARCH_FEEDS_PER_POLL),
             },
@@ -1270,8 +1445,21 @@ class SlickdealsIngestor(BaseIngestor):
     # ------------------------------------------------------------------ polling
 
     def feeds_for_poll(self) -> list[FeedTarget]:
-        """Configured feeds + the next round-robin slice of profile search feeds."""
-        feeds = list(self.static_feeds)
+        """Due configured feeds + the next round-robin slice of profile search feeds.
+
+        Consumes the slots: an interval feed returned here is next due ``interval_seconds``
+        from now. Feeds without an interval are due on every call.
+        """
+        now = self.clock()
+        feeds: list[FeedTarget] = []
+        for feed in self.static_feeds:
+            if feed.interval_seconds is None:
+                feeds.append(feed)
+                continue
+            due_at = self._next_due.get(feed)
+            if due_at is None or now >= due_at - FEED_DUE_TOLERANCE_SECONDS:
+                feeds.append(feed)
+                self._next_due[feed] = now + feed.interval_seconds
         total = len(self.search_feeds)
         if total:
             per_poll = min(total, SEARCH_FEEDS_PER_POLL)
@@ -1280,21 +1468,48 @@ class SlickdealsIngestor(BaseIngestor):
             self._search_cursor = (start + per_poll) % total
         return feeds
 
+    def seconds_until_next_due(self) -> float | None:
+        """Seconds until the earliest interval feed is due (0 if one is due now); None if
+        no configured feed has an interval."""
+        now = self.clock()
+        waits = [
+            max(0.0, self._next_due.get(feed, now) - now) for feed in self.static_feeds if feed.interval_seconds is not None
+        ]
+        return min(waits) if waits else None
+
+    def next_interval(self) -> float:
+        """The jittered poll interval, but never past the moment the next interval feed is due."""
+        interval = super().next_interval()
+        until_due = self.seconds_until_next_due()
+        if until_due is None:
+            return interval
+        return max(MIN_POLL_WAIT_SECONDS, min(interval, until_due))
+
     async def poll(self) -> list[RawListing]:
-        feeds = self.feeds_for_poll()
-        if not feeds:
+        if not self.static_feeds and not self.search_feeds:
             if not self._warned_no_feeds:
                 self._warned_no_feeds = True
                 self.log.warning("slickdeals enabled without feeds or search terms", extra={"source": self.name})
             return []
-        gathered = await asyncio.gather(*(self._poll_feed(feed) for feed in feeds), return_exceptions=True)
-        results: list[FeedResult] = []
-        for feed, item in zip(feeds, gathered):
-            if isinstance(item, BaseException):
-                if not isinstance(item, Exception):  # CancelledError / KeyboardInterrupt
-                    raise item
-                item = FeedResult(feed, FeedOutcome.ERROR, detail=repr(item)[:300])
-            results.append(item)
+        schedule, cursor = dict(self._next_due), self._search_cursor
+        feeds = self.feeds_for_poll()
+        if not feeds:
+            # Only interval feeds are configured and none is due yet: a quiet success.
+            self.log.debug("no slickdeals feed due", extra={"source": self.name, "next_due_s": self.seconds_until_next_due()})
+            return []
+        try:
+            gathered = await asyncio.gather(*(self._poll_feed(feed) for feed in feeds), return_exceptions=True)
+            results: list[FeedResult] = []
+            for feed, item in zip(feeds, gathered):
+                if isinstance(item, BaseException):
+                    if not isinstance(item, Exception):  # CancelledError / KeyboardInterrupt
+                        raise item
+                    item = FeedResult(feed, FeedOutcome.ERROR, detail=repr(item)[:300])
+                results.append(item)
+        except BaseException:
+            # Nothing was delivered: the consumed feed slots are due again on the next poll.
+            self._next_due, self._search_cursor = schedule, cursor
+            raise
 
         listings: list[RawListing] = []
         failed: list[FeedResult] = []
@@ -1349,6 +1564,8 @@ class SlickdealsIngestor(BaseIngestor):
             except asyncio.CancelledError:
                 raise
             except HttpStatusError as exc:
+                # Block statuses are "expected" and normally come back as responses; should one
+                # surface here, the HTTP layer has already burned the identity for 403/429.
                 if exc.status in BLOCK_STATUSES:
                     return FeedResult(feed, FeedOutcome.BLOCKED, detail=f"HTTP {exc.status}", retry_after=exc.retry_after)
                 return FeedResult(feed, FeedOutcome.ERROR, detail=f"HTTP {exc.status}")
@@ -1360,12 +1577,10 @@ class SlickdealsIngestor(BaseIngestor):
         body = bytes(resp.data) if isinstance(resp.data, (bytes, bytearray)) else b""
         content_type = _header(resp.headers, "Content-Type")
         if resp.status in BLOCK_STATUSES or is_block_response(resp.headers, body):
-            self._forget_validators(feed)
-            return FeedResult(
+            return self._blocked(
                 feed,
-                FeedOutcome.BLOCKED,
-                detail=f"HTTP {resp.status} {'challenge/HTML page' if resp.status == 200 else 'block'}",
-                retry_after=parse_retry_after(_header(resp.headers, "Retry-After")),
+                f"HTTP {resp.status} {'challenge/HTML page' if resp.status == 200 else 'block'}",
+                parse_retry_after(_header(resp.headers, "Retry-After")),
             )
 
         started = time.perf_counter()
@@ -1379,10 +1594,10 @@ class SlickdealsIngestor(BaseIngestor):
         self.m_parse_ms.observe((time.perf_counter() - started) * 1000.0, feed=feed.name)
 
         if parsed.malformed:
-            self._forget_validators(feed)
             self.m_entries.inc(feed=feed.name, outcome="malformed_feed")
             if looks_like_html(body, content_type):
-                return FeedResult(feed, FeedOutcome.BLOCKED, detail="HTML instead of RSS")
+                return self._blocked(feed, "HTML instead of RSS")
+            self._forget_validators(feed)
             return FeedResult(feed, FeedOutcome.ERROR, detail=f"malformed feed: {parsed.detail}")
 
         if parsed.listings:
@@ -1393,6 +1608,15 @@ class SlickdealsIngestor(BaseIngestor):
             self.m_entries.inc(parsed.errors, feed=feed.name, outcome="error")
             self.log.debug("slickdeals entries failed to parse", extra={"source": self.name, "feed": feed.name, "count": parsed.errors})
         return FeedResult(feed, FeedOutcome.OK, listings=parsed.listings)
+
+    def _blocked(self, feed: FeedTarget, detail: str, retry_after: float | None = None) -> FeedResult:
+        """A block wall: burn the host's browser identity (the request "expected" the block
+        status, so the HTTP layer did not) and drop the feed's validators."""
+        host = _host(feed.url)
+        if host:
+            self.ctx.http.identities.burn(host)
+        self._forget_validators(feed)
+        return FeedResult(feed, FeedOutcome.BLOCKED, detail=detail, retry_after=retry_after)
 
     def _forget_validators(self, feed: FeedTarget) -> None:
         # Never revalidate against a challenge/broken body: a later 304 would mean
@@ -1405,6 +1629,7 @@ __all__ = [
     "BLOCK_STATUSES",
     "EntrySkipped",
     "FEED_ACCEPT",
+    "FEED_DUE_TOLERANCE_SECONDS",
     "FeedOutcome",
     "FeedResult",
     "FeedTarget",

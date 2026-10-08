@@ -24,8 +24,10 @@ Failure semantics
   raises ``SourceBlocked`` if all of them were bot-walled, ``SourceAuthError`` if all
   were credential failures, and ``SourceError`` otherwise.
 * Blocks are HTTP 403, HTTP 429, Target's non-standard HTTP 435, an HTML challenge
-  page where JSON was expected, and a PerimeterX ``{"appId", "blockScript"}`` JSON
-  body. On Best Buy a 403 means a bad key or an exhausted quota (it never sends 429),
+  page where JSON was expected, a PerimeterX ``{"appId", "blockScript"}`` JSON
+  body, and any other status that :func:`~deal_radar.core.http.is_challenge_page`
+  recognises (``core.http`` raises those at once instead of retrying, e.g. a
+  Cloudflare 503 "Just a moment" page). On Best Buy a 403 means a bad key or an exhausted quota (it never sends 429),
   so it is reported as a credential failure instead. Either one puts
   only that endpoint into an exponential cooldown, starting at ``cooldown_seconds``
   and capped at one hour, or honours ``Retry-After`` when the server sends it. The
@@ -104,7 +106,8 @@ Adapters
     ``compare_at_price <= 0`` treated as absent. Shopify throttles unsigned bots with
     a 429 Cloudflare managed challenge (HTML, ``cf-mitigated: challenge``, no
     ``Retry-After``). That puts the endpoint into a block cooldown. Store currency is
-    not exposed by these endpoints, so ``DEFAULT_CURRENCY`` is assumed.
+    not exposed by these endpoints, so it comes from ``endpoint.currency`` (default
+    ``USD``), like every other adapter's.
 ``target_redsky`` (undocumented; **blocked from cloud IPs**)
     ``GET https://redsky.target.com/redsky_aggregations/v1/web/product_summary_with_fulfillment_v1
     ?key=..&tcins=a,b&store_id=..&zip=..&channel=WEB``. ``tcins`` is plural; the
@@ -122,8 +125,13 @@ Adapters
     ``Seller.SellerName`` (null means sold by Newegg) and the
     ``Image.ImagePathPattern`` template. Field names were verified against a live
     response in October 2026, but the API is internal and can change without notice.
-    Its data refreshes about every 60-65 s, so without an explicit
-    ``poll_interval_seconds`` this endpoint defaults to ``NEWEGG_MIN_INTERVAL_SECONDS``.
+    It is served from an application cache with a ~60 s TTL: the ``Age`` response
+    header counts up to about 60 and the payload only changes when it resets, while
+    random query parameters and ``no-cache`` request headers are ignored. Polling
+    faster buys no freshness, only block risk, so the effective interval of a Newegg
+    endpoint is clamped to at least ``NEWEGG_MIN_INTERVAL_SECONDS``, jitter and
+    failure backoff included. A faster configured ``poll_interval_seconds`` is logged
+    once, at startup.
 ``json`` (generic)
     ``url``/``method``/``params``/``body``/``headers`` describe the request.
     ``items_path`` and the ``fields`` map are dotted paths with list indices
@@ -132,8 +140,8 @@ Adapters
     default condition.
 
 Every listing has ``source="retail"`` and ``source_id=f"{endpoint.name}:{id}"`` (for
-Shopify ``id`` is ``f"{store_host}:{variant_id}"``). ``retailer`` and ``profile_hint``
-come from the endpoint, and ``extra`` always carries ``{"endpoint", "adapter"}``. The
+Shopify ``id`` is ``f"{store_host}:{variant_id}"``). ``retailer``, ``currency`` and
+``profile_hint`` come from the endpoint, and ``extra`` always carries ``{"endpoint", "adapter"}``. The
 change signature is ``(price, in_stock)``, so price moves *and* stock flips both
 re-emit.
 """
@@ -162,7 +170,7 @@ from deal_radar.config_schema import (
     TargetEndpoint,
 )
 from deal_radar.core.backoff import RetryExhausted, parse_retry_after
-from deal_radar.core.http import HttpClient, HttpStatusError, ResponseTooLarge, json_loads
+from deal_radar.core.http import HttpClient, HttpStatusError, ResponseTooLarge, is_challenge_page, json_loads
 from deal_radar.core.logs import get_logger
 from deal_radar.core.metrics import Metrics
 from deal_radar.engine.types import Condition, RawListing, SellerInfo, SourceKind, utcnow
@@ -172,7 +180,6 @@ AnyEndpoint = BestBuyEndpoint | ShopifyEndpoint | TargetEndpoint | NeweggEndpoin
 SkipFn = Callable[[str, str], None]  # (reason, item id or "") -> None
 
 SOURCE_NAME = "retail"
-DEFAULT_CURRENCY = "USD"  # the retail endpoint schema has no currency field (see module docstring)
 
 BESTBUY_API_BASE = "https://api.bestbuy.com/v1"
 BESTBUY_PAGE_SIZE = 100
@@ -204,7 +211,7 @@ REDSKY_DIGITAL_STORE_ID = "3991"  # rejected by RedSky ("cannot be digital store
 REDSKY_AVAILABLE = frozenset({"IN_STOCK", "LIMITED_STOCK", "PRE_ORDER_SELLABLE"})
 
 NEWEGG_REALTIME_URL = "https://www.newegg.com/product/api/ProductRealtime"
-NEWEGG_MIN_INTERVAL_SECONDS = 60.0  # observed internal cache TTL (~60-65 s); faster polling buys nothing
+NEWEGG_MIN_INTERVAL_SECONDS = 60.0  # ProductRealtime app-cache TTL (Age header); faster polling buys nothing
 NEWEGG_IMAGE_PATTERN = "https://c1.neweggimages.com/ProductImageOriginal/{ImageName}"
 NEWEGG_IMAGE_SIZE = 1280
 
@@ -517,10 +524,14 @@ def build_listing(
     quantity: int | None = None,
     seller: SellerInfo | None = None,
     posted_at: datetime | None = None,
-    currency: str = DEFAULT_CURRENCY,
+    currency: str | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> RawListing:
-    """Assemble a RawListing with the fields every retail adapter shares."""
+    """Assemble a RawListing with the fields every retail adapter shares.
+
+    ``currency`` defaults to ``endpoint.currency``: none of the supported retailer
+    payloads states one reliably, so the operator declares it per endpoint.
+    """
     meta: dict[str, Any] = {"endpoint": endpoint.name, "adapter": endpoint.adapter}
     if extra:
         meta.update({k: v for k, v in extra.items() if v is not None})
@@ -531,7 +542,7 @@ def build_listing(
         url=url,
         title=title,
         price=price,
-        currency=currency,
+        currency=(currency or endpoint.currency or "USD").strip().upper(),
         shipping=shipping,
         list_price=list_price,
         condition=condition,
@@ -1166,7 +1177,11 @@ class EndpointAdapter(abc.ABC):
         return True
 
     def interval(self, default: float) -> float:
-        return float(self.endpoint.poll_interval_seconds or default)
+        return max(self.min_interval(), float(self.endpoint.poll_interval_seconds or default))
+
+    def min_interval(self) -> float:
+        """Shortest gap between two polls of this endpoint (after jitter and backoff)."""
+        return MIN_INTERVAL_SECONDS
 
     def redact(self, text: str) -> str:
         return redact(text, self.secrets())
@@ -1280,8 +1295,9 @@ class EndpointAdapter(abc.ABC):
         except asyncio.CancelledError:
             raise
         except HttpStatusError as exc:
+            # core/http raises at once (no retry) for challenge pages outside ``expected``.
             self._m_requests.inc(endpoint=self.name, outcome=str(exc.status))
-            raise self._status_error(http, spec, exc.status, exc.body, exc.headers) from None
+            raise self._status_error(http, spec, exc.status, exc.body, exc.headers, exc.retry_after) from None
         except RetryExhausted as exc:
             self._m_requests.inc(endpoint=self.name, outcome="retries_exhausted")
             raise RetailEndpointError(self.name, self.redact(f"retries exhausted: {exc.last_exc!r}")) from None
@@ -1323,11 +1339,18 @@ class EndpointAdapter(abc.ABC):
             http.identities.burn(urlsplit(spec.url).hostname or "")
 
     def _status_error(
-        self, http: HttpClient, spec: RequestSpec, status: int, body: str, headers: Mapping[str, str]
+        self,
+        http: HttpClient,
+        spec: RequestSpec,
+        status: int,
+        body: str,
+        headers: Mapping[str, str],
+        retry_after: float | None = None,
     ) -> RetailEndpointError:
-        retry_after = parse_retry_after(headers.get("Retry-After")) if headers else None
+        if retry_after is None and headers:
+            retry_after = parse_retry_after(headers.get("Retry-After"))
         snippet = self.redact(" ".join(body.split())[:200])
-        if status in BLOCK_STATUSES:
+        if status in BLOCK_STATUSES or is_challenge_page(status, headers or {}, body):
             self._burn(http, spec)
             if retry_after is not None:
                 bucket = http.limiter.for_host(urlsplit(spec.url).hostname or "")
@@ -1342,7 +1365,7 @@ class EndpointAdapter(abc.ABC):
         self, status: int, snippet: str, headers: Mapping[str, str], retry_after: float | None
     ) -> RetailEndpointError:
         challenge = str(headers.get("cf-mitigated", "")).lower() == "challenge" if headers else False
-        reason = {403: "forbidden", 429: "rate limited", 435: "PerimeterX/HUMAN bot wall"}.get(status, "blocked")
+        reason = {403: "forbidden", 429: "rate limited", 435: "PerimeterX/HUMAN bot wall"}.get(status, "bot challenge page")
         if challenge:
             reason += " (Cloudflare managed challenge)"
         return RetailEndpointError(
@@ -1555,7 +1578,13 @@ class TargetAdapter(EndpointAdapter):
         return parse_redsky_summaries(payload, self.endpoint, self._on_skip)
 
     def _status_error(
-        self, http: HttpClient, spec: RequestSpec, status: int, body: str, headers: Mapping[str, str]
+        self,
+        http: HttpClient,
+        spec: RequestSpec,
+        status: int,
+        body: str,
+        headers: Mapping[str, str],
+        retry_after: float | None = None,
     ) -> RetailEndpointError:
         if status in (404, 405, 410):
             return RetailEndpointError(
@@ -1563,7 +1592,7 @@ class TargetAdapter(EndpointAdapter):
                 f"HTTP {status}: RedSky aggregation retired or key rotated; rediscover from a live target.com page",
                 status=status,
             )
-        return super()._status_error(http, spec, status, body, headers)
+        return super()._status_error(http, spec, status, body, headers, retry_after)
 
 
 _NEWEGG_ID_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z-]{4,40}")
@@ -1577,19 +1606,19 @@ class NeweggAdapter(EndpointAdapter):
     def __init__(self, endpoint: NeweggEndpoint, **kwargs: Any) -> None:
         super().__init__(endpoint, **kwargs)
         self.items = _unique_ids(endpoint.item_numbers, _NEWEGG_ID_RE, self.log, endpoint.name, "item_number")
-        if endpoint.poll_interval_seconds is not None and endpoint.poll_interval_seconds < NEWEGG_MIN_INTERVAL_SECONDS:
+        configured = endpoint.poll_interval_seconds
+        if configured is not None and configured < NEWEGG_MIN_INTERVAL_SECONDS:
+            # Logged once per endpoint (adapters are built once, at startup).
             self.log.warning(
-                "Newegg ProductRealtime refreshes about every 60 s; a faster interval only adds block risk",
-                extra={"endpoint": endpoint.name, "interval_s": endpoint.poll_interval_seconds},
+                "Newegg ProductRealtime is cached for ~60 s (Age header); clamping poll interval to 60 s",
+                extra={"endpoint": endpoint.name, "interval_s": configured, "effective_s": NEWEGG_MIN_INTERVAL_SECONDS},
             )
 
     def has_work(self) -> bool:
         return bool(self.items)
 
-    def interval(self, default: float) -> float:
-        if self.endpoint.poll_interval_seconds is not None:
-            return float(self.endpoint.poll_interval_seconds)
-        return max(float(default), NEWEGG_MIN_INTERVAL_SECONDS)
+    def min_interval(self) -> float:
+        return NEWEGG_MIN_INTERVAL_SECONDS
 
     def requests(self) -> list[RequestSpec]:
         return [
@@ -1763,9 +1792,11 @@ class RetailIngestor(BaseIngestor):
             notice = self._on_failure(state, started, error)
         return _Outcome(list(listings), error, notice)
 
-    def _jittered(self, interval: float) -> float:
+    def _jittered(self, state: EndpointState) -> float:
+        """The endpoint's interval +/- ``jitter_pct``, never below its adapter's floor."""
         jitter = float(self.cfg.jitter_pct)
-        return max(MIN_INTERVAL_SECONDS, interval * (1.0 + self.ctx.rng.uniform(-jitter, jitter)))
+        floor = max(MIN_INTERVAL_SECONDS, state.adapter.min_interval())
+        return max(floor, state.interval * (1.0 + self.ctx.rng.uniform(-jitter, jitter)))
 
     def _on_success(self, state: EndpointState, started: float) -> None:
         state.consecutive_failures = 0
@@ -1773,7 +1804,7 @@ class RetailIngestor(BaseIngestor):
         state.last_error = None
         state.last_success = started
         state.state = "ok"
-        state.next_due = started + self._jittered(state.interval)
+        state.next_due = started + self._jittered(state)
         self._m_endpoint.inc(endpoint=state.name, outcome="ok")
 
     def _on_failure(self, state: EndpointState, started: float, error: RetailEndpointError) -> tuple[str, str] | None:
@@ -1781,7 +1812,7 @@ class RetailIngestor(BaseIngestor):
         notice: tuple[str, str] | None = None
         state.failures += 1
         state.last_error = str(error)[:500]
-        base = self._jittered(state.interval)
+        base = self._jittered(state)
         if error.blocked or error.auth:
             state.consecutive_blocks += 1
             state.state = "blocked"

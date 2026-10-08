@@ -21,11 +21,12 @@ import aiohttp
 import pytest
 from aiohttp import WSCloseCode, WSMsgType, web
 from aiohttp.test_utils import TestServer
+from multidict import CIMultiDict
 from pydantic import SecretStr
 
 from deal_radar.config_schema import DiscordTarget, TelegramChat, WebSocketSection
 from deal_radar.core.backoff import BackoffPolicy
-from deal_radar.core.http import HttpClient, NetworkSettings, json_dumps
+from deal_radar.core.http import HttpClient, HttpResponse, NetworkSettings, json_dumps
 from deal_radar.core.metrics import Metrics
 from deal_radar.dispatchers.base import SEVERITY_COLOR, facts, headline, links
 from deal_radar.dispatchers.discord import (
@@ -42,9 +43,11 @@ from deal_radar.dispatchers.discord import (
     DiscordDispatcher,
     _enforce_total,
     build_discord_payload,
+    canonical_webhook_url,
     embed_length,
     escape_markdown,
     minimal_payload,
+    sanitize_text,
     scrub_alert,
     scrub_surrogates,
     truncate,
@@ -1287,3 +1290,148 @@ async def test_secrets_padded_with_whitespace_still_work(discord_api: FakeAPI, t
     assert (await telegram.send(make_alert())).ok
     [sent] = telegram_api.requests
     assert sent.path == f"/bot{TELEGRAM_TOKEN}/sendMessage" and sent.json["chat_id"] == "-100123"
+
+
+# --------------------------------------------------------------------------- regressions: 2026 platform facts
+
+
+class _CapturingHttp:
+    """Records each POST (url, payload) and answers with a scripted HttpResponse."""
+
+    def __init__(self, status: int = 200, data: str = '{"id": "1290000000000000002"}') -> None:
+        self.status = status
+        self.data = data
+        self.posts: list[tuple[str, Any]] = []
+
+    async def post_json(self, url: str, payload: Any, **kwargs: Any) -> HttpResponse:
+        self.posts.append((url, payload))
+        return HttpResponse(self.status, url, CIMultiDict(), self.data)
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "https://discord.com/api/webhooks/1234567890/{token}",
+        "https://discordapp.com/api/webhooks/1234567890/{token}",
+        "https://ptb.discord.com/api/webhooks/1234567890/{token}",
+        "https://canary.discordapp.com/api/v9/webhooks/1234567890/{token}/",
+        "https://Discord.com/api/v10/webhooks/1234567890/{token}/slack",
+    ],
+)
+def test_discord_webhook_url_is_rebuilt_on_versioned_api(configured: str) -> None:
+    rebuilt = canonical_webhook_url(configured.format(token=DISCORD_TOKEN))
+    assert rebuilt == f"https://discord.com/api/v10/webhooks/1234567890/{DISCORD_TOKEN}"
+
+
+def test_discord_canonical_webhook_url_keeps_query_and_foreign_hosts() -> None:
+    url = canonical_webhook_url(f"https://discordapp.com/api/webhooks/1/{DISCORD_TOKEN}?thread_id=77")
+    assert url == f"https://discord.com/api/v10/webhooks/1/{DISCORD_TOKEN}?thread_id=77"
+    relay = f"http://127.0.0.1:8080/api/webhooks/1/{DISCORD_TOKEN}"  # self-hosted relays / test fakes: verbatim
+    assert canonical_webhook_url(relay) == relay
+    for bad in (
+        f"https://discord.com/channels/1/{DISCORD_TOKEN}",
+        f"https://discord.com/api/webhooks/abc/{DISCORD_TOKEN}",
+        f"https://discord.com/{DISCORD_TOKEN}",
+    ):
+        with pytest.raises(ValueError) as info:
+            canonical_webhook_url(bad)
+        assert DISCORD_TOKEN not in str(info.value)
+
+
+async def test_discord_sends_to_versioned_url_with_components_flag() -> None:
+    capture = _CapturingHttp()
+    cfg = DiscordTarget(webhook_url=SecretStr(f"https://ptb.discordapp.com/api/webhooks/42/{DISCORD_TOKEN}"))
+    dispatcher = DiscordDispatcher("gpu", cfg, capture, timeout=2.0)  # type: ignore[arg-type]
+    assert (await dispatcher.send(make_alert())).ok
+    ((url, payload),) = capture.posts
+    assert url == f"https://discord.com/api/v10/webhooks/42/{DISCORD_TOKEN}?wait=true&with_components=true"
+    assert payload["components"] and payload["embeds"]
+    # Components V2 (flag 1 << 15) forbids embeds: it must never be set on alert payloads.
+    assert not int(payload.get("flags") or 0) & (1 << 15)
+    assert payload["allowed_mentions"] == {"parse": []}
+
+
+async def test_discord_page_url_on_discord_host_disables_target(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    cfg = DiscordTarget(webhook_url=SecretStr(f"https://discord.com/channels/1234/{DISCORD_TOKEN}"))
+    dispatcher = DiscordDispatcher("gpu", cfg, _CapturingHttp(), timeout=1.0)  # type: ignore[arg-type]
+    assert dispatcher.configured is False
+    result = await dispatcher.send(make_alert())
+    assert not result.ok and (result.error or "").startswith("disabled: invalid webhook URL")
+    _assert_no_secret(DISCORD_TOKEN, result.error, caplog)
+
+
+def test_discord_scraped_text_is_sanitised() -> None:
+    title = "RTX​ 4090\u0007 FE ‮[CLAIM PRIZE](https://evil.example/x)‬ <@123456789012345678> @here﻿"
+    item = make_item(
+        title=title,
+        seller=SellerInfo(name="[Best Buy](https://evil.example)‍\x1b[31m"),
+        location=Location(text="Austin⁦\r\nTX⁩"),
+    )
+    payload = build_discord_payload(make_alert(item), _discord_cfg(), mention=False)
+    embed = payload["embeds"][0]
+    rendered = [embed["title"], embed["description"], *(f["value"] for f in embed["fields"])]
+    invisible = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮⁠-⁩﻿]")
+    for text in rendered:
+        assert not invisible.search(text), repr(text)
+        # A masked link only renders from an unescaped "[text](url)"; every bracket is escaped.
+        assert not re.search(r"(?<!\\)\[[^\]]*(?<!\\)\]\(", text), text
+    assert "RTX 4090 FE" in embed["title"] and "\\[CLAIM PRIZE\\](https://evil.example/x)" in embed["title"]
+    fields = {f["name"]: f["value"] for f in embed["fields"]}
+    assert fields["Seller"].startswith("\\[Best Buy\\](https://evil.example)")
+    assert fields["Location"] == "Austin\nTX"
+    # Mentions in titles are inert: nothing is parsed, nobody is pinged.
+    assert payload["allowed_mentions"] == {"parse": []} and payload["content"] == ""
+    for row in payload["components"]:
+        for button in row["components"]:
+            assert not invisible.search(button["label"])
+
+
+def test_discord_sanitize_text_keeps_emoji_sequences() -> None:
+    assert sanitize_text("GPU 👨‍💻 deal") == "GPU 👨‍💻 deal"
+    assert sanitize_text("a‍b\tc\r\nd", single_line=True) == "ab c d"
+    assert sanitize_text("line1\r\nline2\x00") == "line1\nline2"
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Bad Request: failed to get HTTP URL content",
+        "Bad Request: wrong type of the web page content",
+        "Bad Request: wrong file identifier/HTTP URL specified",
+    ],
+)
+async def test_telegram_unfetchable_photo_falls_back_to_link_preview(
+    telegram_api: FakeAPI, http: HttpClient, description: str
+) -> None:
+    telegram_api.queue(400, {"ok": False, "error_code": 400, "description": description})
+    dispatcher = _telegram(telegram_api, http)
+    alert = make_alert()
+    result = await dispatcher.send(alert)
+    assert result.ok and result.attempts == 2 and dispatcher.configured
+    first, second = telegram_api.requests
+    assert first.path.endswith("/sendPhoto") and second.path.endswith("/sendMessage")
+    assert second.json["link_preview_options"]["url"] == alert.item.best_url
+    assert second.json["link_preview_options"]["is_disabled"] is False
+
+
+async def test_telegram_429_uses_integer_parameters_retry_after_over_header(telegram_api: FakeAPI, http: HttpClient) -> None:
+    body = {"ok": False, "error_code": 429, "description": "Too Many Requests: retry after 0", "parameters": {"retry_after": 0}}
+    telegram_api.queue(429, body, {"Retry-After": "30"})
+    result = await _telegram(telegram_api, http, timeout=2.0, send_photos=False).send(make_alert())
+    assert result.ok and result.attempts == 2
+
+
+async def test_telegram_token_redacted_in_any_url_form(http: HttpClient, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    encoded = TELEGRAM_TOKEN.replace(":", "%3A")
+    other = "6000000001:AAOtherBotTokenThatIsNotOurs_abcdefghij"
+    scripted = _ScriptedHttp(http, lambda url: RuntimeError(f"boom {url.replace(TELEGRAM_TOKEN, encoded)} /bot{other}/x"))
+    dispatcher = TelegramDispatcher(
+        "main", TelegramChat(chat_id="1", send_photos=False), SecretStr(TELEGRAM_TOKEN), "https://api.telegram.org",
+        scripted, timeout=1.0,  # type: ignore[arg-type]
+    )
+    result = await dispatcher.send(make_alert())
+    assert not result.ok and "unexpected error" in (result.error or "")
+    for secret in (TELEGRAM_TOKEN, encoded, other, "AAHsecretTelegramTokenValue"):
+        _assert_no_secret(secret, result.error, caplog)

@@ -1025,3 +1025,109 @@ async def test_registry_and_shipped_config_build_the_ingestor(http: HttpClient) 
     assert {r.profile_hint for r in fresh} == {"rtx_5090"}
     assert all(isinstance(r, RawListing) and r.received_at <= datetime.now(UTC) + timedelta(seconds=1) for r in fresh)
     assert isinstance(NeweggAdapter(NeweggEndpoint(name="n", item_numbers=["14-137-866"])).interval(20), float)
+
+
+# =========================================================================== regressions: 2026 platform facts
+
+
+def test_endpoint_currency_is_used_for_listings() -> None:
+    """``endpoint.currency`` (config, default USD) is the listing currency, not a module constant."""
+    cad_shop = ShopifyEndpoint(name="ca_shop", retailer="CA Shop", store_url=STORE, handles=["x"], currency="CAD")
+    assert {r.currency for r in parse_shopify_product_js(load("shopify_product_rtx5090.js.json"), cad_shop, STORE)} == {"CAD"}
+    listings, _, _ = parse_shopify_products_json(load("shopify_collection_gpus_page1.json"), cad_shop, STORE)
+    assert listings and {r.currency for r in listings} == {"CAD"}
+    euro_api = generic_endpoint(currency="EUR")
+    assert {r.currency for r in parse_generic_items(GENERIC_PAYLOAD, euro_api)} == {"EUR"}
+    newegg = NeweggEndpoint(name="ne", item_numbers=["14-137-866"], currency="USD")
+    assert parse_newegg_realtime(load("newegg_productrealtime_14-137-866.json"), newegg)[0].currency == "USD"
+    default = TargetEndpoint(name="tgt", tcins=["93954446"])
+    assert default.currency == "USD"
+    assert {r.currency for r in parse_redsky_summaries(load("redsky_summary_with_fulfillment.json"), default)} == {"USD"}
+
+
+async def test_newegg_interval_is_clamped_to_60s_and_logged_once(
+    http: HttpClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ProductRealtime sits behind a ~60 s app cache (``Age`` header): never poll it faster."""
+    caplog.set_level(logging.WARNING)
+    config = make_config(
+        [{"name": "ne", "adapter": "newegg", "item_numbers": ["14-137-866"], "poll_interval_seconds": 15}],
+        jitter_pct=0.3,
+    )
+    clock = FakeClock(0.0)
+    ingestor = make_ingestor(config, http, clock=clock)
+    state = ingestor.endpoints[0]
+    assert state.interval == NEWEGG_MIN_INTERVAL_SECONDS
+    assert state.adapter.interval(5) == NEWEGG_MIN_INTERVAL_SECONDS  # asking again does not log again
+    clamp_logs = [r for r in caplog.records if "newegg" in r.getMessage().lower()]
+    assert len(clamp_logs) == 1
+    with aioresponses() as m:
+        m.get(NEWEGG_RE, payload=load("newegg_productrealtime_14-137-866.json"), headers={"Age": "41"}, repeat=True)
+        for _ in range(6):  # jitter never pulls the next poll under the cache TTL
+            clock.t = state.next_due
+            await ingestor.poll()
+            assert state.next_due - clock.t >= NEWEGG_MIN_INTERVAL_SECONDS
+    # A transient failure does not shorten it either.
+    with aioresponses() as m:
+        m.get(NEWEGG_RE, status=500, body="oops", repeat=True)
+        clock.t = state.next_due
+        with pytest.raises(SourceError):
+            await ingestor.poll()
+        assert state.next_due - clock.t >= NEWEGG_MIN_INTERVAL_SECONDS
+
+
+async def test_challenge_page_raised_by_http_client_is_a_block(http: HttpClient) -> None:
+    """core/http raises HttpStatusError at once for a challenge page outside ``expected`` (e.g. a 503)."""
+    config = make_config([shop_endpoint(handles=["a", "b"])], max_concurrency=1, cooldown_seconds=120)
+    ingestor = make_ingestor(config, http)
+    pattern = re.compile(re.escape(STORE) + r"/products/.*\.js")
+    challenge = {"cf-mitigated": "challenge", "Retry-After": "300"}
+    with aioresponses() as m:
+        m.get(pattern, status=503, body=CF_CHALLENGE_HTML, content_type="text/html", headers=challenge, repeat=True)
+        with pytest.raises(SourceBlocked, match="challenge"):
+            await ingestor.poll()
+        assert len(requests_to(m, pattern)) == 1  # never retried, the other handle was not requested
+    state = ingestor.endpoints[0]
+    assert state.state == "blocked" and state.next_due == pytest.approx(1000.0 + 300.0)
+
+
+async def test_target_435_block_is_never_parsed_as_out_of_stock(http: HttpClient) -> None:
+    """A RedSky 435 wall next to a healthy endpoint is a blocked endpoint result, not empty stock."""
+    config = make_config(
+        [
+            {"name": "tgt", "adapter": "target_redsky", "api_key": TARGET_KEY, "tcins": ["93954446", "89981234"]},
+            shop_endpoint(),
+        ]
+    )
+    ingestor = make_ingestor(config, http)
+    with aioresponses() as m:
+        m.get(REDSKY_RE, status=435, body=json.dumps(load("redsky_block_435.json")), content_type="application/json")
+        m.get(re.compile(re.escape(STORE) + ".*"), payload=load("shopify_product_rtx5090.js.json"))
+        listings = await ingestor.poll()
+    assert {r.extra["endpoint"] for r in listings} == {"gpu_shop"}  # no Target listing (in or out of stock)
+    states = {s.name: s for s in ingestor.endpoints}
+    assert states["tgt"].state == "blocked" and "435" in (states["tgt"].last_error or "")
+    assert TARGET_KEY not in (states["tgt"].last_error or "")
+
+
+async def test_bestbuy_quota_403_cools_down_without_a_retry_storm(
+    http: HttpClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Quota exhaustion is a 403 like a bad key: one request, endpoint cools down, key never logged."""
+    caplog.set_level(logging.DEBUG)
+    skus = ["6614151", "6614153", "6575404"]
+    config = make_config([bb_endpoint(skus=skus, batch_size=1)], max_concurrency=1, cooldown_seconds=600)
+    clock = FakeClock(0.0)
+    ingestor = make_ingestor(config, http, clock=clock)
+    quota = {"errorCode": "403", "errorMessage": "Over Quota", "apiKey": BB_KEY}
+    with aioresponses() as m:
+        m.get(BB_RE, status=403, payload=quota, repeat=True)
+        with pytest.raises(SourceAuthError):
+            await ingestor.poll()
+        assert len(requests_to(m, BB_RE)) == 1  # the other two batches were not sent
+        clock.t = 300.0  # still cooling down: nothing is requested
+        assert await ingestor.poll() == []
+        assert len(requests_to(m, BB_RE)) == 1
+    state = ingestor.endpoints[0]
+    assert state.state == "blocked" and state.next_due == pytest.approx(600.0)
+    assert all(BB_KEY not in record.getMessage() and BB_KEY not in str(record.__dict__) for record in caplog.records)

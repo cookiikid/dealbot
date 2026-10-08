@@ -665,7 +665,7 @@ class VisionSection(Strict):
     max_image_bytes: int = Field(default=8_000_000, ge=10_000)
     resize_max_side: int = Field(default=512, ge=224, le=2048)
     jpeg_quality: int = Field(default=85, ge=40, le=100)
-    keep_alive: str = "30m"
+    keep_alive: str | int | float = "30m"  # Ollama duration ("30m") or seconds (-1 = keep loaded forever)
     num_predict: int = Field(default=160, ge=16, le=2048)
     apply_to_kinds: list[SourceKind] = Field(default_factory=lambda: [SourceKind.LOCAL])
     apply_to_sources: list[str] = Field(default_factory=list)  # extra source names beyond kinds

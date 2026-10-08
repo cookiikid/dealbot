@@ -12,13 +12,31 @@ Design decisions
   emoji-heavy titles cannot slip over a limit.
 * **Identical facts on every channel.** Title, fields and buttons come from the shared
   ``headline()`` / ``facts()`` / ``links()`` helpers in :mod:`dispatchers.base`.
-* **No accidental pings.** ``allowed_mentions.parse`` is always empty; a role is pinged
-  only when the router asked for a mention *and* ``mention_role_id`` is a snowflake,
-  and then only that role is whitelisted. Listing titles containing ``@everyone``
-  therefore render as text.
+* **No accidental pings.** ``allowed_mentions`` is sent explicitly on every payload
+  (alerts, degraded retries and notices) with ``parse`` empty; a role is pinged only
+  when the router asked for a mention *and* ``mention_role_id`` is a snowflake, and
+  then only that role is whitelisted. Listing titles containing ``@everyone``,
+  ``@here`` or ``<@id>`` therefore render as inert text.
+* **Scraped text is sanitised** (:func:`sanitize_text`) before it is formatted: C0/C1
+  control characters, zero-width and other invisible characters, and bidi overrides
+  (which can visually reverse a price) are stripped (a zero-width joiner survives
+  only inside emoji sequences); single-line contexts (title, button labels) fold
+  newlines and tabs to spaces. Markdown is then escaped (:func:`escape_markdown`),
+  including ``[`` / ``]``, so a title like ``[Claim](https://evil)`` can never render
+  as a masked link in the title, description or fields.
+* **Versioned API URL.** The URL copied from Discord's UI is unversioned
+  (``https://discord.com/api/webhooks/<id>/<token>``), and older ones use
+  ``discordapp.com`` or the ``ptb.`` / ``canary.`` hosts. :func:`canonical_webhook_url`
+  rebuilds every Discord-hosted webhook URL onto
+  ``https://discord.com/api/v10/webhooks/<id>/<token>`` (dropping a ``/slack`` or
+  ``/github`` suffix, because the payload is native). A Discord-hosted URL that is
+  not a webhook (e.g. a channel link) disables the target; any other host (a
+  self-hosted relay) is used verbatim.
 * **Link buttons** are sent as one action row (type 1) of link buttons (type 2,
-  style 5). Non-application webhooks only honour components with
-  ``?with_components=true``, which is added when ``link_buttons`` is enabled.
+  style 5). Non-application webhooks silently drop components unless the request
+  carries ``?with_components=true``, which is added whenever the payload has
+  components. The ``IS_COMPONENTS_V2`` flag (``1 << 15``) is never set: V2 messages
+  cannot carry ``embeds`` or ``content``, and Discord would reject the alert.
 * **Own retry loop instead of HttpClient retries.** Discord's 429 carries
   ``retry_after`` (float seconds) in the JSON body, which the generic client cannot
   see, so requests go out with ``retry=False`` and every status is inspected here. The
@@ -87,8 +105,25 @@ URL_LIMIT = 2048
 EXPLAIN_LINES = 6  # how many ScoreResult.explain lines make it into the description
 MIN_FIELD_VALUE = 16  # below this a truncated field is useless; drop it instead
 NOTICE_COLOR = 0x607D8B
-ZWSP = "​"  # Discord rejects empty field names/values
+ZWSP = "\u200b"  # Discord rejects empty field names/values
 FORBIDDEN_USERNAME_PARTS = ("discord", "clyde")  # webhook username overrides containing these are refused (400)
+
+# --------------------------------------------------------------------------- webhook URL
+
+DISCORD_API_VERSION = 10
+DISCORD_WEBHOOK_HOSTS = frozenset(
+    {
+        "discord.com",
+        "www.discord.com",
+        "ptb.discord.com",
+        "canary.discord.com",
+        "discordapp.com",
+        "www.discordapp.com",
+        "ptb.discordapp.com",
+        "canary.discordapp.com",
+    }
+)
+_WEBHOOK_EXECUTE_PATH = re.compile(r"/api(?:/v\d{1,2})?/webhooks/(\d{1,20})/([A-Za-z0-9_-]{1,200})(?:/(?:slack|github))?/?")
 
 # --------------------------------------------------------------------------- delivery policy
 
@@ -147,6 +182,40 @@ def escape_markdown(text: str) -> str:
     text = _MD_SPECIAL.sub(r"\\\1", text)
     text = _MD_LINE_MARKER.sub(r"\1\\\2", text)
     return _MD_ORDERED_LIST.sub(r"\1\\.", text)
+
+
+# C0/C1 controls (tab/newline/CR are folded separately), soft hyphen, invisible
+# joiners/separators, bidi marks/embeddings/overrides/isolates, Hangul fillers (blank
+# "names"), BOM, interlinear annotation marks and Unicode tag characters.
+_INVISIBLE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e"
+    "\u200b\u200c\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\u3164\ufeff\uffa0\ufff9-\ufffb"
+    "\U000e0000-\U000e007f]"
+)
+_EMOJI_CLASS = "[\u2190-\u2bff\u2600-\u27bf\ufe0f\U0001f000-\U0001faff]"
+# A zero-width joiner is only legitimate inside an emoji sequence (e.g. U+1F468 ZWJ U+1F4BB).
+_STRAY_ZWJ = re.compile(f"(?<!{_EMOJI_CLASS})\u200d|\u200d(?!{_EMOJI_CLASS})")
+_LINE_BREAKS = re.compile(r"\r\n?|[\u2028\u2029\x85]")
+
+
+def sanitize_text(text: str, *, single_line: bool = False) -> str:
+    """Strip control and invisible characters from scraped text before formatting.
+
+    Newlines are normalised to ``\\n`` (or folded to spaces with ``single_line``) and
+    tabs become spaces. The result is safe to pass to :func:`escape_markdown`.
+    """
+    if not text:
+        return ""
+    text = _LINE_BREAKS.sub("\n", text)
+    text = _STRAY_ZWJ.sub("", _INVISIBLE.sub("", text)).replace("\t", " ")
+    if single_line:
+        text = " ".join(part.strip() for part in text.split("\n") if part.strip())
+    return text
+
+
+def _md(text: str, *, single_line: bool = False) -> str:
+    """Untrusted text -> sanitised and markdown-escaped."""
+    return escape_markdown(sanitize_text(text, single_line=single_line))
 
 
 _SURROGATE = re.compile("[\ud800-\udfff]")
@@ -257,16 +326,16 @@ def _enforce_total(embed: dict[str, Any], limit: int = EMBED_TOTAL_LIMIT) -> Non
 
 def _description(alert: Alert) -> str:
     lines: list[str] = []
-    profile = f"**{escape_markdown(alert.profile_name)}**"
+    profile = f"**{_md(alert.profile_name, single_line=True)}**"
     if alert.variant_id:
-        profile += f" · {escape_markdown(alert.variant_id)}"
-    profile += f" · {escape_markdown(alert.category)}"
+        profile += f" · {_md(alert.variant_id, single_line=True)}"
+    profile += f" · {_md(alert.category, single_line=True)}"
     lines.append(profile)
     risk = risk_summary(alert)
     if risk:
-        lines.append(f"⚠️ Risk: {escape_markdown(risk)}")
+        lines.append(f"⚠️ Risk: {_md(risk, single_line=True)}")
     for line in alert.score.explain[:EXPLAIN_LINES]:
-        line = line.strip()
+        line = sanitize_text(line, single_line=True)
         if line:
             lines.append(f"• {escape_markdown(line)}")
     return "\n".join(lines)
@@ -276,7 +345,7 @@ def build_embed(alert: Alert, *, node_id: str | None = None) -> dict[str, Any]:
     """The alert embed with every Discord limit enforced."""
     item = alert.item
     embed: dict[str, Any] = {
-        "title": truncate(escape_markdown(headline(alert)), TITLE_LIMIT),
+        "title": truncate(_md(headline(alert), single_line=True), TITLE_LIMIT),
         "color": SEVERITY_COLOR[alert.severity],
         "timestamp": _iso(alert.created_at),
     }
@@ -287,8 +356,8 @@ def build_embed(alert: Alert, *, node_id: str | None = None) -> dict[str, Any]:
         embed["description"] = description
     fields = [
         {
-            "name": _field_text(fact.name, FIELD_NAME_LIMIT),
-            "value": _field_text(escape_markdown(fact.value), FIELD_VALUE_LIMIT),
+            "name": _field_text(sanitize_text(fact.name, single_line=True), FIELD_NAME_LIMIT),
+            "value": _field_text(_md(fact.value), FIELD_VALUE_LIMIT),
             "inline": fact.inline,
         }
         for fact in facts(alert)[:FIELDS_LIMIT]
@@ -311,7 +380,8 @@ def link_button_rows(alert: Alert) -> list[dict[str, Any]]:
         if not _valid_url(url, BUTTON_URL_LIMIT) or url in seen:
             continue
         seen.add(url)
-        buttons.append({"type": 2, "style": 5, "label": truncate(label, BUTTON_LABEL_LIMIT) or "Open", "url": url})
+        text = truncate(sanitize_text(label, single_line=True), BUTTON_LABEL_LIMIT)
+        buttons.append({"type": 2, "style": 5, "label": text or "Open", "url": url})
     rows = [{"type": 1, "components": buttons[i : i + BUTTONS_PER_ROW]} for i in range(0, len(buttons), BUTTONS_PER_ROW)]
     return rows[:ACTION_ROWS_LIMIT]
 
@@ -333,7 +403,11 @@ def _base_payload(cfg: DiscordTarget) -> dict[str, Any]:
 
 
 def build_discord_payload(alert: Alert, cfg: DiscordTarget, *, mention: bool, node_id: str | None = None) -> dict[str, Any]:
-    """Webhook execute payload for ``alert`` (pure; used by the dispatcher and tests)."""
+    """Webhook execute payload for ``alert`` (pure; used by the dispatcher and tests).
+
+    ``allowed_mentions`` is always explicit and ``flags`` is never set (no
+    ``IS_COMPONENTS_V2``: it forbids ``embeds``), see the module docstring.
+    """
     role = _snowflake(cfg.mention_role_id) if mention else None
     payload = _base_payload(cfg)
     payload["content"] = f"<@&{role}>" if role else ""
@@ -360,8 +434,8 @@ def minimal_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 def build_notice_payload(title: str, message: str, cfg: DiscordTarget) -> dict[str, Any]:
     """Operator notice: one plain embed, never pings anybody."""
     embed: dict[str, Any] = {
-        "title": truncate(escape_markdown(title.strip()) or "Notice", TITLE_LIMIT),
-        "description": truncate(message.strip() or ZWSP, DESCRIPTION_LIMIT),
+        "title": truncate(_md(title, single_line=True) or "Notice", TITLE_LIMIT),
+        "description": truncate(sanitize_text(message).strip() or ZWSP, DESCRIPTION_LIMIT),
         "color": NOTICE_COLOR,
         "timestamp": _iso(utcnow()),
         "footer": {"text": "DealRadar notice"},
@@ -370,6 +444,28 @@ def build_notice_payload(title: str, message: str, cfg: DiscordTarget) -> dict[s
     payload = _base_payload(cfg)
     payload.update({"content": "", "allowed_mentions": {"parse": []}, "embeds": [embed]})
     return scrub_surrogates(payload)
+
+
+def canonical_webhook_url(url: str) -> str:
+    """Rebuild a Discord webhook URL onto ``https://discord.com/api/v10/webhooks/<id>/<token>``.
+
+    Accepts the unversioned UI copy, older ``/api/vN`` URLs and the ``discordapp.com``
+    / ``ptb.`` / ``canary.`` hosts; the query (e.g. ``thread_id``) is kept. URLs on any
+    other host are returned unchanged (self-hosted relays). Raises ``ValueError`` for
+    a non-http(s) URL or a Discord URL that is not a webhook; the message never echoes
+    the URL, which is the credential.
+    """
+    if not _valid_url(url, limit=max(URL_LIMIT, len(url))):
+        raise ValueError("invalid webhook URL: expected an http(s) URL")
+    parts = urlsplit(url)
+    if (parts.hostname or "").lower() not in DISCORD_WEBHOOK_HOSTS:
+        return url
+    match = _WEBHOOK_EXECUTE_PATH.fullmatch(parts.path)
+    if match is None:
+        raise ValueError("invalid webhook URL: expected https://discord.com/api/webhooks/<id>/<token>")
+    webhook_id, token = match.groups()
+    path = f"/api/v{DISCORD_API_VERSION}/webhooks/{webhook_id}/{token}"
+    return urlunsplit(("https", "discord.com", path, parts.query, ""))
 
 
 def webhook_url(base: str, *, with_components: bool, thread_id: str | None) -> str:
@@ -466,12 +562,16 @@ class DiscordDispatcher(Dispatcher):
         self._requests = self.metrics.counter("discord_requests_total", "Discord webhook requests", ("target", "status"))
         self._rate_limited = self.metrics.counter("discord_rate_limited_total", "Discord 429 responses", ("target",))
         self._thread_id = (cfg.thread_id or "").strip() or None
-        self._secrets = self._secret_forms()
+        self._url: str | None = None  # canonical execute URL (v10); None when unset or invalid
         secret = self._secret()
-        if secret is not None and not _valid_url(secret, limit=len(secret)):
-            # Never echo the URL: it is the credential. The router skips unconfigured targets.
-            self._disabled_reason = "invalid webhook URL (expected https://discord.com/api/webhooks/<id>/<token>)"
-            log.error("discord webhook_url is not an http(s) URL; target disabled", extra={"target": self.target})
+        if secret is not None:
+            try:
+                self._url = canonical_webhook_url(secret)
+            except ValueError:
+                # Never echo the URL: it is the credential. The router skips unconfigured targets.
+                self._disabled_reason = "invalid webhook URL (expected https://discord.com/api/webhooks/<id>/<token>)"
+                log.error("discord webhook_url is not a webhook URL; target disabled", extra={"target": self.target})
+        self._secrets = self._secret_forms()
         if cfg.mention_role_id and _snowflake(cfg.mention_role_id) is None:
             log.warning("discord mention_role_id is not a numeric role id; mentions disabled", extra={"target": self.target})
         if not username_allowed(cfg.username):
@@ -500,14 +600,17 @@ class DiscordDispatcher(Dispatcher):
         return self.cfg.webhook_url.get_secret_value().strip() if self.cfg.webhook_url is not None else None
 
     def _secret_forms(self) -> list[tuple[str, str]]:
-        """(needle, replacement) pairs: the URL and its token, raw and percent-encoded."""
+        """(needle, replacement) pairs: the URLs and the token, raw and percent-encoded."""
         secret = self._secret()
         if not secret:
             return []
-        forms = [(secret, "<webhook>"), (quote(secret, safe=":/?&="), "<webhook>")]
-        tail = secret.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
-        if len(tail) >= 8:  # the token; also catches it inside URLs normalised by yarl
-            forms += [(tail, "<redacted>"), (quote(tail, safe=""), "<redacted>")]
+        forms: list[tuple[str, str]] = []
+        for url in dict.fromkeys(u for u in (secret, self._url) if u):
+            forms += [(url, "<webhook>"), (quote(url, safe=":/?&="), "<webhook>")]
+        for url in dict.fromkeys(u for u in (self._url, secret) if u):
+            tail = url.split("?", 1)[0].split("#", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+            if len(tail) >= 8:  # the token; also catches it inside URLs normalised by yarl
+                forms += [(tail, "<redacted>"), (quote(tail, safe=""), "<redacted>")]
         return forms
 
     def _redact(self, text: str) -> str:
@@ -558,11 +661,11 @@ class DiscordDispatcher(Dispatcher):
         deadline = started + self.timeout
         # Scaled down for tiny budgets so the first attempt always goes out.
         min_attempt = min(MIN_ATTEMPT_SECONDS, self.timeout / 2)
-        secret = self._secret()
-        if secret is None:
+        if self._secret() is None:
             return DispatchResult(target=self.target, ok=False, error="not configured")
-        if self._disabled_reason is not None:
-            return DispatchResult(target=self.target, ok=False, error=f"disabled: {self._disabled_reason}")
+        if self._disabled_reason is not None or self._url is None:
+            return DispatchResult(target=self.target, ok=False, error=f"disabled: {self._disabled_reason or 'invalid webhook URL'}")
+        base_url = self._url
 
         attempt = _Attempt(payload)
         attempts = 0
@@ -593,7 +696,7 @@ class DiscordDispatcher(Dispatcher):
                 error = error or "dispatch budget exhausted"
                 break
             attempts += 1
-            url = webhook_url(secret, with_components="components" in attempt.payload, thread_id=self._thread_id)
+            url = webhook_url(base_url, with_components="components" in attempt.payload, thread_id=self._thread_id)
             try:
                 resp = await self.http.post_json(
                     url,
@@ -701,10 +804,12 @@ __all__ = [
     "build_discord_payload",
     "build_embed",
     "build_notice_payload",
+    "canonical_webhook_url",
     "embed_length",
     "escape_markdown",
     "link_button_rows",
     "minimal_payload",
+    "sanitize_text",
     "scrub_alert",
     "scrub_surrogates",
     "text_length",

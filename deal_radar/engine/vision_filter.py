@@ -16,51 +16,88 @@ Flow of :meth:`VisionFilter.check`
    ``max_bytes`` cap, small retry policy), reject non-image content types, then
    decode / EXIF-orient / flatten / downscale to ``resize_max_side`` and re-encode
    as JPEG in ``asyncio.to_thread`` (Pillow is CPU bound and must not block the loop).
-   Unusable images (404, HTML error page, oversized, corrupt) are skipped and the
-   next listing photo is tried instead, up to ``max_images + 2`` candidates.
-3. One model call per image, bounded by a semaphore of ``max_concurrency`` (the
+   Only web photo formats are decoded (JPEG/MPO, PNG, WebP, GIF, BMP, AVIF when
+   Pillow has it): listing photos are attacker-controlled bytes and must not reach
+   the long tail of Pillow decoders (TIFF, PCX, SGI, ...). Unusable images (404,
+   HTML error page, oversized, corrupt) are skipped and the next listing photo is
+   tried instead, up to ``max_images + 2`` candidates. Photo downloads bypass the
+   per-host politeness budgets: ``images.craigslist.org`` / ``images.offerup.com``
+   would otherwise inherit the 0.3 req/s budgets meant for the sites' search pages
+   and stall a two-photo check for seconds, while a browser rendering one listing
+   loads a dozen photos from those CDNs at once.
+3. Content dedupe: the answer is also cached under the digest of the normalised
+   image (``sha1`` of the downscaled JPEG). Marketplace CDN URLs carry rotating
+   signatures (fbcdn ``oh``/``oe``), so the same photo regularly comes back under a
+   new URL; it then costs one download instead of a GPU call, and the new URL is
+   learnt so the next observation skips the download too. The digest is exact on
+   purpose: a perceptual near-match could hand one listing the verdict of a
+   different unit photographed the same way (an empty box vs. a full one).
+4. One model call per image, bounded by a semaphore of ``max_concurrency`` (the
    GPU is the scarce resource), ``timeout_seconds`` per call, no retries and no
    politeness rate limit (local endpoint: fail fast, never queue behind a backoff).
-4. The model answers :data:`VISION_SCHEMA` (Ollama ``format`` / OpenAI
+5. The model answers :data:`VISION_SCHEMA` (Ollama ``format`` / OpenAI
    ``response_format``). Answers are parsed defensively: prose or markdown fences
-   around the JSON, Python-literal dicts, percent/word confidences and outputs
-   truncated by ``num_predict`` are all tolerated.
-5. Category → :class:`VisionVerdict`, then aggregation over the images:
+   around the JSON, Python-literal dicts, percent/word confidences (a number wins
+   over a word: ``"0.9 (high)"`` is 0.9), echoed option lists
+   (``"genuine|box_only"`` is UNCERTAIN) and outputs truncated by ``num_predict``
+   are all tolerated.
+6. Category → :class:`VisionVerdict`, then aggregation over the images:
 
-   * a *defect* verdict (DAMAGED, PARTS_ONLY) with confidence >=
-     ``negative_min_confidence`` always wins (highest confidence first);
-   * an *absence* verdict (BOX_ONLY, SCREENSHOT, RECEIPT, STOCK_PHOTO, UNRELATED)
-     with enough confidence wins unless another photo of the same listing is
-     GENUINE with at least the same threshold. Sellers routinely add a photo of
-     the retail box next to photos of the card; "this photo only shows the box"
-     must not veto a listing whose first photo shows the actual item;
+   * DAMAGED with confidence >= ``negative_min_confidence`` always wins (highest
+     confidence first): damage seen on any photo is a property of the item;
+   * any other negative verdict (PARTS_ONLY, BOX_ONLY, SCREENSHOT, RECEIPT,
+     STOCK_PHOTO, UNRELATED) with enough confidence wins unless another photo of
+     the same listing is GENUINE with at least the same threshold. Sellers
+     routinely add a photo of the retail box, a close-up of the backplate or the
+     GPU inside a prebuilt next to photos of the whole item; "this photo only
+     shows the box / a part" must not veto a listing whose first photo shows the
+     complete item;
    * otherwise GENUINE if any image is genuine, else UNCERTAIN (low-confidence
      negatives therefore end up UNCERTAIN, never negative).
 
-6. Two-stage cascade: an UNCERTAIN aggregate is re-asked to ``escalation_model``
+7. Two-stage cascade: an UNCERTAIN aggregate is re-asked to ``escalation_model``
    (when configured) reusing the already prepared images. If the escalation fails
    the primary UNCERTAIN result is returned rather than an error.
 
 ``check`` never raises: backend failures (timeouts, HTTP errors, an open circuit)
-become an ``ERROR`` verdict and ``on_error`` policy is applied by the pipeline;
-listings whose photos are all unusable get ``SKIPPED`` (the backend was healthy,
-there was simply nothing to look at). A :class:`CircuitBreaker` (3 consecutive
-failures → open for 30 s, doubling up to 5 min) turns a dead GPU box into
-microsecond ``ERROR`` results instead of a ``timeout_seconds`` stall per listing;
-an open circuit also skips the image downloads.
+become an ``ERROR`` verdict and ``on_error`` policy is applied by the pipeline. A
+failure on one photo (including an unexpected bug) is recorded in
+``details["errors"]`` without discarding the answers of the other photos.
+Listings whose photos are all unusable get ``SKIPPED`` (the backend was healthy,
+there was simply nothing to look at), except under ``vision: required`` profiles:
+there an unverifiable listing is ``ERROR`` so the scorer adds its
+``vision_unverified`` risk instead of treating the check as not applicable.
+
+A :class:`CircuitBreaker` (3 consecutive failures → open for 30 s, doubling up to
+5 min) turns a dead GPU box into microsecond ``ERROR`` results instead of a
+``timeout_seconds`` stall per listing; an open circuit also skips the image
+downloads. After the recovery timeout exactly one check runs the half-open trial;
+concurrent checks keep failing fast (no download) until it has settled, and every
+outcome of the trial settles the breaker - an answer closes it; a timeout, HTTP
+error, malformed response, unexpected exception or cancellation re-opens it.
+HTTP 503 (``OLLAMA_MAX_QUEUE`` overflow) and 429 are backpressure from a healthy
+server: outcome ``busy``, never counted as a breaker failure while the circuit is
+closed; a busy reply to the half-open trial proves nothing either way, so the
+trial slot is released by re-opening (the breaker API has no neutral release).
 
 Performance (RTX 3060 12 GB, Ollama, Q4 weights)
 ------------------------------------------------
 * A VLM call is image-encoder + prefill of the visual tokens + decode of the
-  answer. Qwen2.5-VL turns every 28x28 pixel block into one token, so a raw 12 MP
-  phone photo is thousands of visual tokens and several seconds of prefill alone;
-  at <= 672 px the same photo is ~400-600 tokens. Downscaling is the main latency
-  lever, followed by a short answer: ``num_predict`` ~100-160 caps the decode
-  tail (the JSON answer is ~40-80 tokens, ``reason`` is limited to 160 chars).
-* With that, small VLMs (qwen2.5vl:3b, gemma3:4b, minicpm-v) answer in roughly
-  0.3-1.5 s per image on a 3060; 7B-class models in roughly 1-3 s. JPEG ``draft``
-  mode lets Pillow decode large JPEGs at 1/2-1/8 scale, so preprocessing stays at
-  a few ms, and the re-encoded ~50-100 KB payload is negligible over Tailscale.
+  answer. Qwen3-VL turns every 32x32 pixel block into one visual token (16 px
+  patches merged 2x2; Qwen2.5-VL: 28x28), so a raw 12 MP phone photo is ~10k
+  visual tokens and seconds of prefill alone; at the default ``resize_max_side``
+  of 512 a 4:3 photo is ~200 tokens. Downscaling is the main latency lever,
+  followed by a short answer: ``num_predict`` ~100-160 caps the decode tail (the
+  JSON answer is ~40-80 tokens, ``reason`` is limited to 160 chars).
+* With that, 2026 measurements put ``qwen3-vl:4b-instruct`` (the default model) at
+  ~1.2 s per image for the JSON answer on 8-12 GB GPUs such as the 3060; larger
+  7-8B VLMs cost a multiple of that, and reasoning ("thinking") builds ~5x more,
+  hence ``think: false``. Sub-200 ms per image is only reachable with
+  encoder-only classifiers (CLIP/SigLIP-style embeddings + a trained head), not
+  with a generative VLM; this module trades that latency for zero-shot,
+  category-aware judgement with a stated reason. JPEG ``draft`` mode lets Pillow
+  decode large JPEGs at 1/2-1/8 scale, so preprocessing stays at a few ms, and
+  the re-encoded ~30-80 KB payload is negligible over Tailscale.
 * ``keep_alive`` keeps the weights resident; a cold load costs several seconds
   (logged and counted from Ollama's ``load_duration``). Changing ``num_ctx`` per
   request would force a reload, so it is deliberately never sent. :meth:`warmup`
@@ -75,12 +112,19 @@ Performance (RTX 3060 12 GB, Ollama, Q4 weights)
   keeps its queue empty for the few real candidates. The threshold sits below the
   alert threshold because a GENUINE verdict raises source trust (and with it the
   score) while a negative verdict adds risk.
-* Cascade: the small model handles the clear cases in ~0.5-1 s; only UNCERTAIN
-  aggregates (including low-confidence negatives) pay for the larger model. When
-  both models do not fit in VRAM together, escalation also pays a model swap, so
-  keep the escalation model for the genuinely ambiguous minority.
-* Answers are cached per image for ``cache_ttl_seconds``: re-observations of the
-  same listing (price drops, other workers, restarts with Redis) cost nothing.
+* Cascade: the small model handles the clear cases in ~1.2 s per image; only
+  UNCERTAIN aggregates (including low-confidence negatives) pay for the larger
+  model. When both models do not fit in VRAM together, escalation also pays a
+  model swap, so keep the escalation model for the genuinely ambiguous minority.
+* Answers are cached per image URL and per image content for
+  ``cache_ttl_seconds``: re-observations of the same listing (price drops, other
+  workers, restarts with Redis, re-signed CDN URLs) cost no GPU time.
+* ``keep_alive`` values without a unit ("-1", "3600") are sent as JSON numbers
+  (seconds; negative = keep loaded forever): Ollama parses *strings* with Go's
+  ``time.ParseDuration``, which rejects a bare number with HTTP 400.
+* ``base_url`` may be given with the API prefix many guides show
+  (``http://host:1234/v1`` for LM Studio / vLLM, ``http://host:11434/api``); the
+  prefix is stripped before the endpoint paths are appended.
 """
 
 from __future__ import annotations
@@ -90,6 +134,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import ipaddress
 import math
 import re
 import time
@@ -97,7 +142,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import aiohttp
 from PIL import Image, ImageOps
@@ -172,15 +217,29 @@ DEFAULT_CONFIDENCE = 0.5  # model omitted / garbled the confidence
 _DAMAGE_FLAG_DISCOUNT = 0.8  # "genuine" + damage_visible: damage is a side judgement, trust it a bit less
 _CONTRADICTION_DISCOUNT = 0.5  # answers whose fields contradict their category become UNCERTAIN
 
-_DEFECT_VERDICTS = frozenset({VisionVerdict.DAMAGED, VisionVerdict.PARTS_ONLY})
+# Verdicts that hold for the whole item whichever photo shows them. PARTS_ONLY is not
+# one: a close-up of the backplate or the GPU inside a prebuilt is a detail shot of a
+# complete item, so a confident GENUINE photo of the same listing overrides it.
+_ITEM_PROPERTY_VERDICTS = frozenset({VisionVerdict.DAMAGED})
 
 # --------------------------------------------------------------------------- tuning constants
 
-PROMPT_VERSION = "v1"  # part of the cache key: bump when the prompt changes meaningfully
+PROMPT_VERSION = "v2"  # part of the cache key: bump when the prompt changes meaningfully
 MEMORY_CACHE_ENTRIES = 4096
 IMAGE_FETCH_TIMEOUT_SECONDS = 5.0
 IMAGE_FETCH_POLICY = BackoffPolicy(max_attempts=2, base_delay=0.15, max_delay=0.5, max_total_seconds=6.0)
-IMAGE_ACCEPT = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+BUSY_STATUSES = frozenset({429, 503})  # backpressure from a healthy server, not a backend fault
+
+
+def _web_image_formats() -> tuple[str, ...]:
+    """Pillow decoders a listing photo can legitimately need (MPO: multi-picture camera JPEGs)."""
+    Image.init()
+    return tuple(f for f in ("JPEG", "MPO", "PNG", "WEBP", "GIF", "BMP", "AVIF") if f in Image.OPEN)
+
+
+WEB_IMAGE_FORMATS: tuple[str, ...] = _web_image_formats()
+# Advertise AVIF only when this Pillow build can decode it (CDNs negotiate on Accept).
+IMAGE_ACCEPT = ("image/avif," if "AVIF" in WEB_IMAGE_FORMATS else "") + "image/webp,image/apng,image/*,*/*;q=0.8"
 MIN_IMAGE_SIDE = 32  # tracking pixels / icons
 MAX_IMAGE_PIXELS = 40_000_000  # refuse decompression bombs before decoding
 EXTRA_IMAGE_CANDIDATES = 2  # how many further photos to try when some are unusable
@@ -295,10 +354,12 @@ def build_prompt(profile: Profile) -> str:
         f"You check one photo from a second-hand listing for: {profile.name}.\n"
         f"A genuine photo shows {hint}.\n"
         "Pick exactly one category for THIS photo:\n"
-        "genuine - the real item is clearly shown (its box or accessories next to it are fine)\n"
+        "genuine - the real item is clearly shown (its box or accessories next to it are fine); a close-up "
+        "of one area of the item (ports, backplate, label, serial number) is also genuine\n"
         "box_only - only the retail box or packaging, the item itself is not shown\n"
-        "parts_only - only a part or accessory, not the complete item\n"
-        "damaged - the item is shown with visible damage\n"
+        "parts_only - only a part or accessory separated from the item, not the complete item\n"
+        "damaged - the item is shown broken, cracked, burnt or with missing pieces; dust and normal wear "
+        "such as light scratches or scuffs are not damage\n"
         "screenshot - a screenshot or a photo of a screen, web page or spec sheet\n"
         "receipt - a receipt, invoice, order confirmation or other document\n"
         "stock_photo - an official marketing render or catalog image, not a photo of a real unit\n"
@@ -315,7 +376,10 @@ def build_prompt(profile: Profile) -> str:
 
 _FENCE = re.compile(r"```[A-Za-z0-9_-]*\s*(.*?)```", re.S)
 _TRAILING_COMMA = re.compile(r",\s*([}\]])")
-_NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
+_NUMBER = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?", re.I)
+# Separators of an echoed option list ("genuine|box_only|parts_only", "box_only/genuine",
+# "genuine or box_only"): small models sometimes copy the schema instead of choosing.
+_OPTION_SEPARATORS = re.compile(r"\s*(?:[|/,;]|\bor\b|(?<=[a-z])_or_(?=[a-z]))\s*", re.I)
 _SALVAGE: dict[str, re.Pattern[str]] = {
     "category": re.compile(r"[\"']?category[\"']?\s*[:=]\s*[\"']?([A-Za-z][A-Za-z_ -]*)", re.I),
     "confidence": re.compile(r"[\"']?confidence[\"']?\s*[:=]\s*[\"']?([0-9.]+\s*%?|[A-Za-z][A-Za-z_ ]*)", re.I),
@@ -436,11 +500,11 @@ def extract_json_object(content: Any) -> dict[str, Any] | None:
     return salvaged if salvaged is not None else fallback
 
 
-def normalize_category(value: Any) -> str:
-    """Map a free-form category to one of :data:`VISION_CATEGORIES` (default ``uncertain``)."""
-    if not isinstance(value, str):
-        return "uncertain"
-    key = re.sub(r"[^a-z]+", "_", value.strip().lower()).strip("_")
+def _category_token(text: str) -> str | None:
+    """One category for one free-form token, or None when it names none."""
+    key = re.sub(r"[^a-z]+", "_", text.strip().lower()).strip("_")
+    if not key:
+        return None
     if key in CATEGORY_VERDICTS:
         return key
     alias = _CATEGORY_ALIASES.get(key)
@@ -449,11 +513,31 @@ def normalize_category(value: Any) -> str:
     for name in VISION_CATEGORIES:
         if key.startswith(name):
             return name
-    return "uncertain"
+    return None
+
+
+def normalize_category(value: Any) -> str:
+    """Map a free-form category to one of :data:`VISION_CATEGORIES` (default ``uncertain``).
+
+    An answer naming several different categories ("genuine|box_only|parts_only")
+    is an echoed option list, not a decision, and becomes ``uncertain``.
+    """
+    if not isinstance(value, str):
+        return "uncertain"
+    named = {c for c in map(_category_token, _OPTION_SEPARATORS.split(value)) if c is not None}
+    if len(named) > 1:
+        return "uncertain"
+    if named:
+        return named.pop()
+    return _category_token(value) or "uncertain"
 
 
 def coerce_confidence(value: Any) -> float | None:
-    """0..1 confidence from numbers, numeric strings, percentages or words."""
+    """0..1 confidence from numbers, numeric strings, percentages or words.
+
+    A number in the text wins over a word next to it: ``"0.9 (high)"`` is 0.9 and
+    ``"low (0.2)"`` is 0.2; words alone map through a small table.
+    """
     if value is None or isinstance(value, bool):
         return None
     percent = False
@@ -463,14 +547,14 @@ def coerce_confidence(value: Any) -> float | None:
         text = value.strip().lower()
         if not text:
             return None
-        word = re.sub(r"[^a-z]+", "_", text).strip("_")
-        if word in _WORD_CONFIDENCE:
-            return _WORD_CONFIDENCE[word]
         match = _NUMBER.search(text)
         if match is None:
+            return _WORD_CONFIDENCE.get(re.sub(r"[^a-z]+", "_", text).strip("_"))
+        try:
+            number = float(match.group())
+        except (ValueError, OverflowError):
             return None
-        number = float(match.group())
-        percent = "%" in text
+        percent = text[match.end() :].lstrip().startswith("%")
     else:
         return None
     if not math.isfinite(number):
@@ -478,6 +562,11 @@ def coerce_confidence(value: Any) -> float | None:
     if percent or 1.0 < number <= 100.0:
         number /= 100.0
     return min(1.0, max(0.0, number))
+
+
+def _is_number(value: Any) -> bool:
+    """A finite int/float that is not a bool."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _coerce_bool(value: Any) -> bool | None:
@@ -582,25 +671,49 @@ class ImageAnswer:
 
     @classmethod
     def from_cache(cls, url: str, model: str, data: Any) -> ImageAnswer | None:
+        """Rebuild a cached answer; None for anything this module would not have written.
+
+        Redis is shared with other workers and versions: an entry with a field of the
+        wrong type or a verdict that is not an answer category (``error``,
+        ``skipped``) is ignored rather than trusted or allowed to raise.
+        """
         if not isinstance(data, Mapping):
             return None
-        try:
-            verdict = VisionVerdict(data["verdict"])
-            confidence = float(data["confidence"])
-        except (KeyError, TypeError, ValueError):
+        verdict_value = data.get("verdict")
+        category = data.get("category", verdict_value)
+        if not (isinstance(verdict_value, str) and verdict_value in CATEGORY_VERDICTS):
             return None
-        if not 0.0 <= confidence <= 1.0:
+        if not (isinstance(category, str) and category in CATEGORY_VERDICTS):
+            return None
+        confidence = data.get("confidence")
+        if not _is_number(confidence) or not 0.0 <= confidence <= 1.0:
+            return None
+        model_ms = data.get("model_ms", 0.0)
+        if model_ms is None:
+            model_ms = 0.0
+        if not _is_number(model_ms) or model_ms < 0:
+            return None
+        reason = data.get("reason", "")
+        if reason is None:
+            reason = ""
+        item_visible = data.get("item_visible")
+        damage_visible = data.get("damage_visible")
+        if (
+            not isinstance(reason, str)
+            or not (item_visible is None or isinstance(item_visible, bool))
+            or not (damage_visible is None or isinstance(damage_visible, bool))
+        ):
             return None
         return cls(
             url=url,
             model=model,
-            category=str(data.get("category") or verdict.value),
-            verdict=verdict,
-            confidence=confidence,
-            item_visible=_coerce_bool(data.get("item_visible")),
-            damage_visible=_coerce_bool(data.get("damage_visible")),
-            reason=str(data.get("reason") or "")[:REASON_MAX_CHARS],
-            model_ms=float(data.get("model_ms") or 0.0),
+            category=category,
+            verdict=CATEGORY_VERDICTS[verdict_value],
+            confidence=float(confidence),
+            item_visible=item_visible,
+            damage_visible=damage_visible,
+            reason=reason[:REASON_MAX_CHARS],
+            model_ms=float(model_ms),
             cached=True,
         )
 
@@ -635,9 +748,9 @@ def aggregate_answers(
         return a.confidence
 
     strong = [a for a in answers if a.verdict.is_negative and a.confidence >= negative_min_confidence]
-    defects = [a for a in strong if a.verdict in _DEFECT_VERDICTS]
-    if defects:
-        top = max(defects, key=conf)
+    item_defects = [a for a in strong if a.verdict in _ITEM_PROPERTY_VERDICTS]
+    if item_defects:
+        top = max(item_defects, key=conf)
         return top.verdict, top.confidence, top
     genuine = [a for a in answers if a.verdict is VisionVerdict.GENUINE]
     best_genuine = max(genuine, key=conf) if genuine else None
@@ -673,6 +786,7 @@ class PreparedImage:
     jpeg_bytes: int
     source_format: str | None = None
     prep_ms: float = 0.0
+    digest: str = ""  # sha1 hex of the normalised JPEG: the content cache key
 
     @property
     def size_label(self) -> str:
@@ -698,7 +812,8 @@ def prepare_image(data: bytes, *, max_side: int, quality: int) -> PreparedImage:
     """
     started = time.perf_counter()
     try:
-        with Image.open(io.BytesIO(data)) as img:
+        # Restrict the decoders: listing photos are attacker-controlled bytes (see module docstring).
+        with Image.open(io.BytesIO(data), formats=WEB_IMAGE_FORMATS) as img:
             source_format = img.format
             src_w, src_h = img.size
             if src_w < MIN_IMAGE_SIDE or src_h < MIN_IMAGE_SIDE:
@@ -728,13 +843,41 @@ def prepare_image(data: bytes, *, max_side: int, quality: int) -> PreparedImage:
         jpeg_bytes=len(jpeg),
         source_format=source_format,
         prep_ms=round((time.perf_counter() - started) * 1000.0, 3),
+        digest=hashlib.sha1(jpeg).hexdigest(),
     )
 
 
+_DEFAULT_PORTS: dict[str, int] = {"http": 80, "https": 443}
+
+
 def _site(host: str) -> str:
-    """Approximate registrable domain (last two labels) for Sec-Fetch-Site."""
+    """Approximate registrable domain (last two labels) for Sec-Fetch-Site; IP literals are their own site."""
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
     labels = [part for part in host.lower().split(".") if part]
     return ".".join(labels[-2:])
+
+
+def _origin(parts: SplitResult) -> tuple[str, str, int] | None:
+    """(scheme, host, effective port) of an http(s) URL, None when it has no usable origin."""
+    scheme = parts.scheme.lower()
+    if scheme not in _DEFAULT_PORTS or not parts.hostname:
+        return None
+    try:
+        port = parts.port
+    except ValueError:  # out-of-range / non-numeric port
+        return None
+    return scheme, parts.hostname, port or _DEFAULT_PORTS[scheme]
+
+
+def _serialize_origin(origin: tuple[str, str, int]) -> str:
+    scheme, host, port = origin
+    netloc = f"[{host}]" if ":" in host else host
+    if port != _DEFAULT_PORTS[scheme]:
+        netloc += f":{port}"
+    return f"{scheme}://{netloc}"
 
 
 def image_request_headers(image_url: str, page_url: str | None) -> dict[str, str]:
@@ -742,21 +885,28 @@ def image_request_headers(image_url: str, page_url: str | None) -> dict[str, str
 
     Combined with ``fetch_mode="no-cors"`` (which drops the navigation-only headers),
     this mirrors a real subresource load: ``Sec-Fetch-Dest: image``, the
-    same-site/cross-site relation to the listing page and an origin-only ``Referer``
-    (the default ``strict-origin-when-cross-origin`` policy).
+    (schemeful) same-origin/same-site/cross-site relation to the listing page and the
+    ``Referer`` of the default ``strict-origin-when-cross-origin`` policy: the full
+    page URL (without credentials or fragment) for same-origin loads, only the origin
+    for cross-origin loads, nothing for an https page loading an http photo.
     """
-    image_host = urlsplit(image_url).hostname or ""
+    image_origin = _origin(urlsplit(image_url))
     page = urlsplit(page_url) if page_url else None
-    page_host = page.hostname if page is not None else None
-    if not page_host or page is None or page.scheme not in ("http", "https"):
+    page_origin = _origin(page) if page is not None else None
+    if page is None or page_origin is None or image_origin is None:
         return {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": "cross-site"}
-    if page_host == image_host:
+    if page_origin == image_origin:
         relation = "same-origin"
-    elif _site(page_host) == _site(image_host):
+    elif page_origin[0] == image_origin[0] and _site(page_origin[1]) == _site(image_origin[1]):
         relation = "same-site"
     else:
         relation = "cross-site"
-    return {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": relation, "Referer": f"{page.scheme}://{page.netloc}/"}
+    headers = {"Sec-Fetch-Dest": "image", "Sec-Fetch-Site": relation}
+    if relation == "same-origin":
+        headers["Referer"] = _serialize_origin(page_origin) + urlunsplit(("", "", page.path or "/", page.query, ""))
+    elif not (page_origin[0] == "https" and image_origin[0] == "http"):
+        headers["Referer"] = _serialize_origin(page_origin) + "/"
+    return headers
 
 
 def candidate_urls(urls: Sequence[str]) -> list[str]:
@@ -881,6 +1031,45 @@ def _model_names(data: Any) -> set[str]:
     return names
 
 
+_INT_SECONDS = re.compile(r"[-+]?\d+")
+_FLOAT_SECONDS = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+(?:\.\d*)?e[-+]?\d+)", re.I)
+
+
+def ollama_keep_alive(value: str | float) -> str | int | float:
+    """``keep_alive`` as Ollama accepts it: unit-less numbers become JSON numbers (seconds).
+
+    Ollama parses a *string* with Go's ``time.ParseDuration``, so ``"-1"`` or ``"3600"``
+    (no unit) is an HTTP 400, while the numbers ``-1`` (keep loaded) and ``3600`` work.
+    Duration strings ("30m", "-1m", "1h") are passed through unchanged.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if _INT_SECONDS.fullmatch(text):
+        return int(text)
+    if _FLOAT_SECONDS.fullmatch(text):
+        number = float(text)
+        if math.isfinite(number):
+            return number
+    return text
+
+
+def api_base(base_url: str, backend: str) -> str:
+    """``base_url`` without an API prefix copied from a guide ("/v1", Ollama's "/api").
+
+    The endpoint paths (``/api/chat``, ``/v1/chat/completions``) are appended to the
+    result. Ollama also serves its OpenAI-compatible API under ``/v1``, so both
+    prefixes are stripped for it; an OpenAI-compatible server keeps a non-``/v1``
+    prefix (Open WebUI serves ``/api/chat/completions``).
+    """
+    base = base_url.strip().rstrip("/")
+    suffixes = ("/api", "/v1") if backend == "ollama" else ("/v1",)
+    for suffix in suffixes:
+        if base.lower().endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
 # --------------------------------------------------------------------------- filter
 
 
@@ -912,7 +1101,11 @@ class VisionFilter:
         self._redis_retry_at = 0.0
         self._closed = False
         self._circuit_state = CircuitBreaker.CLOSED
-        base = self.cfg.base_url.rstrip("/")
+        # True while one check owns the half-open trial: from before its download until
+        # its model call settled the breaker. Concurrent checks fail fast meanwhile.
+        self._trial_reserved = False
+        self._keep_alive = ollama_keep_alive(self.cfg.keep_alive)
+        base = api_base(self.cfg.base_url, self.cfg.backend)
         self._chat_url = f"{base}/api/chat" if self.cfg.backend == "ollama" else f"{base}/v1/chat/completions"
         self._models_url = f"{base}/api/tags" if self.cfg.backend == "ollama" else f"{base}/v1/models"
 
@@ -968,6 +1161,15 @@ class VisionFilter:
 
     async def health(self) -> bool:
         """Backend reachable and (for Ollama) the configured model pulled. Never raises."""
+        try:
+            return await self._health()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # e.g. RuntimeError("Session is closed") during shutdown
+            log.warning("vision health probe failed", extra={"url": self._models_url, "error": _short(repr(exc))})
+            return False
+
+    async def _health(self) -> bool:
         cfg = self.cfg
         try:
             resp = await self.http.get_json(
@@ -1010,7 +1212,7 @@ class VisionFilter:
             try:
                 await self.http.post_json(
                     self._chat_url,
-                    {"model": model, "messages": [], "keep_alive": self.cfg.keep_alive},
+                    {"model": model, "messages": [], "keep_alive": self._keep_alive},
                     headers=self._auth_headers(),
                     timeout=max(60.0, self.cfg.timeout_seconds),
                     retry=False,
@@ -1018,7 +1220,7 @@ class VisionFilter:
                 )
             except asyncio.CancelledError:
                 raise
-            except _PROBE_ERRORS as exc:
+            except Exception as exc:  # expected probe errors and e.g. a closed session alike
                 log.warning("vision warmup failed", extra={"vision_model": model, "error": _short(repr(exc))})
                 ok = False
         return ok
@@ -1036,9 +1238,12 @@ class VisionFilter:
             return self._result(VisionVerdict.ERROR, started, error="vision filter closed")
         if not cfg.enabled or profile.vision == "off":
             return self._result(VisionVerdict.SKIPPED, started, error="vision disabled")
+        # Nothing to look at: not applicable, unless the profile demands a photo check, in
+        # which case the listing is unverified (ERROR adds the scorer's vision_unverified risk).
+        unusable = VisionVerdict.ERROR if profile.vision == "required" else VisionVerdict.SKIPPED
         urls = candidate_urls(item.image_urls)
         if not urls:
-            return self._result(VisionVerdict.SKIPPED, started, error="no images")
+            return self._result(unusable, started, error="no images")
 
         prompt = build_prompt(profile)
         images = _ImageStore(lambda url: self._fetch_image(url, item.url))
@@ -1054,7 +1259,7 @@ class VisionFilter:
             details["answers"] = []
             if primary.errors:
                 return self._result(VisionVerdict.ERROR, started, error="; ".join(dict.fromkeys(primary.errors)), details=details)
-            return self._result(VisionVerdict.SKIPPED, started, error="no usable images", details=details)
+            return self._result(unusable, started, error="no usable images", details=details)
 
         verdict, confidence, decisive = aggregate_answers(primary.answers, cfg.negative_min_confidence)
         answers = list(primary.answers)
@@ -1117,25 +1322,55 @@ class VisionFilter:
     async def _answer(
         self, model: str, profile: Profile, prompt: str, url: str, images: _ImageStore
     ) -> ImageAnswer | _Skip | _Failure:
-        key = self._cache_key(model, profile.id, url)
-        cached = await self._cache_get(key, url, model)
+        """One photo's answer. Never raises (except cancellation): a bug in one photo's
+        path becomes a :class:`_Failure` instead of discarding the other photos' answers."""
+        try:
+            return await self._answer_photo(model, profile, prompt, url, images)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("vision photo check failed", exc_info=True, extra={"url": url, "vision_model": model})
+            return _Failure(f"internal: {type(exc).__name__}: {_short(exc)}")
+
+    async def _answer_photo(
+        self, model: str, profile: Profile, prompt: str, url: str, images: _ImageStore
+    ) -> ImageAnswer | _Skip | _Failure:
+        url_key = self._cache_key(model, profile.id, url)
+        cached = await self._cache_get(url_key, url, model)
         if cached is not None:
             return cached
-        if self.breaker.state == CircuitBreaker.OPEN:
-            # Fail fast: no download, no request while the backend is known to be down.
+        state = self.breaker.state
+        if state == CircuitBreaker.OPEN or (state == CircuitBreaker.HALF_OPEN and self._trial_reserved):
+            # Fail fast: no download, no request while the backend is known to be down or
+            # while another check's half-open trial is still deciding.
             self._m_calls.inc(model=model, outcome="circuit_open")
             return _Failure("circuit_open")
-        image = await images.get(url)
-        if isinstance(image, ImageRejected):
-            log.debug("vision image skipped", extra={"url": url, "reason": image.reason, "detail": _short(image.detail)})
-            return _Skip(image.reason)
+        trial = state == CircuitBreaker.HALF_OPEN
+        if trial:
+            self._trial_reserved = True
         try:
-            answer = await self._ask_model(model, prompt, url, image)
-        except _BackendFailure as exc:
-            return _Failure(str(exc))
-        if answer.parse_error is None:
-            await self._cache_put(key, answer)
-        return answer
+            image = await images.get(url)
+            if isinstance(image, ImageRejected):
+                log.debug("vision image skipped", extra={"url": url, "reason": image.reason, "detail": _short(image.detail)})
+                return _Skip(image.reason)
+            content_key = self._cache_key(model, profile.id, f"content:{image.digest}") if image.digest else None
+            if content_key is not None:
+                known = await self._cache_get(content_key, url, model, layer="content")
+                if known is not None:
+                    await self._cache_put(url_key, known)  # learn the new URL: no download next time
+                    return known
+            try:
+                answer = await self._ask_model(model, prompt, url, image)
+            except _BackendFailure as exc:
+                return _Failure(str(exc))
+            if answer.parse_error is None:
+                await self._cache_put(url_key, answer)
+                if content_key is not None:
+                    await self._cache_put(content_key, answer)
+            return answer
+        finally:
+            if trial:
+                self._trial_reserved = False
 
     async def _fetch_image(self, url: str, page_url: str | None = None) -> PreparedImage:
         cfg = self.cfg
@@ -1149,6 +1384,7 @@ class VisionFilter:
                 accept=IMAGE_ACCEPT,
                 policy=IMAGE_FETCH_POLICY,
                 timeout=IMAGE_FETCH_TIMEOUT_SECONDS,
+                rate_limit=False,  # photo CDNs: never queue behind a site's politeness budget
             )
         except asyncio.CancelledError:
             raise
@@ -1195,7 +1431,7 @@ class VisionFilter:
                 "messages": [{"role": "user", "content": prompt, "images": [image.b64]}],
                 "stream": False,
                 "format": VISION_SCHEMA,
-                "keep_alive": cfg.keep_alive,
+                "keep_alive": self._keep_alive,
                 # Reasoning builds (qwen3.5, *-thinking) think by default: 6.4 s vs 1.2 s per
                 # image in 2026 benchmarks. The verdict needs no chain of thought.
                 "think": False,
@@ -1260,6 +1496,22 @@ class VisionFilter:
             content = message["reasoning_content"]  # reasoning servers that put everything there
         return ("" if content is None else content), stats
 
+    def _busy(self, model: str, status: int, trial: bool, started: float) -> _BackendFailure:
+        """HTTP 503 (``OLLAMA_MAX_QUEUE`` overflow) / 429: backpressure, not a backend fault.
+
+        Never a breaker failure while the circuit is closed: this photo simply goes
+        unverified. A busy reply to the half-open trial proves nothing either way, but
+        the trial slot must be released, and :class:`CircuitBreaker` can only release
+        it by settling: re-open and keep backing off rather than wedge half-open.
+        """
+        if trial:
+            self.breaker.record_failure()
+            self._sync_circuit()
+        self._m_calls.inc(model=model, outcome="busy")
+        self._m_model_ms.observe((time.perf_counter() - started) * 1000.0, model=model)
+        log.info("vision backend busy", extra={"vision_model": model, "status": status, "half_open_trial": trial})
+        return _BackendFailure(f"backend_busy (HTTP {status})")
+
     def _fail(self, model: str, outcome: str, message: str, started: float) -> _BackendFailure:
         elapsed = (time.perf_counter() - started) * 1000.0
         self.breaker.record_failure()
@@ -1276,9 +1528,13 @@ class VisionFilter:
         cfg = self.cfg
         payload = self._payload(model, prompt, image)
         async with self._sem:  # the GPU is the bottleneck: bound in-flight inferences
+            # No await between reading the state and allow(): ``trial`` is exact.
+            trial = self.breaker.state == CircuitBreaker.HALF_OPEN
             if not self.breaker.allow():
                 self._m_calls.inc(model=model, outcome="circuit_open")
                 raise _BackendFailure("circuit_open")
+            # From here on every outcome must settle the breaker (record_success or
+            # record_failure); a half-open trial left unsettled wedges it for good.
             started = time.perf_counter()
             try:
                 resp = await self.http.post_json(
@@ -1289,33 +1545,32 @@ class VisionFilter:
                     rate_limit=False,
                     retry=False,
                 )
+                content, stats = self._extract_content(resp.data)
             except asyncio.CancelledError:
-                if self.breaker.state != CircuitBreaker.CLOSED:
+                if trial:
                     self.breaker.record_failure()  # never leave a half-open trial dangling
                     self._sync_circuit()
                 raise
             except TimeoutError as exc:  # before OSError: TimeoutError subclasses it
                 raise self._fail(model, "timeout", f"timeout after {cfg.timeout_seconds:g}s", started) from exc
             except HttpStatusError as exc:
-                if exc.status == 503:
-                    # OLLAMA_MAX_QUEUE overflow: backpressure from a healthy server, not a fault.
-                    # Do not trip the breaker; this image simply goes unverified.
-                    self._m_calls.inc(model=model, outcome="busy")
-                    raise _BackendFailure("backend_busy (HTTP 503)") from exc
+                if exc.status in BUSY_STATUSES:
+                    raise self._busy(model, exc.status, trial, started) from exc
                 raise self._fail(model, "http_error", f"HTTP {exc.status}: {_short(exc.body)}", started) from exc
             except (RetryExhausted, ResponseTooLarge, aiohttp.ClientError, OSError, ValueError) as exc:
                 raise self._fail(model, "transport_error", f"{type(exc).__name__}: {_short(exc)}", started) from exc
+            except Exception as exc:  # e.g. RuntimeError("Session is closed"): still settles the breaker
+                raise self._fail(model, "error", f"{type(exc).__name__}: {_short(exc)}", started) from exc
+            if content is None:
+                raise self._fail(model, "bad_response", f"unexpected response shape: {_short(repr(resp.data))}", started)
+            self.breaker.record_success()
+            self._sync_circuit()
         elapsed = (time.perf_counter() - started) * 1000.0
-        content, stats = self._extract_content(resp.data)
-        if content is None:
-            raise self._fail(model, "bad_response", f"unexpected response shape: {_short(json_dumps(resp.data))}", started)
-        self.breaker.record_success()
-        self._sync_circuit()
         self._m_model_ms.observe(elapsed, model=model)
         load_ms = stats.get("load_ms")
         if isinstance(load_ms, (int, float)) and load_ms >= COLD_LOAD_LOG_MS:
             self._m_cold.inc(model=model)
-            log.info("vision model cold load", extra={"vision_model": model, "load_ms": load_ms, "keep_alive": cfg.keep_alive})
+            log.info("vision model cold load", extra={"vision_model": model, "load_ms": load_ms, "keep_alive": self._keep_alive})
 
         parsed = extract_json_object(content)
         extra = {"model_ms": round(elapsed, 3), "image_size": image.size_label}
@@ -1363,20 +1618,26 @@ class VisionFilter:
     def _cache_key(self, model: str, profile_id: str, url: str) -> str:
         return hashlib.sha1(f"{PROMPT_VERSION}\x1f{model}\x1f{profile_id}\x1f{url}".encode()).hexdigest()
 
-    async def _cache_get(self, key: str, url: str, model: str) -> ImageAnswer | None:
+    async def _cache_get(self, key: str, url: str, model: str, *, layer: str | None = None) -> ImageAnswer | None:
+        """Cached answer for ``key`` (memory, then Redis), rebuilt for ``url``.
+
+        Metrics: URL lookups are reported per layer (``memory`` / ``redis``); content
+        lookups (``layer="content"``) are reported once, as that single layer.
+        """
         ttl = self.cfg.cache_ttl_seconds
         if ttl <= 0:
             return None
-        data = self._memory.get(key)
-        if data is not None:
-            answer = ImageAnswer.from_cache(url, model, data)
-            if answer is not None:
-                self._m_cache.inc(layer="memory", result="hit")
-                return answer
-        self._m_cache.inc(layer="memory", result="miss")
+        answer = ImageAnswer.from_cache(url, model, self._memory.get(key))
+        if answer is not None:
+            self._m_cache.inc(layer=layer or "memory", result="hit")
+            return answer
+        if layer is None:
+            self._m_cache.inc(layer="memory", result="miss")
         raw = await self._redis_call("get", key)
         if raw is None:
-            if self.redis is not None:
+            if layer is not None:
+                self._m_cache.inc(layer=layer, result="miss")
+            elif self.redis is not None:
                 self._m_cache.inc(layer="redis", result="miss")
             return None
         try:
@@ -1385,9 +1646,9 @@ class VisionFilter:
             data = None
         answer = ImageAnswer.from_cache(url, model, data)
         if answer is None:
-            self._m_cache.inc(layer="redis", result="corrupt")
+            self._m_cache.inc(layer=layer or "redis", result="corrupt")
             return None
-        self._m_cache.inc(layer="redis", result="hit")
+        self._m_cache.inc(layer=layer or "redis", result="hit")
         self._memory.put(key, answer.to_cache(), ttl)
         return answer
 
@@ -1447,11 +1708,13 @@ __all__ = [
     "CATEGORY_VERDICTS",
     "VISION_CATEGORIES",
     "VISION_SCHEMA",
+    "WEB_IMAGE_FORMATS",
     "ImageAnswer",
     "ImageRejected",
     "PreparedImage",
     "VisionFilter",
     "aggregate_answers",
+    "api_base",
     "build_prompt",
     "candidate_urls",
     "coerce_confidence",
@@ -1459,6 +1722,7 @@ __all__ = [
     "image_request_headers",
     "interpret_answer",
     "normalize_category",
+    "ollama_keep_alive",
     "prepare_image",
     "prompt_kind",
     "verdict_for",

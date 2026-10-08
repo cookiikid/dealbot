@@ -40,6 +40,7 @@ from deal_radar.engine.vision_filter import (
     ImageRejected,
     VisionFilter,
     aggregate_answers,
+    api_base,
     build_prompt,
     candidate_urls,
     coerce_confidence,
@@ -47,6 +48,7 @@ from deal_radar.engine.vision_filter import (
     image_request_headers,
     interpret_answer,
     normalize_category,
+    ollama_keep_alive,
     prepare_image,
     prompt_kind,
     verdict_for,
@@ -453,9 +455,11 @@ def test_aggregate_answers_rules() -> None:
                      VisionVerdict.PARTS_ONLY)
     assert aggregate_answers([], 0.6)[:2] == (VisionVerdict.UNCERTAIN, 0.0)
     assert aggregate_answers([_ans(G, 0.8)], 0.6)[:2] == (G, 0.8)
-    # defect evidence wins even next to a genuine photo
+    # damage evidence wins even next to a genuine photo
     assert aggregate_answers([_ans(G, 0.9), _ans(D, 0.7)], 0.6)[:2] == (D, 0.7)
-    assert aggregate_answers([_ans(G, 0.9), _ans(P, 0.65)], 0.6)[:2] == (P, 0.65)
+    # a parts-only photo is usually a detail shot: a confident genuine photo of the listing overrides it
+    assert aggregate_answers([_ans(G, 0.9), _ans(P, 0.65)], 0.6)[:2] == (G, 0.9)
+    assert aggregate_answers([_ans(G, 0.55), _ans(P, 0.65)], 0.6)[:2] == (P, 0.65)
     # "this photo only shows the box" does not veto a confidently genuine photo of the same listing
     assert aggregate_answers([_ans(G, 0.9), _ans(B, 0.95)], 0.6)[:2] == (G, 0.9)
     assert aggregate_answers([_ans(G, 0.5), _ans(B, 0.95)], 0.6)[:2] == (B, 0.95)
@@ -617,7 +621,9 @@ async def test_ollama_genuine_and_request_shape(backend, http: HttpClient, base_
     # every identity profile sends Fetch Metadata; an <img> load is no-cors with destination "image"
     assert sent["Sec-Fetch-Dest"] == "image" and sent["Sec-Fetch-Mode"] == "no-cors"
     assert sent["Sec-Fetch-Site"] == "cross-site"
-    assert sent["Referer"] == "https://www.facebook.com/"
+    # https listing page -> plain-http test CDN is a downgrade: strict-origin-when-cross-origin sends no
+    # Referer (the https CDN case, origin-only Referer, is covered by test_image_request_headers)
+    assert "Referer" not in sent
     assert "Upgrade-Insecure-Requests" not in sent and "Sec-Fetch-User" not in sent
 
     assert metrics.counter("vision_checks_total", labelnames=("verdict",)).value(verdict="genuine") == 1
@@ -896,9 +902,9 @@ async def test_redis_cache_is_shared_between_instances(backend, http: HttpClient
     item = make_item(server, "blue.jpg")
     first = await VisionFilter(config, http, redis=redis).check(item, gpu_profile(config))
     keys = await redis.keys("dr:vision:*")
-    assert len(keys) == 1
-    ttl = await redis.ttl(keys[0])
-    assert 0 < ttl <= 86_400
+    assert len(keys) == 2  # one entry keyed by the image URL, one by the image content
+    for key in keys:
+        assert 0 < await redis.ttl(key) <= 86_400
 
     other_node = VisionFilter(config, http, redis=redis)  # fresh in-memory cache
     second = await other_node.check(item, gpu_profile(config))
@@ -1427,3 +1433,65 @@ async def test_bug_in_one_photo_does_not_discard_the_other_answers(
     result = await vf.check(make_item(server, "red.jpg", "blue.jpg"), gpu_profile(base_config))
     assert result.verdict is VisionVerdict.GENUINE and result.images_checked == 1
     assert any("unexpected bug" in e for e in result.details["errors"])
+
+
+# --------------------------------------------------------------------------- hardening around the review fixes
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"verdict": ["genuine"], "confidence": 0.9},  # unhashable verdict
+        {"verdict": "genuine", "confidence": True},  # bool is not a confidence
+        {"verdict": "genuine", "confidence": float("nan")},
+        {"verdict": "genuine", "category": "error", "confidence": 0.9},
+        {"verdict": "genuine", "confidence": 0.9, "reason": {"x": 1}},
+        {"verdict": "genuine", "confidence": 0.9, "item_visible": "maybe"},
+        {"verdict": "genuine", "confidence": 0.9, "model_ms": -5},
+        {"verdict": "skipped", "confidence": 0.9},
+    ],
+)
+def test_from_cache_rejects_entries_this_module_never_writes(data: dict[str, Any]) -> None:
+    assert ImageAnswer.from_cache("u", SMALL, data) is None
+
+
+def test_from_cache_round_trips_its_own_entries() -> None:
+    original = ImageAnswer.from_fields("u", SMALL, interpret_answer(answer("genuine", 0.9, damage_visible=True)), model_ms=12.5)
+    restored = ImageAnswer.from_cache("v", SMALL, json.loads(json.dumps(original.to_cache())))
+    assert restored is not None and restored.cached is True and restored.url == "v"
+    assert (restored.verdict, restored.category, restored.confidence) == (VisionVerdict.DAMAGED, "genuine", original.confidence)
+
+
+def test_keep_alive_and_api_base_helpers() -> None:
+    assert ollama_keep_alive("-1") == -1 and ollama_keep_alive(" 600 ") == 600
+    assert ollama_keep_alive("1e3") == 1000.0 and ollama_keep_alive("inf") == "inf"
+    assert ollama_keep_alive("24h") == "24h"
+    assert api_base("http://gpu:1234/v1", "openai") == "http://gpu:1234"
+    assert api_base("http://gpu:3000/api", "openai") == "http://gpu:3000/api"  # Open WebUI-style prefix is kept
+    assert api_base("http://gpu:11434/v1/", "ollama") == "http://gpu:11434"
+    assert api_base("http://gpu:11434", "ollama") == "http://gpu:11434"
+
+
+async def test_half_open_trial_without_a_model_call_releases_the_trial(
+    backend, http: HttpClient, base_config: AppConfig
+) -> None:
+    # the check that owns the half-open trial only had an unusable photo: the next check may run the trial
+    server, state = backend
+    clock = FakeClock()
+    breaker = CircuitBreaker(1, 10.0, clock=clock)
+    vf = VisionFilter(configure(base_config, server), http, breaker=breaker, clock=clock)
+    profile = gpu_profile(base_config)
+    await _open_breaker(vf, state, server, profile, clock)
+    state.fail_status = None
+    skipped = await vf.check(make_item(server, "page.html"), profile)
+    assert skipped.verdict is VisionVerdict.SKIPPED and breaker.state == CircuitBreaker.HALF_OPEN
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    assert (await vf.check(make_item(server, "red.jpg"), profile)).verdict is VisionVerdict.GENUINE
+    assert breaker.state == CircuitBreaker.CLOSED
+
+
+def test_prepare_image_digest_is_content_identity() -> None:
+    red = prepare_image(make_image("red", (800, 600)), max_side=512, quality=85)
+    again = prepare_image(make_image("red", (800, 600)), max_side=512, quality=85)
+    blue = prepare_image(make_image("blue", (800, 600)), max_side=512, quality=85)
+    assert red.digest == again.digest != blue.digest
