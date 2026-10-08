@@ -30,7 +30,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from deal_radar.config_schema import AppConfig, Profile, VisionSection, load_config
 from deal_radar.core.http import HttpClient, NetworkSettings
 from deal_radar.core.metrics import Metrics
-from deal_radar.core.ratelimit import CircuitBreaker
+from deal_radar.core.ratelimit import CircuitBreaker, HostLimit
 from deal_radar.engine.types import DealItem, SourceKind, VisionVerdict
 from deal_radar.engine.vision_filter import (
     CATEGORY_VERDICTS,
@@ -1152,3 +1152,278 @@ async def test_malformed_backend_response_counts_as_failure(backend, http: HttpC
     result = await vf.check(make_item(server, "red.jpg"), gpu_profile(config))
     assert result.verdict is VisionVerdict.ERROR and "unexpected response shape" in (result.error or "")
     assert vf.breaker.consecutive_failures == 1
+
+
+# --------------------------------------------------------------------------- review regressions
+
+
+async def _open_breaker(vf: VisionFilter, state: Backend, server: TestServer, profile: Profile, clock: FakeClock) -> None:
+    """Trip a threshold-1 breaker with one HTTP 500 and move the clock into the half-open window."""
+    state.fail_status = 500
+    assert (await vf.check(make_item(server, "red.jpg"), profile)).verdict is VisionVerdict.ERROR
+    assert vf.breaker.state == CircuitBreaker.OPEN
+    clock.now += 11
+    assert vf.breaker.state == CircuitBreaker.HALF_OPEN
+
+
+@pytest.mark.parametrize("busy_status", [503, 429])
+async def test_busy_reply_to_half_open_trial_does_not_wedge_the_breaker(
+    backend, http: HttpClient, base_config: AppConfig, busy_status: int
+) -> None:
+    server, state = backend
+    clock = FakeClock()
+    breaker = CircuitBreaker(1, 10.0, clock=clock)
+    vf = VisionFilter(configure(base_config, server), http, breaker=breaker, clock=clock)
+    profile = gpu_profile(base_config)
+    await _open_breaker(vf, state, server, profile, clock)
+
+    state.fail_status = busy_status  # the half-open trial reaches a saturated server
+    busy = await vf.check(make_item(server, "red.jpg"), profile)
+    assert busy.verdict is VisionVerdict.ERROR and "busy" in (busy.error or "")
+    assert breaker.state == CircuitBreaker.OPEN  # trial settled: still backing off, not stuck half-open
+
+    state.fail_status = None
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    clock.now += 60
+    recovered = await vf.check(make_item(server, "red.jpg"), profile)
+    assert recovered.verdict is VisionVerdict.GENUINE
+    assert breaker.state == CircuitBreaker.CLOSED
+
+
+async def test_unexpected_error_in_half_open_trial_does_not_wedge_the_breaker(
+    backend, http: HttpClient, base_config: AppConfig, monkeypatch
+) -> None:
+    server, state = backend
+    clock = FakeClock()
+    breaker = CircuitBreaker(1, 10.0, clock=clock)
+    vf = VisionFilter(configure(base_config, server), http, breaker=breaker, clock=clock)
+    profile = gpu_profile(base_config)
+    await _open_breaker(vf, state, server, profile, clock)
+
+    real_post_json = http.post_json
+
+    async def broken_post_json(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("Session is closed")
+
+    monkeypatch.setattr(http, "post_json", broken_post_json)
+    result = await vf.check(make_item(server, "red.jpg"), profile)
+    assert result.verdict is VisionVerdict.ERROR and "Session is closed" in (result.error or "")
+    assert breaker.state == CircuitBreaker.OPEN
+
+    monkeypatch.setattr(http, "post_json", real_post_json)
+    state.fail_status = None
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    clock.now += 60
+    assert (await vf.check(make_item(server, "red.jpg"), profile)).verdict is VisionVerdict.GENUINE
+
+
+async def test_concurrent_checks_fail_fast_while_the_half_open_trial_is_in_flight(
+    backend, http: HttpClient, base_config: AppConfig
+) -> None:
+    server, state = backend
+    clock = FakeClock()
+    breaker = CircuitBreaker(1, 10.0, clock=clock)
+    vf = VisionFilter(configure(base_config, server), http, breaker=breaker, clock=clock)
+    profile = gpu_profile(base_config)
+    await _open_breaker(vf, state, server, profile, clock)
+
+    state.fail_status = None
+    state.delay = 0.3
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    trial = asyncio.create_task(vf.check(make_item(server, "red.jpg"), profile))
+    for _ in range(200):
+        if len(state.chat) == 2:
+            break
+        await asyncio.sleep(0.01)
+    other = await vf.check(make_item(server, "blue.jpg"), profile)
+    assert other.verdict is VisionVerdict.ERROR and other.error == "circuit_open"
+    assert "blue.jpg" not in state.image_hits  # no download while the trial decides
+    assert (await trial).verdict is VisionVerdict.GENUINE
+    assert breaker.state == CircuitBreaker.CLOSED
+
+
+async def test_image_downloads_do_not_queue_behind_the_host_politeness_budget(
+    backend, base_config: AppConfig
+) -> None:
+    server, state = backend
+    for color in ("red", "blue"):
+        state.answers[("*", color)] = answer("genuine", 0.9)
+    # images.craigslist.org / images.offerup.com inherit the 0.3 req/s budgets of their sites
+    slow = HttpClient.create(NetworkSettings(trust_env=False, host_limits={"127.0.0.1": HostLimit(0.2, 1)}))
+    try:
+        vf = VisionFilter(configure(base_config, server), slow)
+        result = await vf.check(make_item(server, "red.jpg", "blue.jpg"), gpu_profile(base_config))
+    finally:
+        await slow.close()
+    assert result.verdict is VisionVerdict.GENUINE and result.images_checked == 2
+    assert result.latency_ms < 2000  # a 0.2 req/s bucket would stall the second photo for 5 s
+
+
+async def test_health_and_warmup_never_raise(backend, base_config: AppConfig) -> None:
+    server, _state = backend
+    closed = HttpClient.create(NetworkSettings(trust_env=False))
+    await closed.close()
+    vf = VisionFilter(configure(base_config, server), closed)
+    assert await vf.health() is False
+    assert await vf.warmup() is False
+    result = await vf.check(make_item(server, "red.jpg"), gpu_profile(base_config))
+    assert result.verdict is VisionVerdict.ERROR
+
+
+async def test_cache_entry_with_bad_field_types_is_ignored(backend, http: HttpClient, base_config: AppConfig) -> None:
+    server, state = backend
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    redis = fakeredis.FakeAsyncRedis()
+    config = configure(base_config, server)
+    await VisionFilter(config, http, redis=redis).check(make_item(server, "red.jpg"), gpu_profile(config))
+    keys = await redis.keys("dr:vision:*")
+    assert keys
+    for key in keys:
+        await redis.set(key, json.dumps({"verdict": "genuine", "confidence": 0.9, "model_ms": "slow"}))
+    result = await VisionFilter(config, http, redis=redis).check(make_item(server, "red.jpg"), gpu_profile(config))
+    assert result.verdict is VisionVerdict.GENUINE and result.cached is False and result.error is None
+    for key in keys:  # verdicts that are not answer categories are rejected as well
+        await redis.set(key, json.dumps({"verdict": "error", "confidence": 0.9}))
+    again = await VisionFilter(config, http, redis=redis).check(make_item(server, "red.jpg"), gpu_profile(config))
+    assert again.verdict is VisionVerdict.GENUINE and again.cached is False
+    await redis.aclose()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("0.9 (high)", 0.9), ("low (0.2)", 0.2), ("1e-1", 0.1), ("high", 0.85)],
+)
+def test_coerce_confidence_prefers_numbers_over_words(value: str, expected: float) -> None:
+    assert coerce_confidence(value) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["genuine|box_only|parts_only", "genuine or box_only", "box_only/genuine"])
+def test_normalize_category_rejects_echoed_option_lists(raw: str) -> None:
+    assert normalize_category(raw) == "uncertain"
+
+
+@pytest.mark.parametrize(("keep_alive", "sent"), [("-1", -1), ("3600", 3600), ("1.5", 1.5), ("30m", "30m"), ("-1m", "-1m")])
+async def test_numeric_keep_alive_is_sent_as_seconds(
+    backend, http: HttpClient, base_config: AppConfig, keep_alive: str, sent: Any
+) -> None:
+    # Ollama parses string keep_alive values with Go's time.ParseDuration: "-1" (no unit) is a 400.
+    server, state = backend
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    vf = VisionFilter(configure(base_config, server, keep_alive=keep_alive), http)
+    assert (await vf.check(make_item(server, "red.jpg"), gpu_profile(base_config))).verdict is VisionVerdict.GENUINE
+    assert await vf.warmup() is True
+    assert all(c["payload"]["keep_alive"] == sent for c in state.chat)
+    assert type(state.chat[0]["payload"]["keep_alive"]) is type(sent)
+
+
+def test_image_request_headers_follow_the_default_referrer_policy() -> None:
+    creds = image_request_headers("https://cdn.example.net/a.jpg", "https://user:secret@shop.example.com:8443/item/1?x=1#top")
+    assert creds["Referer"] == "https://shop.example.com:8443/"
+    same = image_request_headers("https://example.com/a.jpg", "https://example.com/item/1?id=2#photos")
+    assert same["Referer"] == "https://example.com/item/1?id=2"  # same-origin: full URL without fragment
+    downgrade = image_request_headers("http://cdn.example.net/a.jpg", "https://www.example.com/item/1")
+    assert "Referer" not in downgrade and downgrade["Sec-Fetch-Site"] == "cross-site"
+
+
+@pytest.mark.parametrize(("backend_name", "suffix"), [("openai", "/v1"), ("openai", "/v1/"), ("ollama", "/api")])
+async def test_base_url_with_api_suffix_is_tolerated(
+    backend, http: HttpClient, base_config: AppConfig, backend_name: str, suffix: str
+) -> None:
+    server, state = backend
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    base = str(server.make_url("")).rstrip("/") + suffix
+    config = base_config.model_copy(
+        update={"vision": VisionSection(enabled=True, backend=backend_name, base_url=base, model=SMALL)}
+    )
+    vf = VisionFilter(config, http)
+    assert await vf.health() is True
+    result = await vf.check(make_item(server, "red.jpg"), gpu_profile(config))
+    assert result.verdict is VisionVerdict.GENUINE
+    assert state.chat[0]["path"] in ("/api/chat", "/v1/chat/completions")
+
+
+def _encode(fmt: str, size: tuple[int, int] = (400, 300)) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, PALETTE["red"]).save(buf, format=fmt)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "PNG", "WEBP", "GIF", "BMP"])
+def test_prepare_image_accepts_web_photo_formats(fmt: str) -> None:
+    prepared = prepare_image(_encode(fmt), max_side=224, quality=80)
+    assert (prepared.width, prepared.height) == (224, 168) and prepared.source_format == fmt
+    assert len(prepared.digest) == 40
+
+
+@pytest.mark.parametrize("fmt", ["TIFF", "PPM", "TGA", "ICO", "PCX", "SGI"])
+def test_prepare_image_refuses_non_web_formats(fmt: str) -> None:
+    # attacker-controlled bytes only reach the decoders a listing photo can legitimately need
+    with pytest.raises(ImageRejected) as err:
+        prepare_image(_encode(fmt, (128, 96)), max_side=224, quality=80)
+    assert err.value.reason == "decode_error"
+
+
+async def test_required_profile_with_only_unusable_photos_is_unverified(
+    backend, http: HttpClient, base_config: AppConfig
+) -> None:
+    server, state = backend
+    vf = VisionFilter(configure(base_config, server), http)
+    item = make_item(server, "page.html", "missing.jpg")
+    auto = await vf.check(item, gpu_profile(base_config))
+    assert auto.verdict is VisionVerdict.SKIPPED and auto.error == "no usable images"
+    required = await vf.check(item, gpu_profile(base_config).model_copy(update={"vision": "required"}))
+    assert required.verdict is VisionVerdict.ERROR and required.error == "no usable images"
+    assert {s["reason"] for s in required.details["skipped"]} == {"not_image", "http_404"}
+    assert state.chat == [] and vf.breaker.consecutive_failures == 0
+
+
+async def test_same_photo_under_a_new_url_reuses_the_answer(backend, http: HttpClient, base_config: AppConfig) -> None:
+    # Marketplace CDN URLs carry rotating signatures (fbcdn ``oh``/``oe``): the bytes are the key that sticks.
+    server, state = backend
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    state.images["red_resigned.jpg"] = state.images["red.jpg"]
+    metrics = Metrics()
+    vf = VisionFilter(configure(base_config, server), http, metrics=metrics)
+    profile = gpu_profile(base_config)
+    first = await vf.check(make_item(server, "red.jpg"), profile)
+    second = await vf.check(make_item(server, "red_resigned.jpg"), profile)
+    assert first.cached is False and second.cached is True
+    assert second.verdict is VisionVerdict.GENUINE and second.confidence == pytest.approx(0.9)
+    assert len(state.chat) == 1 and state.image_hits == {"red.jpg": 1, "red_resigned.jpg": 1}
+    third = await vf.check(make_item(server, "red_resigned.jpg"), profile)  # now known by URL: no download
+    assert third.cached is True and state.image_hits["red_resigned.jpg"] == 1
+    assert metrics.counter("vision_cache_total", labelnames=("layer", "result")).value(layer="content", result="hit") == 1
+
+
+def test_detail_photo_next_to_a_genuine_photo_does_not_veto_the_listing() -> None:
+    G, P, D = VisionVerdict.GENUINE, VisionVerdict.PARTS_ONLY, VisionVerdict.DAMAGED
+    # a close-up of the backplate / the GPU inside a prebuilt is not proof of a parts-only listing
+    assert aggregate_answers([_ans(G, 0.9), _ans(P, 0.8)], 0.6)[:2] == (G, 0.9)
+    assert aggregate_answers([_ans(G, 0.5), _ans(P, 0.8)], 0.6)[:2] == (P, 0.8)
+    assert aggregate_answers([_ans(P, 0.8)], 0.6)[:2] == (P, 0.8)
+    # damage seen on any photo is a property of the item: it always wins
+    assert aggregate_answers([_ans(G, 0.95), _ans(D, 0.65)], 0.6)[:2] == (D, 0.65)
+
+
+def test_prompt_separates_detail_shots_and_wear_from_negatives(base_config: AppConfig) -> None:
+    prompt = build_prompt(base_config.profile("rtx_4090"))
+    assert "close-up" in prompt and "wear" in prompt
+
+
+async def test_bug_in_one_photo_does_not_discard_the_other_answers(
+    backend, http: HttpClient, base_config: AppConfig, monkeypatch
+) -> None:
+    server, state = backend
+    state.answers[("*", "red")] = answer("genuine", 0.9)
+    vf = VisionFilter(configure(base_config, server), http)
+    real_fetch = vf._fetch_image
+
+    async def flaky_fetch(url: str, page_url: str | None = None) -> Any:
+        if url.endswith("blue.jpg"):
+            raise RuntimeError("unexpected bug")
+        return await real_fetch(url, page_url)
+
+    monkeypatch.setattr(vf, "_fetch_image", flaky_fetch)
+    result = await vf.check(make_item(server, "red.jpg", "blue.jpg"), gpu_profile(base_config))
+    assert result.verdict is VisionVerdict.GENUINE and result.images_checked == 1
+    assert any("unexpected bug" in e for e in result.details["errors"])

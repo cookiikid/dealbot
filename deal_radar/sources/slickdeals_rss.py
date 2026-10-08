@@ -1350,9 +1350,7 @@ class SlickdealsIngestor(BaseIngestor):
                 raise
             except HttpStatusError as exc:
                 if exc.status in BLOCK_STATUSES:
-                    return FeedResult(
-                        feed, FeedOutcome.BLOCKED, detail=f"HTTP {exc.status}", retry_after=parse_retry_after(exc.headers.get("Retry-After"))
-                    )
+                    return FeedResult(feed, FeedOutcome.BLOCKED, detail=f"HTTP {exc.status}", retry_after=exc.retry_after)
                 return FeedResult(feed, FeedOutcome.ERROR, detail=f"HTTP {exc.status}")
             except Exception as exc:  # noqa: BLE001 - network/size failures only skip this feed
                 return FeedResult(feed, FeedOutcome.ERROR, detail=repr(exc)[:300])
