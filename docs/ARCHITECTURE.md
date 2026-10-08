@@ -67,9 +67,9 @@ themselves read.
 | Tier | Signal | Visibility lag (t0→t1) | DealRadar poll `T` | Mean detection lag |
 |---|---|---|---|---|
 | **0** | First-party retailer endpoints (Best Buy Products API, Shopify product JSON, generic JSON) | seconds (CDN TTL / API refresh) | 15-20 s per endpoint | ≈ 10 s |
-| **0** | eBay Browse `sort=newlyListed` | seconds-minutes (search index) | quota-derived (see §2.2) | ≈ 1-3 min |
+| **0** | eBay Browse `sort=newlyListed` | seconds-minutes (search index) | ≈ 3 min, quota-derived (§2.2) | ≈ 1.5 min |
 | **0-1** | Facebook Marketplace search sorted by creation time (home IP) | FB listing review ≈ 1-10 min | 4 min ±15 % | ≈ 2 min + FB review |
-| **1** | Slickdeals **Hot Deals forum** RSS (forum 9) | **0-22 s** after thread creation (measured) | 30-45 s | ≈ 20-40 s |
+| **1** | Slickdeals **Hot Deals forum** RSS (forum 9) | **0-22 s** after thread creation (measured) | 30 s | ≈ 15-35 s |
 | **1** | Reddit `/new` via OAuth (r/buildapcsales, r/hardwareswap) | ≈ 10-30 s | 6 s | ≈ 15-35 s |
 | **2** | Slickdeals frontpage / popular RSS | 3-12 h (promotion time) | minutes | quality signal, not speed |
 | **3** | Twitter/X bots, public Discord/Telegram channels | minutes – hours | — | not used |
@@ -154,12 +154,15 @@ polls_per_day    = daily_call_budget · safety_factor / calls_per_poll
 T_ebay           = max(poll_interval_seconds, 86 400 / polls_per_day)
 ```
 
-With the shipped 14 search terms, 5,000 calls/day and a 0.85 safety factor:
-`T = 86 400 · 14 / 4 250 ≈ 285 s`, so the mean lag is ≈ 2.4 min. The lever is
-query design: OR-queries (`(rtx 4090, rtx 5090)`) and broader terms cut
-`calls_per_poll` and lower `T` proportionally. The free Application Growth Check
-raises the quota. The application token is cached and refreshed 5 minutes before
-expiry, single-flight.
+Per-profile searches would cost one call per search term: 21 terms in the shipped
+profiles, so `T ≈ 86 400 · 21 / 4 250 ≈ 427 s`. The shipped config instead **coalesces**
+them into 9 `sources.ebay.queries` using eBay's OR syntax (`rtx (5090, 4090, 3090)` means
+"rtx" AND any of the three). That gives `T ≈ 86 400 · 9 / 4 250 ≈ 183 s` and a mean lag
+of ≈ 1.5 min on the free quota. The text filter assigns profiles afterwards, so wide
+queries cost nothing in precision. The free Application Growth Check raises the quota.
+The application token (≤ 1,000 mints/day) is cached and shared through Redis,
+refreshed 5 minutes before expiry, single-flight. A fleet-wide Redis ledger counts
+calls against the quota, which resets at midnight America/Los_Angeles.
 
 ### 2.3 Slickdeals (`sources/slickdeals_rss.py`)
 
