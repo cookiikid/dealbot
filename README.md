@@ -150,6 +150,27 @@ The suite never touches the network: upstream APIs are emulated with recorded-sh
 fixtures, `aioresponses` or local `aiohttp` test servers; Redis tests use `fakeredis`
 and, when the binary exists, a throwaway `redis-server`.
 
+## Verification status
+
+* **2,018 offline tests** pass (`python -m pytest -q`, ≈ 100 s). Every module was built
+  against shared contracts and then reviewed by a separate adversarial reviewer that
+  wrote failing tests first. Redis behaviour is tested on `fakeredis` and on a real
+  `redis-server`. Stealth/browser behaviour is tested in real headless Chromium against
+  local fake pages.
+* **End-to-end:** `tests/test_pipeline.py` runs real listings through normalize →
+  filter → score → vision → Lua dedup → router → recorder. It asserts p95 internal
+  overhead < 50 ms, exactly-once alerts, price-drop re-alerts and rollback when every
+  channel fails.
+* **Process:** the real binary starts, serves `/healthz` `/readyz` `/metrics` `/status`,
+  and shuts down cleanly on SIGTERM (exit 0).
+* **Live:** one dry-run poll of the Slickdeals feeds (2026-10-08) fetched and priced 73
+  real deals in ≈ 2.8 s; none matched a hardware profile, so none were (correctly) alerted.
+* **Not exercised against production services:** eBay, Reddit OAuth, Best Buy,
+  Facebook Marketplace, OfferUp, Craigslist, Discord, Telegram and Ollama. They need
+  your credentials, accounts or home network. Their request/response shapes come from
+  live-verified research and recorded fixtures. Run `--once --dry-run --sources <name>`
+  after adding credentials.
+
 ## Responsible use
 
 DealRadar is built for an individual hunting hardware for their own use. Several
