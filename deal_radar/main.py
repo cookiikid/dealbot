@@ -89,7 +89,7 @@ def build_dispatchers(config: AppConfig, http: HttpClient, metrics: Metrics) -> 
     if config.dispatch.websocket.enabled:
         out["websocket"] = WebSocketHub(config.dispatch.websocket, auth_token=config.http_server.auth_token, metrics=metrics)
     for name, target in config.dispatch.discord.webhooks.items():
-        out[f"discord:{name}"] = DiscordDispatcher(name, target, http, timeout=timeout, metrics=metrics)
+        out[f"discord:{name}"] = DiscordDispatcher(name, target, http, timeout=timeout, metrics=metrics, node_id=config.app.node_id)
     tg = config.dispatch.telegram
     for name, chat in tg.chats.items():
         out[f"telegram:{name}"] = TelegramDispatcher(name, chat, tg.bot_token, tg.api_base, http, timeout=timeout, metrics=metrics)
@@ -256,6 +256,9 @@ class DealRadarApp:
         if self.vision is not None:
             healthy = await self.vision.health()
             log.info("vision backend", extra={"healthy": healthy, "url": self.config.vision.base_url, "model": self.config.vision.model})
+            if healthy:
+                # Load the weights now (2-10 s cold start) instead of on the first real candidate.
+                self._tasks.append(asyncio.create_task(self.vision.warmup(), name="vision-warmup"))
         if self.runner is not None:
             self._tasks.append(asyncio.create_task(self.runner.run(), name="pipeline-runner"))
         for ingestor in self.ingestors:
